@@ -1,0 +1,6 @@
+edge_bucket_pct,trades,wins,losses,hit_rate_pct,avg_edge_pct,total_stake_dollars,total_fees_dollars,expected_profit_net_dollars,realized_pnl_dollars,roi_pct_on_stake
+<5,1,1,0,100.0,-6.46,3.08,0.08,-0.34,-3.16,-102.6
+10-20,5,3,2,60.0,16.84,7.84,0.2,1.35,-2.04,-26.02
+20-30,4,3,1,75.0,24.75,11.85,0.3,3.02,2.85,24.05
+30-40,14,8,6,57.14,34.49,31.85,0.97,14.89,-2.82,-8.85
+40+,9,5,4,55.56,53.47,24.89,1.15,38.87,14.96,60.1

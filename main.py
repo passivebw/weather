@@ -68,6 +68,10 @@ SCAN_USE_SCHEDULE = env_bool("SCAN_USE_SCHEDULE", default=False)
 SCAN_SCHEDULE_ANCHOR_HOUR = int(os.getenv("SCAN_SCHEDULE_ANCHOR_HOUR", "6"))
 SCAN_SCHEDULE_INTERVAL_HOURS = int(os.getenv("SCAN_SCHEDULE_INTERVAL_HOURS", "6"))
 SCAN_SCHEDULE_MINUTE = int(os.getenv("SCAN_SCHEDULE_MINUTE", "12"))
+FAST_SCAN_ON_EDGE_ENABLED = env_bool("FAST_SCAN_ON_EDGE_ENABLED", default=True)
+FAST_SCAN_INTERVAL_SECONDS = int(os.getenv("FAST_SCAN_INTERVAL_SECONDS", "60"))
+FAST_SCAN_WINDOW_MINUTES = int(os.getenv("FAST_SCAN_WINDOW_MINUTES", "20"))
+FAST_SCAN_EDGE_THRESHOLD_PCT = float(os.getenv("FAST_SCAN_EDGE_THRESHOLD_PCT", str(POLICY_MIN_NET_EDGE_PCT)))
 BOARD_CACHE_TTL_SECONDS = int(os.getenv("BOARD_CACHE_TTL_SECONDS", "180"))
 SNAPSHOT_LOGGING_ENABLED = env_bool("SNAPSHOT_LOGGING_ENABLED", default=True)
 SNAPSHOT_LOG_DIR = os.getenv("SNAPSHOT_LOG_DIR", "logs").strip() or "logs"
@@ -940,11 +944,42 @@ def next_scheduled_scan_time(now_local: datetime) -> datetime:
                 return candidate
     return now_local + timedelta(hours=interval_h)
 
+_fast_scan_until_ts = 0.0
+
+def _board_has_fast_scan_edge(board_payload: Optional[dict]) -> bool:
+    if not board_payload:
+        return False
+    threshold = float(FAST_SCAN_EDGE_THRESHOLD_PCT)
+    for row in board_payload.get("rows", []) or []:
+        edge_pct = float(row.get("net_calibrated_edge_pct", row.get("edge_pct", 0.0)))
+        if edge_pct >= threshold:
+            return True
+    return False
+
+def _maybe_extend_fast_scan_window(board_payload: Optional[dict], now_ts: float) -> None:
+    global _fast_scan_until_ts
+    if not FAST_SCAN_ON_EDGE_ENABLED:
+        return
+    if not _board_has_fast_scan_edge(board_payload):
+        return
+    window_seconds = max(0, int(FAST_SCAN_WINDOW_MINUTES) * 60)
+    if window_seconds <= 0:
+        return
+    _fast_scan_until_ts = max(_fast_scan_until_ts, now_ts + window_seconds)
+
+def _active_scan_interval_seconds(now_ts: float) -> int:
+    base_interval = max(1, int(SCAN_INTERVAL_SECONDS))
+    if not FAST_SCAN_ON_EDGE_ENABLED:
+        return base_interval
+    if now_ts < _fast_scan_until_ts:
+        return max(1, int(FAST_SCAN_INTERVAL_SECONDS))
+    return base_interval
+
 def compute_sleep_seconds(now_local: datetime) -> float:
     if not SCAN_USE_SCHEDULE:
-        interval = max(1, int(SCAN_INTERVAL_SECONDS))
+        now_ts = time.time()
+        interval = _active_scan_interval_seconds(now_ts)
         if SCAN_ALIGN_TO_INTERVAL and interval >= 60:
-            now_ts = time.time()
             next_tick = (math.floor(now_ts / interval) + 1) * interval
             return max(1.0, next_tick - now_ts)
         return max(1.0, float(interval))
@@ -7035,6 +7070,7 @@ def background_loop():
                 discord_send(discrepancy_text(discrepancy_alerts, now_local))
             try:
                 board_payload = build_odds_board(now_local, market_day="today")
+                _maybe_extend_fast_scan_window(board_payload, time.time())
                 if EDGE_TRACKING_ENABLED:
                     track_edge_lifecycles(now_local, board_payload)
                 maybe_post_paper_trades(now_local, board_payload)

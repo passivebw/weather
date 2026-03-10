@@ -218,6 +218,8 @@ ENABLE_METNO_SOURCE = env_bool("ENABLE_METNO_SOURCE", default=True)
 ENABLE_ACCUWEATHER_SOURCE = env_bool("ENABLE_ACCUWEATHER_SOURCE", default=True)
 ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS", "2592000"))
 ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS", "3600"))
+LIVE_PRETRADE_ACCUWEATHER_REFRESH_ENABLED = env_bool("LIVE_PRETRADE_ACCUWEATHER_REFRESH_ENABLED", default=True)
+LIVE_PRETRADE_ACCUWEATHER_MAX_AGE_SECONDS = int(os.getenv("LIVE_PRETRADE_ACCUWEATHER_MAX_AGE_SECONDS", "1800"))
 MANUAL_WEATHERCOM_HIGHS = os.getenv("MANUAL_WEATHERCOM_HIGHS", "").strip()
 MANUAL_ACCUWEATHER_HIGHS = os.getenv("MANUAL_ACCUWEATHER_HIGHS", "").strip()
 
@@ -710,7 +712,13 @@ def accuweather_get_forecast_high_f(lat: float, lon: float, now_local: datetime)
 def accuweather_get_forecast_low_f(lat: float, lon: float, now_local: datetime) -> Optional[float]:
     return accuweather_get_forecast_temp_f(lat, lon, now_local, temp_side="low")
 
-def accuweather_get_forecast_temp_f(lat: float, lon: float, now_local: datetime, temp_side: str = "high") -> Optional[float]:
+def accuweather_get_forecast_temp_f(
+    lat: float,
+    lon: float,
+    now_local: datetime,
+    temp_side: str = "high",
+    force_refresh: bool = False,
+) -> Optional[float]:
     side = normalize_temp_side(temp_side)
     if not ACCUWEATHER_API_KEY:
         return None
@@ -720,15 +728,16 @@ def accuweather_get_forecast_temp_f(lat: float, lon: float, now_local: datetime,
     cache_key = str(loc_key).strip()
     today_iso = now_local.date().isoformat()
     now_ts = time.time()
-    with _accuweather_cache_lock:
-        cached = _accuweather_forecast_cache.get(cache_key)
-        if isinstance(cached, dict):
-            age = now_ts - float(cached.get("ts", 0.0) or 0.0)
-            date_cached = str(cached.get("date", "") or "").strip()
-            if age < max(60, ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS) and date_cached == today_iso:
-                v = cached.get("high_f") if side == "high" else cached.get("low_f")
-                if v is not None:
-                    return float(v)
+    if not force_refresh:
+        with _accuweather_cache_lock:
+            cached = _accuweather_forecast_cache.get(cache_key)
+            if isinstance(cached, dict):
+                age = now_ts - float(cached.get("ts", 0.0) or 0.0)
+                date_cached = str(cached.get("date", "") or "").strip()
+                if age < max(60, ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS) and date_cached == today_iso:
+                    v = cached.get("high_f") if side == "high" else cached.get("low_f")
+                    if v is not None:
+                        return float(v)
     params = {
         "apikey": ACCUWEATHER_API_KEY,
         "details": "false",
@@ -755,6 +764,25 @@ def accuweather_get_forecast_temp_f(lat: float, lon: float, now_local: datetime,
         }
     value = high_f if side == "high" else low_f
     return None if value is None else float(value)
+
+
+def accuweather_forecast_cache_age_seconds(lat: float, lon: float) -> Optional[float]:
+    coord_key = f"{lat:.4f},{lon:.4f}"
+    now_ts = time.time()
+    with _accuweather_cache_lock:
+        loc = _accuweather_location_cache.get(coord_key)
+        if not isinstance(loc, dict):
+            return None
+        loc_key = str(loc.get("location_key", "") or "").strip()
+        if not loc_key:
+            return None
+        fc = _accuweather_forecast_cache.get(loc_key)
+        if not isinstance(fc, dict):
+            return None
+        ts = float(fc.get("ts", 0.0) or 0.0)
+        if ts <= 0:
+            return None
+        return max(0.0, now_ts - ts)
 
 
 # -----------------------
@@ -1423,7 +1451,12 @@ def next_nws_update_time(now_local: datetime) -> datetime:
         candidate = candidate + timedelta(hours=1)
     return candidate
 
-def build_expert_consensus(city: str, now_local: datetime, temp_side: str = "high") -> Optional[dict]:
+def build_expert_consensus(
+    city: str,
+    now_local: datetime,
+    temp_side: str = "high",
+    force_accuweather_refresh: bool = False,
+) -> Optional[dict]:
     side = normalize_temp_side(temp_side)
     cfg = CITY_CONFIG[city]
     lat = float(cfg["lat"])
@@ -1468,7 +1501,13 @@ def build_expert_consensus(city: str, now_local: datetime, temp_side: str = "hig
 
     if ENABLE_ACCUWEATHER_SOURCE:
         try:
-            aw_temp = accuweather_get_forecast_temp_f(lat, lon, now_local, temp_side=side)
+            aw_temp = accuweather_get_forecast_temp_f(
+                lat,
+                lon,
+                now_local,
+                temp_side=side,
+                force_refresh=force_accuweather_refresh,
+            )
             if aw_temp is not None:
                 source_values.append(("AccuWeather", aw_temp, safe_inverse_mae_weight(ACCUWEATHER_HIST_MAE_F)))
         except Exception:
@@ -3061,6 +3100,77 @@ def _net_edge_now_pct_for_side(
     model_win_p = model_yes_p if str(bet_side).upper() == "BUY YES" else (1.0 - model_yes_p)
     return (model_win_p - market_win_p) * 100.0 - EV_SLIPPAGE_PCT
 
+
+def _refresh_trade_signal_with_fresh_accuweather(b: dict, now_local: datetime) -> dict:
+    if not (ENABLE_ACCUWEATHER_SOURCE and LIVE_PRETRADE_ACCUWEATHER_REFRESH_ENABLED):
+        return b
+    city = str(b.get("city", "")).strip()
+    if city not in CITY_CONFIG:
+        return b
+    side = normalize_temp_side(str(b.get("temp_type", "high")))
+    cfg = CITY_CONFIG[city]
+    lat = float(cfg["lat"])
+    lon = float(cfg["lon"])
+    max_age = max(60, int(LIVE_PRETRADE_ACCUWEATHER_MAX_AGE_SECONDS))
+    age = accuweather_forecast_cache_age_seconds(lat, lon)
+    if age is not None and age <= max_age:
+        return b
+
+    # Force-refresh AccuWeather before re-scoring this candidate.
+    _ = accuweather_get_forecast_temp_f(lat, lon, now_local, temp_side=side, force_refresh=True)
+
+    grouped = refresh_markets_cache()
+    city_markets = [m for m in grouped.get(city, []) if normalize_temp_side(getattr(m, "temp_side", "high")) == side]
+    if not city_markets:
+        return b
+
+    target_date = str(b.get("date", "") or b.get("market_date_selected", "")).strip()
+    by_date: Dict[str, List[Market]] = {}
+    for m in city_markets:
+        d = getattr(m, "market_date_iso", "") or parse_market_date_iso_from_ticker(m.ticker) or ""
+        if d:
+            by_date.setdefault(d, []).append(m)
+    if not target_date:
+        target_date = city_lst_now(now_local, city).date().isoformat()
+    selected = by_date.get(target_date, [])
+    if not selected:
+        return b
+
+    consensus = build_expert_consensus(city, now_local, temp_side=side, force_accuweather_refresh=True)
+    if consensus is None:
+        return b
+    detail = build_city_bucket_comparison(city, selected, now_local, temp_side=side, consensus_override=consensus)
+    if not detail:
+        return b
+    ticker = str(b.get("ticker", "")).strip()
+    bucket = None
+    for r in (detail.get("buckets", []) or []):
+        if str(r.get("ticker", "")).strip() == ticker:
+            bucket = r
+            break
+    if not bucket:
+        return b
+
+    out = dict(b)
+    model_yes_prob_pct = float(_to_float(bucket.get("source_yes_prob")) or 0.0) * 100.0
+    net_edge_pct = _net_edge_now_pct_for_side(
+        str(out.get("bet", "")),
+        model_yes_prob_pct,
+        _to_float(bucket.get("yes_bid")),
+        _to_float(bucket.get("yes_ask")),
+    )
+    out["model_yes_prob_pct"] = model_yes_prob_pct
+    out["kalshi_yes_prob_pct"] = float(_to_float(bucket.get("kalshi_yes_prob")) or 0.0) * 100.0
+    out["yes_bid"] = bucket.get("yes_bid")
+    out["yes_ask"] = bucket.get("yes_ask")
+    out["spread_cents"] = bucket.get("spread_cents")
+    out["top_size"] = bucket.get("top_size")
+    out["consensus_mu_f"] = detail.get("consensus_mu_f")
+    out["source_values_map"] = detail.get("source_values_map", {})
+    if net_edge_pct is not None:
+        out["net_edge_pct"] = float(net_edge_pct)
+    return out
+
 def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
     if not LIVE_TRADING_ENABLED or _live_kill_switch_state:
         return 0
@@ -3114,6 +3224,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
         if not ticker:
             continue
         try:
+            b = _refresh_trade_signal_with_fresh_accuweather(b, now_local)
             units = float(b.get("suggested_units", 0.0))
             edge_pct = float(b.get("net_edge_pct", 0.0))
             sig_entry = (edge_entries.get(sig, {}) or {})
@@ -4827,6 +4938,8 @@ def health():
         "discrepancy_temp_threshold_f": DISCREPANCY_MEAN_TEMP_THRESHOLD_F,
         "accuweather_location_cache_ttl_seconds": ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS,
         "accuweather_forecast_cache_ttl_seconds": ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS,
+        "live_pretrade_accuweather_refresh_enabled": LIVE_PRETRADE_ACCUWEATHER_REFRESH_ENABLED,
+        "live_pretrade_accuweather_max_age_seconds": LIVE_PRETRADE_ACCUWEATHER_MAX_AGE_SECONDS,
         "consensus_sources": configured_sources,
     }
 

@@ -82,6 +82,12 @@ DAILY_UPDATE_DISCORD_ENABLED = env_bool("DAILY_UPDATE_DISCORD_ENABLED", default=
 DAILY_UPDATE_EST_HOUR = int(os.getenv("DAILY_UPDATE_EST_HOUR", "8"))
 DAILY_UPDATE_EST_MINUTE = int(os.getenv("DAILY_UPDATE_EST_MINUTE", "0"))
 DAILY_UPDATE_TOTAL_ROI_BASELINE_DOLLARS = float(os.getenv("DAILY_UPDATE_TOTAL_ROI_BASELINE_DOLLARS", "294"))
+NYC_FORECAST_BRIEF_ENABLED = env_bool("NYC_FORECAST_BRIEF_ENABLED", default=True)
+NYC_FORECAST_BRIEF_CITY = os.getenv("NYC_FORECAST_BRIEF_CITY", "New York City").strip() or "New York City"
+NYC_FORECAST_BRIEF_TEMP_SIDE = normalize_temp_side(os.getenv("NYC_FORECAST_BRIEF_TEMP_SIDE", "high"))
+NYC_FORECAST_BRIEF_EVENING_HOUR_ET = int(os.getenv("NYC_FORECAST_BRIEF_EVENING_HOUR_ET", "20"))
+NYC_FORECAST_BRIEF_MORNING_HOUR_ET = int(os.getenv("NYC_FORECAST_BRIEF_MORNING_HOUR_ET", "7"))
+NYC_FORECAST_BRIEF_MINUTE_ET = int(os.getenv("NYC_FORECAST_BRIEF_MINUTE_ET", "0"))
 
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "120"))
 SCAN_ALIGN_TO_INTERVAL = env_bool("SCAN_ALIGN_TO_INTERVAL", default=True)
@@ -286,6 +292,7 @@ _last_top_signature = ""
 _last_discrepancy_post_ts = 0.0
 _last_discrepancy_signature = ""
 _last_daily_update_date = ""
+_nyc_forecast_brief_state: Dict[str, str] = {}
 _paper_alert_state_date = ""
 _paper_alert_state: Dict[str, dict] = {}
 _live_trade_state_date = ""
@@ -2254,6 +2261,9 @@ def daily_update_state_path() -> str:
 def daily_update_history_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "daily_update_history.csv")
 
+def nyc_forecast_brief_state_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "nyc_forecast_brief_state.json")
+
 def _get_last_daily_update_posted_ts_est() -> Optional[datetime]:
     path = daily_update_history_path()
     if not os.path.exists(path):
@@ -2513,6 +2523,39 @@ def _save_last_daily_update_date(date_key: str) -> None:
         json.dump(payload, f, ensure_ascii=True)
     os.replace(tmp, path)
     _last_daily_update_date = payload["date"]
+
+def _load_nyc_forecast_brief_state() -> Dict[str, str]:
+    global _nyc_forecast_brief_state
+    if _nyc_forecast_brief_state:
+        return _nyc_forecast_brief_state
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = nyc_forecast_brief_state_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            entries = payload.get("entries", {})
+            if isinstance(entries, dict):
+                _nyc_forecast_brief_state = {str(k): str(v) for k, v in entries.items()}
+            else:
+                _nyc_forecast_brief_state = {}
+        except Exception:
+            _nyc_forecast_brief_state = {}
+    return _nyc_forecast_brief_state
+
+def _save_nyc_forecast_brief_state(entries: Dict[str, str]) -> None:
+    global _nyc_forecast_brief_state
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = nyc_forecast_brief_state_path()
+    tmp = path + ".tmp"
+    payload = {
+        "entries": {str(k): str(v) for k, v in (entries or {}).items()},
+        "saved_ts_est": fmt_est(datetime.now(tz=LOCAL_TZ)),
+    }
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True)
+    os.replace(tmp, path)
+    _nyc_forecast_brief_state = payload["entries"]
 
 def _append_live_trade_log(row: dict) -> None:
     os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
@@ -4927,6 +4970,12 @@ def health():
         "daily_update_discord_enabled": DAILY_UPDATE_DISCORD_ENABLED,
         "daily_update_est_hour": DAILY_UPDATE_EST_HOUR,
         "daily_update_est_minute": DAILY_UPDATE_EST_MINUTE,
+        "nyc_forecast_brief_enabled": NYC_FORECAST_BRIEF_ENABLED,
+        "nyc_forecast_brief_city": NYC_FORECAST_BRIEF_CITY,
+        "nyc_forecast_brief_temp_side": NYC_FORECAST_BRIEF_TEMP_SIDE,
+        "nyc_forecast_brief_evening_hour_et": NYC_FORECAST_BRIEF_EVENING_HOUR_ET,
+        "nyc_forecast_brief_morning_hour_et": NYC_FORECAST_BRIEF_MORNING_HOUR_ET,
+        "nyc_forecast_brief_minute_et": NYC_FORECAST_BRIEF_MINUTE_ET,
         "daily_update_uses_separate_webhook": bool(DAILY_UPDATE_DISCORD_WEBHOOK_URL),
         "nws_obs_stale_minutes": NWS_OBS_STALE_MINUTES,
         "nws_obs_update_minute_hint": NWS_OBS_UPDATE_MINUTE,
@@ -6900,6 +6949,106 @@ def daily_update_text(now_local: datetime, summary: dict, shadow_summary: Option
     ]
     return "\n".join(lines)
 
+
+def _build_nyc_forecast_brief_text(now_local: datetime, market_day: str, slot_name: str) -> Optional[str]:
+    city = canonical_city_name(NYC_FORECAST_BRIEF_CITY) or "New York City"
+    side = normalize_temp_side(NYC_FORECAST_BRIEF_TEMP_SIDE)
+    grouped = refresh_markets_cache()
+    city_markets = [m for m in grouped.get(city, []) if normalize_temp_side(getattr(m, "temp_side", "high")) == side]
+    if not city_markets:
+        return None
+
+    selected_markets, selected_date, _ = select_markets_for_day(city_markets, now_local, market_day, city=city)
+    if not selected_markets or not selected_date:
+        return None
+    detail = build_city_bucket_comparison(city, selected_markets, now_local, temp_side=side)
+    if not detail or not detail.get("buckets"):
+        return None
+
+    buckets = detail.get("buckets", []) or []
+    best = max(buckets, key=lambda r: r.get("best_edge", -1.0))
+    target_74p = None
+    for r in buckets:
+        try:
+            lo = float(r.get("lo", -999))
+            hi = float(r.get("hi", -999))
+        except Exception:
+            continue
+        if lo >= 74.0 and hi >= 900.0:
+            target_74p = r
+            break
+    source_text = ", ".join(
+        f"{str(s.get('name'))}={float(s.get('high_f')):.1f}F"
+        for s in (detail.get("sources", []) or [])
+        if s.get("high_f") is not None
+    )
+    slot_title = "Evening Brief" if slot_name == "evening" else "Morning Brief"
+    lines = [
+        f"NYC High Forecast {slot_title}",
+        f"Contract Date: {selected_date}",
+        f"As of: {detail.get('as_of_est')}",
+        f"Consensus: {float(detail.get('consensus_mu_f', 0.0)):.1f}F +/- {float(detail.get('consensus_sigma_f', 0.0)):.2f}",
+    ]
+    if source_text:
+        lines.append(f"Sources: {source_text}")
+    if target_74p is not None:
+        lines.append(
+            "74+ Focus: "
+            f"model={100.0 * float(target_74p.get('source_yes_prob', 0.0)):.1f}% | "
+            f"market={100.0 * float(target_74p.get('kalshi_yes_prob', 0.0)):.1f}% | "
+            f"best={str(target_74p.get('best_side'))} | "
+            f"edge={100.0 * float(target_74p.get('best_edge', 0.0)):.1f}% | "
+            f"ticker={str(target_74p.get('ticker'))}"
+        )
+    lines.append(
+        "Top Signal: "
+        f"{str(best.get('best_side'))} | "
+        f"{str(best.get('bucket_label'))} | "
+        f"edge={100.0 * float(best.get('best_edge', 0.0)):.1f}% | "
+        f"ticker={str(best.get('ticker'))}"
+    )
+    return "\n".join(lines)
+
+
+def maybe_post_nyc_forecast_brief(now_local: datetime) -> bool:
+    if not NYC_FORECAST_BRIEF_ENABLED:
+        return False
+    now_et = now_local.astimezone(LOCAL_TZ)
+    minute_et = max(0, min(59, int(NYC_FORECAST_BRIEF_MINUTE_ET)))
+    morning_hour = max(0, min(23, int(NYC_FORECAST_BRIEF_MORNING_HOUR_ET)))
+    evening_hour = max(0, min(23, int(NYC_FORECAST_BRIEF_EVENING_HOUR_ET)))
+    morning_target = now_et.replace(hour=morning_hour, minute=minute_et, second=0, microsecond=0)
+    evening_target = now_et.replace(hour=evening_hour, minute=minute_et, second=0, microsecond=0)
+
+    slot_name = ""
+    market_day = ""
+    slot_target = None
+    if now_et >= evening_target:
+        slot_name = "evening"
+        market_day = "tomorrow"
+        slot_target = evening_target
+    elif now_et >= morning_target:
+        slot_name = "morning"
+        market_day = "today"
+        slot_target = morning_target
+    else:
+        return False
+
+    slot_key = f"{now_et.date().isoformat()}|{slot_name}"
+    state = _load_nyc_forecast_brief_state()
+    if slot_key in state:
+        return False
+    if slot_target is None or now_et < slot_target:
+        return False
+
+    text = _build_nyc_forecast_brief_text(now_local, market_day=market_day, slot_name=slot_name)
+    if not text:
+        return False
+    discord_send_daily(text)
+    state[slot_key] = fmt_est(now_local)
+    _save_nyc_forecast_brief_state(state)
+    return True
+
 def maybe_post_daily_update(now_local: datetime) -> bool:
     if not DAILY_UPDATE_DISCORD_ENABLED:
         return False
@@ -6942,6 +7091,7 @@ def scan():
     paper_trade_posted_count = 0
     edge_tracking = {"active_count": 0, "closed_count": 0}
     daily_update_posted = False
+    nyc_forecast_brief_posted = False
     if DISCORD_LEADERBOARD_ENABLED and should_post(results):
         discord_send(leaderboard_text(results, now_local))
         posted = True
@@ -6962,12 +7112,17 @@ def scan():
         daily_update_posted = maybe_post_daily_update(now_local)
     except Exception:
         daily_update_posted = False
+    try:
+        nyc_forecast_brief_posted = maybe_post_nyc_forecast_brief(now_local)
+    except Exception:
+        nyc_forecast_brief_posted = False
     best = results[0] if results else {}
     return {
         "posted": posted,
         "discrepancy_posted": discrepancy_posted,
         "paper_trade_posted_count": paper_trade_posted_count,
         "daily_update_posted": daily_update_posted,
+        "nyc_forecast_brief_posted": nyc_forecast_brief_posted,
         "edge_active_count": edge_tracking.get("active_count", 0),
         "edge_closed_count": edge_tracking.get("closed_count", 0),
         "best_city": best.get("city"),
@@ -7279,6 +7434,10 @@ def background_loop():
                 pass
             try:
                 maybe_post_daily_update(now_local)
+            except Exception:
+                pass
+            try:
+                maybe_post_nyc_forecast_brief(now_local)
             except Exception:
                 pass
         except Exception:

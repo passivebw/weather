@@ -187,6 +187,11 @@ LIVE_EXIT_AGGRESSIVE_FALLBACK_ENABLED = env_bool("LIVE_EXIT_AGGRESSIVE_FALLBACK_
 LIVE_EXIT_AGGRESSIVE_TIME_IN_FORCE = os.getenv("LIVE_EXIT_AGGRESSIVE_TIME_IN_FORCE", "fill_or_kill").strip().lower()
 LIVE_EXIT_MAX_SPREAD_CENTS = int(os.getenv("LIVE_EXIT_MAX_SPREAD_CENTS", "8"))
 LIVE_EXIT_ONLY_WHEN_LOSING = env_bool("LIVE_EXIT_ONLY_WHEN_LOSING", default=True)
+LIVE_EDGE_DROP_EXIT_ENABLED = env_bool("LIVE_EDGE_DROP_EXIT_ENABLED", default=True)
+LIVE_EDGE_DROP_TRIGGER_PCT_POINTS = float(os.getenv("LIVE_EDGE_DROP_TRIGGER_PCT_POINTS", "25.0"))
+LIVE_EDGE_DROP_SMALL_GREEN_MAX_PCT_OF_STAKE = float(os.getenv("LIVE_EDGE_DROP_SMALL_GREEN_MAX_PCT_OF_STAKE", "10.0"))
+LIVE_EDGE_DROP_PARTIAL_SELL_FRACTION = float(os.getenv("LIVE_EDGE_DROP_PARTIAL_SELL_FRACTION", "0.5"))
+LIVE_EDGE_DROP_AGGRESSIVE_WORSEN_PCT_POINTS = float(os.getenv("LIVE_EDGE_DROP_AGGRESSIVE_WORSEN_PCT_POINTS", "5.0"))
 KELLY_SIZING_ENABLED = env_bool("KELLY_SIZING_ENABLED", default=True)
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.5"))
 KELLY_BANKROLL_DOLLARS = float(os.getenv("KELLY_BANKROLL_DOLLARS", "1500"))
@@ -3002,6 +3007,7 @@ def _aggregate_open_live_positions(now_local: datetime) -> List[dict]:
                 "buy_count": 0,
                 "sell_count": 0,
                 "buy_notional_cents": 0.0,
+                "buy_fee_dollars": 0.0,
                 "first_entry_ts": ts,
                 "last_ts": ts,
                 "entry_edge_pct": float(_to_float(r.get("edge_pct")) or 0.0),
@@ -3011,6 +3017,7 @@ def _aggregate_open_live_positions(now_local: datetime) -> List[dict]:
         if sign > 0:
             e["buy_count"] += cnt
             e["buy_notional_cents"] += (px * cnt)
+            e["buy_fee_dollars"] += float(_to_float(r.get("fee_dollars")) or 0.0)
             e["entry_edge_pct"] = max(float(e.get("entry_edge_pct", 0.0)), float(_to_float(r.get("edge_pct")) or 0.0))
             e["first_entry_ts"] = min(e["first_entry_ts"], ts)
         else:
@@ -3045,6 +3052,27 @@ def _is_open_position_currently_losing(pos: dict, quotes: Dict[str, Optional[int
     if current is None:
         return None
     return float(current) < float(entry_px)
+
+def _estimate_unrealized_pnl_net_dollars(pos: dict, quotes: Dict[str, Optional[int]]) -> Optional[float]:
+    bet_side = str(pos.get("bet", "")).strip().upper()
+    entry_px = _to_float(pos.get("avg_entry_price_cents"))
+    open_count = int(_to_float(pos.get("open_count")) or 0)
+    if entry_px is None or open_count <= 0:
+        return None
+    if bet_side == "BUY YES":
+        current = _to_float(quotes.get("yes_bid"))
+    elif bet_side == "BUY NO":
+        current = _to_float(quotes.get("no_bid"))
+    else:
+        return None
+    if current is None:
+        return None
+    gross = (float(current) - float(entry_px)) * float(open_count) / 100.0
+    buy_count = max(1, int(_to_float(pos.get("buy_count")) or 0))
+    buy_fee_total = float(_to_float(pos.get("buy_fee_dollars")) or 0.0)
+    fee_per_contract = buy_fee_total / float(buy_count)
+    est_exit_fee = fee_per_contract * float(open_count)
+    return float(gross - est_exit_fee)
 
 def _compute_contract_count(stake_dollars: float, limit_price_cents: int) -> int:
     max_loss_per_contract = max(1, int(limit_price_cents))
@@ -3773,14 +3801,16 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
             continue
         entry_edge = float(pos.get("entry_edge_pct", 0.0))
         drop = entry_edge - float(edge_now)
-        hard_trigger = float(edge_now) <= LIVE_EXIT_EDGE_HARD_PCT
-        soft_allowed = float(entry_edge) <= LIVE_EXIT_SOFT_MAX_ENTRY_EDGE_PCT
-        soft_trigger = (
-            soft_allowed and
-            float(edge_now) <= LIVE_EXIT_EDGE_SOFT_PCT and
-            drop >= LIVE_EXIT_EDGE_DROP_PCT
-        )
-        should_exit = hard_trigger or soft_trigger
+        quotes = {
+            "yes_bid": int(yes_bid),
+            "yes_ask": int(yes_ask),
+            "no_bid": int(100 - yes_ask),
+            "no_ask": int(100 - yes_bid),
+        }
+        pnl_net = _estimate_unrealized_pnl_net_dollars(pos, quotes)
+        open_count_total = max(1, int(pos.get("open_count", 0)))
+        stake_open_dollars = (float(_to_float(pos.get("avg_entry_price_cents")) or 0.0) * float(open_count_total)) / 100.0
+
         pos_sig = "|".join([
             str(pos.get("date", "")).strip(),
             city,
@@ -3790,6 +3820,37 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
             str(pos.get("line", "")).strip(),
         ])
         prior = exit_state.get(pos_sig, {}) if isinstance(exit_state.get(pos_sig), dict) else {}
+        partial_taken = bool(prior.get("partial_taken", False))
+        exit_plan = ""  # "partial" | "full" | ""
+        trigger_name = ""
+
+        if LIVE_EDGE_DROP_EXIT_ENABLED and entry_edge > 0:
+            edge_drop_points = float(entry_edge) - float(edge_now)
+            edge_drop_triggered = edge_drop_points >= float(LIVE_EDGE_DROP_TRIGGER_PCT_POINTS)
+            small_green_cap = max(
+                0.0,
+                float(stake_open_dollars) * max(0.0, float(LIVE_EDGE_DROP_SMALL_GREEN_MAX_PCT_OF_STAKE)) / 100.0,
+            )
+            if edge_drop_triggered:
+                if pnl_net is not None and float(pnl_net) < 0.0:
+                    exit_plan = "full"
+                    trigger_name = "edge_drop_red"
+                elif (not partial_taken) and pnl_net is not None and float(pnl_net) <= small_green_cap:
+                    exit_plan = "partial"
+                    trigger_name = "edge_drop_small_green"
+        else:
+            hard_trigger = float(edge_now) <= LIVE_EXIT_EDGE_HARD_PCT
+            soft_allowed = float(entry_edge) <= LIVE_EXIT_SOFT_MAX_ENTRY_EDGE_PCT
+            soft_trigger = (
+                soft_allowed and
+                float(edge_now) <= LIVE_EXIT_EDGE_SOFT_PCT and
+                drop >= LIVE_EXIT_EDGE_DROP_PCT
+            )
+            if hard_trigger or soft_trigger:
+                exit_plan = "full"
+                trigger_name = ("hard" if hard_trigger else "soft")
+
+        should_exit = bool(exit_plan)
         streak = int(prior.get("streak", 0))
         streak = streak + 1 if should_exit else 0
         if should_exit:
@@ -3798,10 +3859,20 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
                 "last_ts_est": fmt_est(now_local),
                 "edge_now_pct": round(float(edge_now), 4),
                 "entry_edge_pct": round(float(entry_edge), 4),
-                "trigger": ("hard" if hard_trigger else "soft"),
+                "trigger": trigger_name,
+                "partial_taken": partial_taken,
             }
         else:
-            if pos_sig in exit_state:
+            if partial_taken:
+                exit_state[pos_sig] = {
+                    "streak": 0,
+                    "last_ts_est": fmt_est(now_local),
+                    "edge_now_pct": round(float(edge_now), 4),
+                    "entry_edge_pct": round(float(entry_edge), 4),
+                    "trigger": "",
+                    "partial_taken": True,
+                }
+            elif pos_sig in exit_state:
                 del exit_state[pos_sig]
         if not should_exit:
             continue
@@ -3809,14 +3880,16 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
             continue
 
         ticker = str(pos.get("ticker", "")).strip()
-        remaining = max(1, min(LIVE_MAX_CONTRACTS_PER_ORDER, int(pos.get("open_count", 0))))
-        quotes = {
-            "yes_bid": int(yes_bid),
-            "yes_ask": int(yes_ask),
-            "no_bid": int(100 - yes_ask),
-            "no_ask": int(100 - yes_bid),
-        }
-        if LIVE_EXIT_ONLY_WHEN_LOSING:
+        if exit_plan == "partial":
+            frac = clamp(float(LIVE_EDGE_DROP_PARTIAL_SELL_FRACTION), 0.01, 0.99)
+            target_count = max(1, int(math.ceil(float(open_count_total) * frac)))
+            if open_count_total > 1:
+                target_count = min(target_count, open_count_total - 1)
+        else:
+            target_count = open_count_total
+        remaining = max(1, min(LIVE_MAX_CONTRACTS_PER_ORDER, int(target_count)))
+
+        if LIVE_EXIT_ONLY_WHEN_LOSING and not LIVE_EDGE_DROP_EXIT_ENABLED:
             losing_now = _is_open_position_currently_losing(pos, quotes)
             if losing_now is not True:
                 continue
@@ -3831,6 +3904,10 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
                 )
                 if p_next is not None:
                     attempts.append({"kind": "passive", "price": int(p_next), "tif": LIVE_EXIT_PASSIVE_TIME_IN_FORCE, "wait_s": LIVE_EXIT_PASSIVE_WAIT_SECONDS})
+        aggressive_gate = True
+        if LIVE_EDGE_DROP_EXIT_ENABLED and should_exit:
+            worsened_need = max(0.0, float(LIVE_EDGE_DROP_AGGRESSIVE_WORSEN_PCT_POINTS))
+            aggressive_gate = float(edge_now) <= (float(entry_edge) - float(LIVE_EDGE_DROP_TRIGGER_PCT_POINTS) - worsened_need)
         if LIVE_EXIT_AGGRESSIVE_FALLBACK_ENABLED:
             pa = _compute_sell_aggressive_price_cents(quotes, order_side, LIVE_ORDER_FILL_MODE)
             if pa is not None:
@@ -3846,6 +3923,24 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
         for idx, a in enumerate(attempts):
             if remaining <= 0:
                 break
+            if str(a.get("kind", "")).strip().lower() == "aggressive" and LIVE_EDGE_DROP_EXIT_ENABLED and not aggressive_gate:
+                # Re-check worsening before escalating to aggressive exit.
+                ob_now = kalshi_get_orderbook(ticker)
+                yb_now, ya_now, _sz_now = best_bid_and_ask_from_orderbook(ob_now)
+                if yb_now is not None and ya_now is not None:
+                    edge_now_latest = _net_edge_now_pct_for_side(
+                        bet_side,
+                        model_yes_prob_pct,
+                        float(yb_now),
+                        float(ya_now),
+                    )
+                    worsened_need = max(0.0, float(LIVE_EDGE_DROP_AGGRESSIVE_WORSEN_PCT_POINTS))
+                    if edge_now_latest is not None:
+                        aggressive_gate = float(edge_now_latest) <= (
+                            float(entry_edge) - float(LIVE_EDGE_DROP_TRIGGER_PCT_POINTS) - worsened_need
+                        )
+                if not aggressive_gate:
+                    continue
             tif_norm = normalize_time_in_force(
                 str(a["tif"]),
                 default=("fill_or_kill" if str(a.get("kind", "")).strip().lower() == "aggressive" else "good_til_cancelled"),
@@ -3869,7 +3964,7 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
             fee_d = _extract_fee_dollars_from_order_response(resp)
             total_fee += float(fee_d)
             total_filled += int(fill_count)
-            remaining = max(0, int(pos.get("open_count", 0)) - int(total_filled))
+            remaining = max(0, int(target_count) - int(total_filled))
             status_local = "rejected" if err else ("submitted" if fill_count > 0 else "not_filled")
             final_exec = {
                 "status": status_local,
@@ -3908,7 +4003,7 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
             "bet": bet_side,
             "line": pos.get("line"),
             "edge_pct": round(float(edge_now), 2),
-            "units": pos.get("open_count"),
+            "units": target_count,
             "stake_dollars": "",
             "side": order_side,
             "limit_price_cents": final_exec.get("limit_price_cents"),
@@ -3932,7 +4027,16 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
         if int(total_filled) > 0:
             placed += 1
             exit_logs.append(done_item)
-            if pos_sig in exit_state:
+            if exit_plan == "partial":
+                exit_state[pos_sig] = {
+                    "streak": 0,
+                    "last_ts_est": fmt_est(now_local),
+                    "edge_now_pct": round(float(edge_now), 4),
+                    "entry_edge_pct": round(float(entry_edge), 4),
+                    "trigger": trigger_name,
+                    "partial_taken": True,
+                }
+            elif pos_sig in exit_state:
                 del exit_state[pos_sig]
 
     if exit_logs:
@@ -5073,6 +5177,11 @@ def health():
         "live_exit_aggressive_time_in_force": LIVE_EXIT_AGGRESSIVE_TIME_IN_FORCE,
         "live_exit_max_spread_cents": LIVE_EXIT_MAX_SPREAD_CENTS,
         "live_exit_only_when_losing": LIVE_EXIT_ONLY_WHEN_LOSING,
+        "live_edge_drop_exit_enabled": LIVE_EDGE_DROP_EXIT_ENABLED,
+        "live_edge_drop_trigger_pct_points": LIVE_EDGE_DROP_TRIGGER_PCT_POINTS,
+        "live_edge_drop_small_green_max_pct_of_stake": LIVE_EDGE_DROP_SMALL_GREEN_MAX_PCT_OF_STAKE,
+        "live_edge_drop_partial_sell_fraction": LIVE_EDGE_DROP_PARTIAL_SELL_FRACTION,
+        "live_edge_drop_aggressive_worsen_pct_points": LIVE_EDGE_DROP_AGGRESSIVE_WORSEN_PCT_POINTS,
         "kelly_sizing_enabled": KELLY_SIZING_ENABLED,
         "kelly_fraction": KELLY_FRACTION,
         "kelly_bankroll_dollars": KELLY_BANKROLL_DOLLARS,

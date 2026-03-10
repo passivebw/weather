@@ -215,6 +215,7 @@ ACCUWEATHER_API_KEY = os.getenv("ACCUWEATHER_API_KEY", "").strip()
 ACCUWEATHER_HIST_MAE_F = float(os.getenv("ACCUWEATHER_HIST_MAE_F", "2.0"))
 ENABLE_NWS_SOURCE = env_bool("ENABLE_NWS_SOURCE", default=False)
 ENABLE_METNO_SOURCE = env_bool("ENABLE_METNO_SOURCE", default=True)
+ENABLE_ACCUWEATHER_SOURCE = env_bool("ENABLE_ACCUWEATHER_SOURCE", default=True)
 MANUAL_WEATHERCOM_HIGHS = os.getenv("MANUAL_WEATHERCOM_HIGHS", "").strip()
 MANUAL_ACCUWEATHER_HIGHS = os.getenv("MANUAL_ACCUWEATHER_HIGHS", "").strip()
 
@@ -1420,6 +1421,14 @@ def build_expert_consensus(city: str, now_local: datetime, temp_side: str = "hig
                 nws_low = nws_get_forecast_low_f(lat, lon, now_local)
                 if nws_low is not None:
                     source_values.append(("NWS", nws_low, safe_inverse_mae_weight(NWS_LOW_HIST_MAE_F)))
+        except Exception:
+            pass
+
+    if ENABLE_ACCUWEATHER_SOURCE:
+        try:
+            aw_temp = accuweather_get_forecast_temp_f(lat, lon, now_local, temp_side=side)
+            if aw_temp is not None:
+                source_values.append(("AccuWeather", aw_temp, safe_inverse_mae_weight(ACCUWEATHER_HIST_MAE_F)))
         except Exception:
             pass
 
@@ -4643,6 +4652,14 @@ def health():
     ]
     if ENABLE_NWS_SOURCE:
         configured_sources.append("NWS")
+    else:
+        configured_sources.append("NWS (disabled via ENABLE_NWS_SOURCE)")
+    if ENABLE_ACCUWEATHER_SOURCE and ACCUWEATHER_API_KEY:
+        configured_sources.append("AccuWeather")
+    elif ENABLE_ACCUWEATHER_SOURCE and not ACCUWEATHER_API_KEY:
+        configured_sources.append("AccuWeather (enabled but missing ACCUWEATHER_API_KEY)")
+    else:
+        configured_sources.append("AccuWeather (disabled via ENABLE_ACCUWEATHER_SOURCE)")
     return {
         "ok": True,
         "cities": list(CITY_CONFIG.keys()),

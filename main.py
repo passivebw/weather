@@ -43,6 +43,27 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def normalize_time_in_force(tif: str, *, default: str = "fill_or_kill") -> str:
+    raw = str(tif or "").strip().lower()
+    if not raw:
+        return default
+    aliases = {
+        "fok": "fill_or_kill",
+        "fill_or_kill": "fill_or_kill",
+        "ioc": "immediate_or_cancel",
+        "immediate_or_cancel": "immediate_or_cancel",
+        "gtc": "good_til_cancelled",
+        "good_til_cancelled": "good_til_cancelled",
+        "good_till_cancelled": "good_til_cancelled",
+        "good_til_canceled": "good_til_cancelled",
+        "good_till_canceled": "good_til_cancelled",
+        "gtd": "good_til_date",
+        "good_til_date": "good_til_date",
+        "good_till_date": "good_til_date",
+    }
+    return aliases.get(raw, default)
+
+
 def fmt_est(dt: datetime) -> str:
     est_tz = tz.tzoffset("EST", -5 * 3600)
     return dt.astimezone(est_tz).strftime("%Y-%m-%d %I:%M:%S %p EST")
@@ -3070,6 +3091,10 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             def _submit_limit(limit_price: int, tif: str, mode: str, spread_cents: Optional[int], desired_count: Optional[int] = None) -> dict:
                 count_local = int(desired_count) if desired_count is not None else _compute_contract_count(stake_dollars, int(limit_price))
                 count_local = max(1, min(LIVE_MAX_CONTRACTS_PER_ORDER, int(count_local)))
+                tif_norm = normalize_time_in_force(
+                    tif,
+                    default=("fill_or_kill" if str(mode).strip().lower() == "aggressive" else "good_til_cancelled"),
+                )
                 payload = {
                     "ticker": ticker,
                     "client_order_id": f"bot-{today_key}-{uuid.uuid4().hex[:12]}",
@@ -3077,11 +3102,10 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                     "side": order_side,
                     "count": int(count_local),
                     price_field: int(limit_price),
-                    "time_in_force": tif,
+                    "time_in_force": tif_norm,
                 }
-                # IOC/FOK orders must not include expiration_ts on Kalshi.
-                tif_norm = str(tif or "").strip().lower()
-                if tif_norm not in {"immediate_or_cancel", "fill_or_kill"}:
+                # Only GTD should carry an explicit expiration timestamp.
+                if tif_norm == "good_til_date":
                     payload["expiration_ts"] = int(time.time()) + max(5, LIVE_ORDER_EXPIRATION_SECONDS)
                 resp_local = kalshi_post("/portfolio/orders", payload, timeout=20, max_retries=2)
                 err_local = str(resp_local.get("error", "") or "")
@@ -3107,7 +3131,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                     "order_action": str(payload.get("action", "buy")),
                     "count": int(count_local),
                     "limit_price_cents": int(limit_price),
-                    "time_in_force": tif,
+                    "time_in_force": tif_norm,
                     "mode": mode,
                     "filled": filled_any,
                     "filled_all": filled_all,
@@ -3500,6 +3524,10 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
         for idx, a in enumerate(attempts):
             if remaining <= 0:
                 break
+            tif_norm = normalize_time_in_force(
+                str(a["tif"]),
+                default=("fill_or_kill" if str(a.get("kind", "")).strip().lower() == "aggressive" else "good_til_cancelled"),
+            )
             payload = {
                 "ticker": ticker,
                 "client_order_id": f"bot-exit-{market_date}-{uuid.uuid4().hex[:10]}",
@@ -3507,10 +3535,9 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
                 "side": order_side,
                 "count": int(remaining),
                 price_field: int(a["price"]),
-                "time_in_force": str(a["tif"]),
+                "time_in_force": tif_norm,
             }
-            tif_norm = str(a["tif"]).strip().lower()
-            if tif_norm not in {"immediate_or_cancel", "fill_or_kill"}:
+            if tif_norm == "good_til_date":
                 payload["expiration_ts"] = int(time.time()) + max(5, LIVE_ORDER_EXPIRATION_SECONDS)
             resp = kalshi_post("/portfolio/orders", payload, timeout=20, max_retries=2)
             err = str(resp.get("error", "") or "")
@@ -3530,7 +3557,7 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
                 "order_action": "sell",
                 "count": int(fill_count),
                 "limit_price_cents": int(a["price"]),
-                "time_in_force": str(a["tif"]),
+                "time_in_force": tif_norm,
                 "mode": str(a["kind"]),
                 "order_status_raw": order_status,
             }

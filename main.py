@@ -225,6 +225,7 @@ ENABLE_METNO_SOURCE = env_bool("ENABLE_METNO_SOURCE", default=True)
 ENABLE_ACCUWEATHER_SOURCE = env_bool("ENABLE_ACCUWEATHER_SOURCE", default=True)
 ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS", "2592000"))
 ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS", "3600"))
+ACCUWEATHER_STALE_FALLBACK_MAX_AGE_SECONDS = int(os.getenv("ACCUWEATHER_STALE_FALLBACK_MAX_AGE_SECONDS", "172800"))
 LIVE_PRETRADE_ACCUWEATHER_REFRESH_ENABLED = env_bool("LIVE_PRETRADE_ACCUWEATHER_REFRESH_ENABLED", default=True)
 LIVE_PRETRADE_ACCUWEATHER_MAX_AGE_SECONDS = int(os.getenv("LIVE_PRETRADE_ACCUWEATHER_MAX_AGE_SECONDS", "1800"))
 MANUAL_WEATHERCOM_HIGHS = os.getenv("MANUAL_WEATHERCOM_HIGHS", "").strip()
@@ -307,6 +308,10 @@ _kalshi_key_cache = None
 _kalshi_key_lock = threading.Lock()
 _accuweather_location_cache: Dict[str, Dict[str, object]] = {}
 _accuweather_forecast_cache: Dict[str, Dict[str, object]] = {}
+_accuweather_cache_loaded = False
+_accuweather_last_success_est = ""
+_accuweather_last_error = ""
+_accuweather_last_error_est = ""
 
 
 # -----------------------
@@ -685,7 +690,63 @@ def weathercom_get_forecast_temp_f(lat: float, lon: float, now_local: datetime, 
             return float(v)
     return None
 
+def accuweather_cache_state_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "accuweather_cache_state.json")
+
+def _load_accuweather_cache_state() -> None:
+    global _accuweather_cache_loaded, _accuweather_last_success_est, _accuweather_last_error, _accuweather_last_error_est
+    if _accuweather_cache_loaded:
+        return
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = accuweather_cache_state_path()
+    with _accuweather_cache_lock:
+        if _accuweather_cache_loaded:
+            return
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                loc = payload.get("location_cache", {})
+                fc = payload.get("forecast_cache", {})
+                if isinstance(loc, dict):
+                    _accuweather_location_cache.update({str(k): v for k, v in loc.items() if isinstance(v, dict)})
+                if isinstance(fc, dict):
+                    _accuweather_forecast_cache.update({str(k): v for k, v in fc.items() if isinstance(v, dict)})
+                _accuweather_last_success_est = str(payload.get("last_success_est", "") or "")
+                _accuweather_last_error = str(payload.get("last_error", "") or "")
+                _accuweather_last_error_est = str(payload.get("last_error_est", "") or "")
+            except Exception:
+                pass
+        _accuweather_cache_loaded = True
+
+def _save_accuweather_cache_state() -> None:
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = accuweather_cache_state_path()
+    tmp = path + ".tmp"
+    with _accuweather_cache_lock:
+        payload = {
+            "saved_ts_est": fmt_est(datetime.now(tz=LOCAL_TZ)),
+            "last_success_est": _accuweather_last_success_est,
+            "last_error": _accuweather_last_error,
+            "last_error_est": _accuweather_last_error_est,
+            "location_cache": _accuweather_location_cache,
+            "forecast_cache": _accuweather_forecast_cache,
+        }
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True)
+    os.replace(tmp, path)
+
+def _record_accuweather_error(err: Exception) -> None:
+    global _accuweather_last_error, _accuweather_last_error_est
+    _accuweather_last_error = f"{type(err).__name__}: {str(err)}"
+    _accuweather_last_error_est = fmt_est(datetime.now(tz=LOCAL_TZ))
+    try:
+        _save_accuweather_cache_state()
+    except Exception:
+        pass
+
 def accuweather_location_key_from_latlon(lat: float, lon: float) -> Optional[str]:
+    _load_accuweather_cache_state()
     if not ACCUWEATHER_API_KEY:
         return None
     coord_key = f"{lat:.4f},{lon:.4f}"
@@ -701,9 +762,13 @@ def accuweather_location_key_from_latlon(lat: float, lon: float) -> Optional[str
         "apikey": ACCUWEATHER_API_KEY,
         "q": coord_key,
     }
-    r = requests.get("https://dataservice.accuweather.com/locations/v1/cities/geoposition/search", params=params, timeout=20)
-    r.raise_for_status()
-    payload = r.json()
+    try:
+        r = requests.get("https://dataservice.accuweather.com/locations/v1/cities/geoposition/search", params=params, timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        _record_accuweather_error(e)
+        return None
     key = payload.get("Key")
     loc_key = str(key) if key else None
     if loc_key:
@@ -712,6 +777,10 @@ def accuweather_location_key_from_latlon(lat: float, lon: float) -> Optional[str
                 "ts": now_ts,
                 "location_key": loc_key,
             }
+        try:
+            _save_accuweather_cache_state()
+        except Exception:
+            pass
     return loc_key
 
 def accuweather_get_forecast_high_f(lat: float, lon: float, now_local: datetime) -> Optional[float]:
@@ -727,6 +796,8 @@ def accuweather_get_forecast_temp_f(
     temp_side: str = "high",
     force_refresh: bool = False,
 ) -> Optional[float]:
+    global _accuweather_last_success_est
+    _load_accuweather_cache_state()
     side = normalize_temp_side(temp_side)
     if not ACCUWEATHER_API_KEY:
         return None
@@ -752,9 +823,22 @@ def accuweather_get_forecast_temp_f(
         "metric": "false",
     }
     url = f"https://dataservice.accuweather.com/forecasts/v1/daily/1day/{loc_key}"
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    payload = r.json()
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        _record_accuweather_error(e)
+        # Fallback to most recent cached value if still reasonably fresh.
+        with _accuweather_cache_lock:
+            cached = _accuweather_forecast_cache.get(cache_key)
+            if isinstance(cached, dict):
+                age = now_ts - float(cached.get("ts", 0.0) or 0.0)
+                if age <= max(300, ACCUWEATHER_STALE_FALLBACK_MAX_AGE_SECONDS):
+                    v = cached.get("high_f") if side == "high" else cached.get("low_f")
+                    if v is not None:
+                        return float(v)
+        return None
     forecasts = payload.get("DailyForecasts", []) or []
     if not forecasts:
         return None
@@ -770,6 +854,11 @@ def accuweather_get_forecast_temp_f(
             "high_f": high_f,
             "low_f": low_f,
         }
+    _accuweather_last_success_est = fmt_est(datetime.now(tz=LOCAL_TZ))
+    try:
+        _save_accuweather_cache_state()
+    except Exception:
+        pass
     value = high_f if side == "high" else low_f
     return None if value is None else float(value)
 
@@ -4983,6 +5072,10 @@ def health():
         "discrepancy_temp_threshold_f": DISCREPANCY_MEAN_TEMP_THRESHOLD_F,
         "accuweather_location_cache_ttl_seconds": ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS,
         "accuweather_forecast_cache_ttl_seconds": ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS,
+        "accuweather_stale_fallback_max_age_seconds": ACCUWEATHER_STALE_FALLBACK_MAX_AGE_SECONDS,
+        "accuweather_last_success_est": _accuweather_last_success_est,
+        "accuweather_last_error_est": _accuweather_last_error_est,
+        "accuweather_last_error": _accuweather_last_error,
         "live_pretrade_accuweather_refresh_enabled": LIVE_PRETRADE_ACCUWEATHER_REFRESH_ENABLED,
         "live_pretrade_accuweather_max_age_seconds": LIVE_PRETRADE_ACCUWEATHER_MAX_AGE_SECONDS,
         "consensus_sources": configured_sources,
@@ -7442,5 +7535,9 @@ def background_loop():
 
 @app.on_event("startup")
 def on_startup():
+    try:
+        _load_accuweather_cache_state()
+    except Exception:
+        pass
     threading.Thread(target=background_loop, daemon=True).start()
 

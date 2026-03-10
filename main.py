@@ -84,7 +84,8 @@ DAILY_UPDATE_EST_MINUTE = int(os.getenv("DAILY_UPDATE_EST_MINUTE", "0"))
 DAILY_UPDATE_TOTAL_ROI_BASELINE_DOLLARS = float(os.getenv("DAILY_UPDATE_TOTAL_ROI_BASELINE_DOLLARS", "294"))
 NYC_FORECAST_BRIEF_ENABLED = env_bool("NYC_FORECAST_BRIEF_ENABLED", default=True)
 NYC_FORECAST_BRIEF_CITY = os.getenv("NYC_FORECAST_BRIEF_CITY", "New York City").strip() or "New York City"
-NYC_FORECAST_BRIEF_TEMP_SIDE = normalize_temp_side(os.getenv("NYC_FORECAST_BRIEF_TEMP_SIDE", "high"))
+_nyc_forecast_brief_temp_side_raw = os.getenv("NYC_FORECAST_BRIEF_TEMP_SIDE", "high").strip().lower()
+NYC_FORECAST_BRIEF_TEMP_SIDE = _nyc_forecast_brief_temp_side_raw if _nyc_forecast_brief_temp_side_raw in {"high", "low"} else "high"
 NYC_FORECAST_BRIEF_EVENING_HOUR_ET = int(os.getenv("NYC_FORECAST_BRIEF_EVENING_HOUR_ET", "20"))
 NYC_FORECAST_BRIEF_MORNING_HOUR_ET = int(os.getenv("NYC_FORECAST_BRIEF_MORNING_HOUR_ET", "7"))
 NYC_FORECAST_BRIEF_MINUTE_ET = int(os.getenv("NYC_FORECAST_BRIEF_MINUTE_ET", "0"))

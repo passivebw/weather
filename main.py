@@ -216,6 +216,8 @@ ACCUWEATHER_HIST_MAE_F = float(os.getenv("ACCUWEATHER_HIST_MAE_F", "2.0"))
 ENABLE_NWS_SOURCE = env_bool("ENABLE_NWS_SOURCE", default=False)
 ENABLE_METNO_SOURCE = env_bool("ENABLE_METNO_SOURCE", default=True)
 ENABLE_ACCUWEATHER_SOURCE = env_bool("ENABLE_ACCUWEATHER_SOURCE", default=True)
+ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS", "2592000"))
+ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS", "3600"))
 MANUAL_WEATHERCOM_HIGHS = os.getenv("MANUAL_WEATHERCOM_HIGHS", "").strip()
 MANUAL_ACCUWEATHER_HIGHS = os.getenv("MANUAL_ACCUWEATHER_HIGHS", "").strip()
 
@@ -290,8 +292,11 @@ _live_exit_state_date = ""
 _live_exit_state: Dict[str, dict] = {}
 _live_kill_switch_state = LIVE_KILL_SWITCH
 _market_cache_lock = threading.Lock()
+_accuweather_cache_lock = threading.Lock()
 _kalshi_key_cache = None
 _kalshi_key_lock = threading.Lock()
+_accuweather_location_cache: Dict[str, Dict[str, object]] = {}
+_accuweather_forecast_cache: Dict[str, Dict[str, object]] = {}
 
 
 # -----------------------
@@ -673,15 +678,31 @@ def weathercom_get_forecast_temp_f(lat: float, lon: float, now_local: datetime, 
 def accuweather_location_key_from_latlon(lat: float, lon: float) -> Optional[str]:
     if not ACCUWEATHER_API_KEY:
         return None
+    coord_key = f"{lat:.4f},{lon:.4f}"
+    now_ts = time.time()
+    with _accuweather_cache_lock:
+        cached = _accuweather_location_cache.get(coord_key)
+        if isinstance(cached, dict):
+            age = now_ts - float(cached.get("ts", 0.0) or 0.0)
+            loc_key_cached = str(cached.get("location_key", "") or "").strip()
+            if loc_key_cached and age < max(60, ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS):
+                return loc_key_cached
     params = {
         "apikey": ACCUWEATHER_API_KEY,
-        "q": f"{lat:.4f},{lon:.4f}",
+        "q": coord_key,
     }
     r = requests.get("https://dataservice.accuweather.com/locations/v1/cities/geoposition/search", params=params, timeout=20)
     r.raise_for_status()
     payload = r.json()
     key = payload.get("Key")
-    return str(key) if key else None
+    loc_key = str(key) if key else None
+    if loc_key:
+        with _accuweather_cache_lock:
+            _accuweather_location_cache[coord_key] = {
+                "ts": now_ts,
+                "location_key": loc_key,
+            }
+    return loc_key
 
 def accuweather_get_forecast_high_f(lat: float, lon: float, now_local: datetime) -> Optional[float]:
     return accuweather_get_forecast_temp_f(lat, lon, now_local, temp_side="high")
@@ -696,6 +717,18 @@ def accuweather_get_forecast_temp_f(lat: float, lon: float, now_local: datetime,
     loc_key = accuweather_location_key_from_latlon(lat, lon)
     if not loc_key:
         return None
+    cache_key = str(loc_key).strip()
+    today_iso = now_local.date().isoformat()
+    now_ts = time.time()
+    with _accuweather_cache_lock:
+        cached = _accuweather_forecast_cache.get(cache_key)
+        if isinstance(cached, dict):
+            age = now_ts - float(cached.get("ts", 0.0) or 0.0)
+            date_cached = str(cached.get("date", "") or "").strip()
+            if age < max(60, ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS) and date_cached == today_iso:
+                v = cached.get("high_f") if side == "high" else cached.get("low_f")
+                if v is not None:
+                    return float(v)
     params = {
         "apikey": ACCUWEATHER_API_KEY,
         "details": "false",
@@ -708,11 +741,20 @@ def accuweather_get_forecast_temp_f(lat: float, lon: float, now_local: datetime,
     forecasts = payload.get("DailyForecasts", []) or []
     if not forecasts:
         return None
-    key = "Maximum" if side == "high" else "Minimum"
-    value = forecasts[0].get("Temperature", {}).get(key, {}).get("Value")
-    if value is None:
-        return None
-    return float(value)
+    t_obj = forecasts[0].get("Temperature", {}) or {}
+    v_high = t_obj.get("Maximum", {}).get("Value")
+    v_low = t_obj.get("Minimum", {}).get("Value")
+    high_f = (None if v_high is None else float(v_high))
+    low_f = (None if v_low is None else float(v_low))
+    with _accuweather_cache_lock:
+        _accuweather_forecast_cache[cache_key] = {
+            "ts": now_ts,
+            "date": today_iso,
+            "high_f": high_f,
+            "low_f": low_f,
+        }
+    value = high_f if side == "high" else low_f
+    return None if value is None else float(value)
 
 
 # -----------------------
@@ -4783,6 +4825,8 @@ def health():
         "settlement_verification_endpoint": "/settlement-map",
         "discrepancy_alert_threshold": DISCREPANCY_ALERT_THRESHOLD,
         "discrepancy_temp_threshold_f": DISCREPANCY_MEAN_TEMP_THRESHOLD_F,
+        "accuweather_location_cache_ttl_seconds": ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS,
+        "accuweather_forecast_cache_ttl_seconds": ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS,
         "consensus_sources": configured_sources,
     }
 

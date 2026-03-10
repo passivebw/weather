@@ -226,6 +226,8 @@ ENABLE_ACCUWEATHER_SOURCE = env_bool("ENABLE_ACCUWEATHER_SOURCE", default=True)
 ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS", "2592000"))
 ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS", "3600"))
 ACCUWEATHER_STALE_FALLBACK_MAX_AGE_SECONDS = int(os.getenv("ACCUWEATHER_STALE_FALLBACK_MAX_AGE_SECONDS", "172800"))
+ACCUWEATHER_LOCATION_LOOKUP_MIN_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_LOOKUP_MIN_SECONDS", "10"))
+ACCUWEATHER_LOCATION_ERROR_BACKOFF_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_ERROR_BACKOFF_SECONDS", "1800"))
 LIVE_PRETRADE_ACCUWEATHER_REFRESH_ENABLED = env_bool("LIVE_PRETRADE_ACCUWEATHER_REFRESH_ENABLED", default=True)
 LIVE_PRETRADE_ACCUWEATHER_MAX_AGE_SECONDS = int(os.getenv("LIVE_PRETRADE_ACCUWEATHER_MAX_AGE_SECONDS", "1800"))
 MANUAL_WEATHERCOM_HIGHS = os.getenv("MANUAL_WEATHERCOM_HIGHS", "").strip()
@@ -312,6 +314,7 @@ _accuweather_cache_loaded = False
 _accuweather_last_success_est = ""
 _accuweather_last_error = ""
 _accuweather_last_error_est = ""
+_accuweather_location_lookup_last_ts = 0.0
 
 
 # -----------------------
@@ -746,6 +749,7 @@ def _record_accuweather_error(err: Exception) -> None:
         pass
 
 def accuweather_location_key_from_latlon(lat: float, lon: float) -> Optional[str]:
+    global _accuweather_location_lookup_last_ts
     _load_accuweather_cache_state()
     if not ACCUWEATHER_API_KEY:
         return None
@@ -758,6 +762,13 @@ def accuweather_location_key_from_latlon(lat: float, lon: float) -> Optional[str
             loc_key_cached = str(cached.get("location_key", "") or "").strip()
             if loc_key_cached and age < max(60, ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS):
                 return loc_key_cached
+            no_retry_until = float(cached.get("no_retry_until_ts", 0.0) or 0.0)
+            if no_retry_until > now_ts:
+                return None
+        min_gap = max(1, ACCUWEATHER_LOCATION_LOOKUP_MIN_SECONDS)
+        if (now_ts - _accuweather_location_lookup_last_ts) < min_gap:
+            return None
+        _accuweather_location_lookup_last_ts = now_ts
     params = {
         "apikey": ACCUWEATHER_API_KEY,
         "q": coord_key,
@@ -768,6 +779,26 @@ def accuweather_location_key_from_latlon(lat: float, lon: float) -> Optional[str
         payload = r.json()
     except Exception as e:
         _record_accuweather_error(e)
+        backoff_seconds = max(60, ACCUWEATHER_LOCATION_ERROR_BACKOFF_SECONDS)
+        if isinstance(e, requests.HTTPError):
+            try:
+                status = int(getattr(e.response, "status_code", 0) or 0)
+            except Exception:
+                status = 0
+            if status in (401, 403):
+                backoff_seconds = max(backoff_seconds, 21600)
+            elif status == 429:
+                backoff_seconds = max(backoff_seconds, 3600)
+        with _accuweather_cache_lock:
+            cur = _accuweather_location_cache.get(coord_key, {})
+            if not isinstance(cur, dict):
+                cur = {}
+            cur["no_retry_until_ts"] = time.time() + float(backoff_seconds)
+            _accuweather_location_cache[coord_key] = cur
+        try:
+            _save_accuweather_cache_state()
+        except Exception:
+            pass
         return None
     key = payload.get("Key")
     loc_key = str(key) if key else None
@@ -776,6 +807,7 @@ def accuweather_location_key_from_latlon(lat: float, lon: float) -> Optional[str
             _accuweather_location_cache[coord_key] = {
                 "ts": now_ts,
                 "location_key": loc_key,
+                "no_retry_until_ts": 0.0,
             }
         try:
             _save_accuweather_cache_state()
@@ -5073,6 +5105,8 @@ def health():
         "accuweather_location_cache_ttl_seconds": ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS,
         "accuweather_forecast_cache_ttl_seconds": ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS,
         "accuweather_stale_fallback_max_age_seconds": ACCUWEATHER_STALE_FALLBACK_MAX_AGE_SECONDS,
+        "accuweather_location_lookup_min_seconds": ACCUWEATHER_LOCATION_LOOKUP_MIN_SECONDS,
+        "accuweather_location_error_backoff_seconds": ACCUWEATHER_LOCATION_ERROR_BACKOFF_SECONDS,
         "accuweather_last_success_est": _accuweather_last_success_est,
         "accuweather_last_error_est": _accuweather_last_error_est,
         "accuweather_last_error": _accuweather_last_error,

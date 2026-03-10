@@ -1689,11 +1689,6 @@ def build_city_bucket_comparison(
                 source_yes_p_raw = 0.0
                 locked_outcome = True
                 locked_reason = "high_obs_exceeded_bucket"
-            # If forecast ceiling remains below this bucket floor by margin, YES is impossible.
-            elif forecast_ceiling_f is not None and forecast_ceiling_f <= (float(r["lo"]) - HIGH_LOCK_MARGIN_F):
-                source_yes_p_raw = 0.0
-                locked_outcome = True
-                locked_reason = "forecast_ceiling_below_bucket"
             else:
                 source_yes_p_raw = conditional_high_bucket_prob(
                     consensus_mu,

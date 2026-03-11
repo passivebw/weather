@@ -4806,6 +4806,7 @@ def home():
         <a class="nav-box" href="#criteria"><b>Trade Criteria</b><span>edge floors, ladder size, scan cadence, gating</span></a>
         <a class="nav-box" href="#model"><b>Model Quality</b><span>city/side attribution, ladder accuracy, rejection health</span></a>
         <a class="nav-box" href="#ev"><b>EV vs Outcome</b><span>cumulative expected P/L against realized P/L</span></a>
+        <a class="nav-box" href="#daily"><b>Daily Stats</b><span>per-day scorecard for fills, EV gap, and execution quality</span></a>
       </div>
     </section>
 
@@ -4902,12 +4903,29 @@ def home():
         <span><i class="dot green"></i>Realized P/L NET Cumulative ($)</span>
       </div>
     </section>
+
+    <section class="card" id="daily" style="margin-top:12px;">
+      <h2>Daily Stats</h2>
+      <div class="meta">Day-level outcomes and execution quality from <span class="mono">/analytics/live-insights</span>.</div>
+      <div class="toolbar">
+        <button class="btn active" data-daily-days="7">Daily 7D</button>
+        <button class="btn" data-daily-days="14">Daily 14D</button>
+        <button class="btn" data-daily-days="30">Daily 30D</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Date</th><th>Fills</th><th>Settled</th><th>Expected</th><th>Realized</th><th>Gap</th><th>Win Rate</th><th>ROI</th><th>Attempts</th><th>Rejected</th><th>Reject Rate</th></tr></thead>
+          <tbody id="dailyRows"><tr><td colspan="11">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </section>
   </main>
 
   <script>
     const $ = (id) => document.getElementById(id);
     let rangeDays = 7;
     let evRangeDays = 7;
+    let dailyRangeDays = 14;
     let liveStatusCache = {};
 
     function esc(v) { return String(v ?? ""); }
@@ -5054,16 +5072,19 @@ def home():
       const start = new Date();
       start.setDate(end.getDate() - (rangeDays - 1));
       const q = new URLSearchParams({ start: ymd(start), end: ymd(end) });
+      const dailyStart = new Date();
+      dailyStart.setDate(end.getDate() - (dailyRangeDays - 1));
+      const qDaily = new URLSearchParams({ start: ymd(dailyStart), end: ymd(end) });
       const evStart = new Date();
       evStart.setDate(end.getDate() - (evRangeDays - 1));
       const firstTradeDate = String((liveStatusCache && liveStatusCache.first_trade_date) || "").trim();
       const historyStart = (firstTradeDate && /^\\d{4}-\\d{2}-\\d{2}$/.test(firstTradeDate)) ? firstTradeDate : ymd(evStart);
       const qEv = new URLSearchParams({ start: historyStart, end: ymd(end) });
-      const [dataSettled, dataInsights] = await Promise.all([
+      const [dataSettled, dataInsights, dataDaily] = await Promise.all([
         fetch(`/analytics/live-scorecard?${q.toString()}`).then(r => r.json()),
         fetch(`/analytics/live-insights?${q.toString()}`).then(r => r.json()),
+        fetch(`/analytics/live-insights?${qDaily.toString()}`).then(r => r.json()),
       ]);
-      const s = (dataSettled && dataSettled.summary) || {};
       const iq = (dataInsights && dataInsights.summary) || {};
       $("modelFills").textContent = iq.fills ?? "-";
       $("modelSettled").textContent = iq.settled_count ?? "-";
@@ -5116,6 +5137,23 @@ def home():
           <td>${esc(e.error)}</td>
         </tr>
       `).join("") : "<tr><td colspan='5'>No recent errors in this window.</td></tr>";
+
+      const dailyRows = Array.isArray(dataDaily.per_day) ? dataDaily.per_day : [];
+      $("dailyRows").innerHTML = dailyRows.length ? dailyRows.slice().reverse().map(d => `
+        <tr>
+          <td>${esc(d.date)}</td>
+          <td>${esc(d.fills)}</td>
+          <td>${esc(d.settled_count)}</td>
+          <td>${money(d.expected_net_dollars)}</td>
+          <td>${money(d.realized_dollars)}</td>
+          <td>${money(d.ev_gap_dollars)}</td>
+          <td>${pct(d.realized_win_rate_pct)}</td>
+          <td>${pct(d.realized_roi_pct_on_stake)}</td>
+          <td>${esc(d.orders_attempted)}</td>
+          <td>${esc(d.orders_rejected)}</td>
+          <td>${pct(d.rejected_rate_pct)}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='11'>No daily data in this window.</td></tr>";
 
       const dataEv = await fetch(`/analytics/live-scorecard?${qEv.toString()}`).then(r => r.json());
       const perAll = Array.isArray(dataEv.per_day) ? dataEv.per_day.filter(x => x.ok) : [];
@@ -5181,6 +5219,15 @@ def home():
       btn.addEventListener("click", async () => {
         evRangeDays = Number(btn.dataset.evDays || "7");
         document.querySelectorAll(".btn[data-ev-days]").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        await loadAnalytics();
+      });
+    });
+
+    document.querySelectorAll(".btn[data-daily-days]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        dailyRangeDays = Number(btn.dataset.dailyDays || "14");
+        document.querySelectorAll(".btn[data-daily-days]").forEach(b => b.classList.remove("active"));
         btn.classList.add("active");
         await loadAnalytics();
       });
@@ -6995,16 +7042,30 @@ def analytics_live_insights(
     filled_rows = 0
     contracts_filled = 0
     recent_errors = []
+    attempts_by_day: Dict[str, dict] = {}
     for r in attempts:
+        day_key = str(r.get("date", "")).strip()
+        day_acc = attempts_by_day.setdefault(day_key, {
+            "orders_attempted": 0,
+            "orders_rejected": 0,
+            "orders_not_filled": 0,
+            "fill_rows": 0,
+            "contracts_filled": 0,
+        })
+        day_acc["orders_attempted"] += 1
         st = str(r.get("status", "")).strip().lower()
         cnt = int(float(_to_float(r.get("count")) or 0))
         if st == "rejected":
             rejected_orders += 1
+            day_acc["orders_rejected"] += 1
         elif st in ("not_filled", "edge_gone", "cancel_failed"):
             not_filled_orders += 1
+            day_acc["orders_not_filled"] += 1
         elif st in ("submitted", "partial", "partial_filled"):
             filled_rows += 1
             contracts_filled += max(0, cnt)
+            day_acc["fill_rows"] += 1
+            day_acc["contracts_filled"] += max(0, cnt)
         err = str(r.get("error", "") or "").strip()
         if err:
             recent_errors.append({
@@ -7022,6 +7083,31 @@ def analytics_live_insights(
     realized_total = float(summary.get("total_realized_pnl_dollars", 0.0) or 0.0)
     ev_gap = realized_total - expected_net
     avg_edge = (sum(float(_to_float(t.get("edge_pct")) or 0.0) for t in trades) / len(trades)) if trades else None
+    per_day_base = [dict(x) for x in (base.get("per_day", []) or []) if x.get("ok")]
+    per_day_out = []
+    for d in per_day_base:
+        day_key = str(d.get("date", "")).strip()
+        aa = attempts_by_day.get(day_key, {})
+        exp_net_day = float(_to_float(d.get("total_expected_profit_net_dollars")) or 0.0)
+        realized_day = float(_to_float(d.get("total_realized_pnl_dollars")) or 0.0)
+        attempted_day = int(aa.get("orders_attempted", 0))
+        rejected_day = int(aa.get("orders_rejected", 0))
+        per_day_out.append({
+            "date": day_key,
+            "fills": int(_to_float(d.get("fills")) or 0),
+            "settled_count": int(_to_float(d.get("realized_count")) or 0),
+            "expected_net_dollars": exp_net_day,
+            "realized_dollars": realized_day,
+            "ev_gap_dollars": realized_day - exp_net_day,
+            "realized_win_rate_pct": _to_float(d.get("realized_win_rate_pct")),
+            "realized_roi_pct_on_stake": _to_float(d.get("realized_roi_pct_on_stake")),
+            "orders_attempted": attempted_day,
+            "orders_rejected": rejected_day,
+            "rejected_rate_pct": ((100.0 * rejected_day / attempted_day) if attempted_day > 0 else None),
+            "orders_not_filled": int(aa.get("orders_not_filled", 0)),
+            "fill_rows": int(aa.get("fill_rows", 0)),
+            "contracts_filled": int(aa.get("contracts_filled", 0)),
+        })
 
     return {
         "ok": True,
@@ -7052,6 +7138,7 @@ def analytics_live_insights(
         "city_side": city_side,
         "edge_ladder": edge_ladder,
         "recent_errors": recent_errors,
+        "per_day": per_day_out,
     }
 
 def summarize_live_window(

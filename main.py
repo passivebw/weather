@@ -4858,13 +4858,18 @@ def home():
     <section class="card" id="ev" style="margin-top:12px;">
       <h2>Expected Value vs Actual Outcome</h2>
       <div class="meta">Live-only daily totals from <span class="mono">/analytics/live-scorecard</span>.</div>
+      <div class="toolbar">
+        <button class="btn active" data-ev-days="7">EV 7D</button>
+        <button class="btn" data-ev-days="14">EV 14D</button>
+        <button class="btn" data-ev-days="30">EV 30D</button>
+      </div>
       <div class="chart-wrap">
         <canvas id="evChart" width="1120" height="260"></canvas>
         <div id="chartTip" class="chart-tip" style="display:none;"></div>
       </div>
       <div class="legend">
-        <span><i class="dot blue"></i>Expected P/L NET ($)</span>
-        <span><i class="dot green"></i>Realized P/L NET ($)</span>
+        <span><i class="dot blue"></i>Expected P/L NET Cumulative ($)</span>
+        <span><i class="dot green"></i>Realized P/L NET Cumulative ($)</span>
       </div>
     </section>
   </main>
@@ -4872,6 +4877,8 @@ def home():
   <script>
     const $ = (id) => document.getElementById(id);
     let rangeDays = 7;
+    let evRangeDays = 7;
+    let liveStatusCache = {};
 
     function esc(v) { return String(v ?? ""); }
     function money(v) { return (v == null || isNaN(v)) ? "-" : `$${Number(v).toFixed(2)}`; }
@@ -4983,6 +4990,7 @@ def home():
         fetch("/live/status").then(r => r.json()),
         fetch("/live/last-orders?limit=30").then(r => r.json())
       ]);
+      liveStatusCache = liveRes || {};
 
       $("sys").textContent = healthRes.ok ? "Online" : "Issue";
       $("asOf").textContent = new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
@@ -5026,6 +5034,11 @@ def home():
       const start = new Date();
       start.setDate(end.getDate() - (rangeDays - 1));
       const q = new URLSearchParams({ start: ymd(start), end: ymd(end) });
+      const evStart = new Date();
+      evStart.setDate(end.getDate() - (evRangeDays - 1));
+      const firstTradeDate = String((liveStatusCache && liveStatusCache.first_trade_date) || "").trim();
+      const historyStart = (firstTradeDate && /^\\d{4}-\\d{2}-\\d{2}$/.test(firstTradeDate)) ? firstTradeDate : ymd(evStart);
+      const qEv = new URLSearchParams({ start: historyStart, end: ymd(end) });
       const [dataSettled, dataProxy] = await Promise.all([
         fetch(`/analytics/live-scorecard?${q.toString()}`).then(r => r.json()),
         fetch(`/analytics/live-scorecard?${q.toString()}&finalized_only=false`).then(r => r.json()),
@@ -5041,10 +5054,20 @@ def home():
       $("feesPaid").textContent = money(s.total_fees_dollars);
       $("feeRate").textContent = pct(s.fees_pct_on_stake);
 
-      const per = Array.isArray(dataSettled.per_day) ? dataSettled.per_day.filter(x => x.ok) : [];
-      const labels = per.map(x => x.date);
-      const exp = per.map(x => Number((x.total_expected_profit_net_dollars ?? x.total_expected_profit_dollars) || 0));
-      const real = per.map(x => Number(x.total_realized_pnl_dollars || 0));
+      const dataEv = await fetch(`/analytics/live-scorecard?${qEv.toString()}`).then(r => r.json());
+      const perAll = Array.isArray(dataEv.per_day) ? dataEv.per_day.filter(x => x.ok) : [];
+      let cExp = 0.0;
+      let cReal = 0.0;
+      const cumAll = perAll.map(x => {
+        cExp += Number((x.total_expected_profit_net_dollars ?? x.total_expected_profit_dollars) || 0);
+        cReal += Number(x.total_realized_pnl_dollars || 0);
+        return { date: String(x.date || ""), exp: cExp, real: cReal };
+      });
+      const evStartIso = ymd(evStart);
+      const visible = cumAll.filter(x => x.date >= evStartIso);
+      const labels = visible.map(x => x.date);
+      const exp = visible.map(x => Number(x.exp || 0));
+      const real = visible.map(x => Number(x.real || 0));
       chartCache = { labels, exp, real };
       drawLineChart(exp, real, labels);
       bindChartHover();
@@ -5070,7 +5093,7 @@ def home():
         const d = chartCache.labels[idx] || "-";
         const e = chartCache.exp[idx] || 0;
         const r = chartCache.real[idx] || 0;
-        tip.innerHTML = `<b>${esc(d)}</b><br/>Expected: ${money(e)}<br/>Realized: ${money(r)}`;
+        tip.innerHTML = `<b>${esc(d)}</b><br/>Expected Cum: ${money(e)}<br/>Realized Cum: ${money(r)}`;
         tip.style.display = "block";
         tip.style.left = Math.max(8, Math.min(rect.width - 170, mx + 10)) + "px";
         tip.style.top = Math.max(8, ev.clientY - rect.top - 10) + "px";
@@ -5086,6 +5109,15 @@ def home():
       btn.addEventListener("click", async () => {
         rangeDays = Number(btn.dataset.days || "7");
         document.querySelectorAll(".btn[data-days]").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        await loadScorecard();
+      });
+    });
+
+    document.querySelectorAll(".btn[data-ev-days]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        evRangeDays = Number(btn.dataset.evDays || "7");
+        document.querySelectorAll(".btn[data-ev-days]").forEach(b => b.classList.remove("active"));
         btn.classList.add("active");
         await loadScorecard();
       });
@@ -5275,6 +5307,21 @@ def live_status():
     now_local = datetime.now(tz=LOCAL_TZ)
     today_key = now_local.date().isoformat()
     state = _load_live_trade_state(today_key)
+    first_trade_date = ""
+    last_trade_date = ""
+    try:
+        rows = load_live_trade_log_rows()
+        dates = sorted({
+            str(r.get("date", "")).strip()
+            for r in rows
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", str(r.get("date", "")).strip())
+        })
+        if dates:
+            first_trade_date = dates[0]
+            last_trade_date = dates[-1]
+    except Exception:
+        first_trade_date = ""
+        last_trade_date = ""
     total = 0
     by_city_side: Dict[str, int] = {}
     for _, row in state.items():
@@ -5293,6 +5340,8 @@ def live_status():
         "orders_placed_today": total,
         "max_orders_per_day": LIVE_MAX_ORDERS_PER_DAY,
         "by_city_side": by_city_side,
+        "first_trade_date": first_trade_date,
+        "last_trade_date": last_trade_date,
         "log_path": live_trade_log_path(),
     }
 

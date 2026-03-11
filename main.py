@@ -464,6 +464,8 @@ def nws_get_today_temp_stats_f(
     date_tz: Optional[timezone] = None,
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[datetime]]:
     # Use a larger window so early-morning lows/highs are still included later in the day.
+    # date_tz is the settlement timezone basis (LST for the city); all day filtering
+    # must happen in this timezone to avoid DST window drift.
     feats = nws_get_recent_observations(station_id, limit=max(200, NWS_OBS_HISTORY_LIMIT))
     obs_tz = date_tz or LOCAL_TZ
     now_local = datetime.now(tz=obs_tz)
@@ -479,7 +481,7 @@ def nws_get_today_temp_stats_f(
         if not ts:
             continue
         try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(LOCAL_TZ)
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(obs_tz)
         except Exception:
             continue
 

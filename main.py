@@ -95,6 +95,12 @@ DAILY_UPDATE_DISCORD_ENABLED = env_bool("DAILY_UPDATE_DISCORD_ENABLED", default=
 DAILY_UPDATE_EST_HOUR = int(os.getenv("DAILY_UPDATE_EST_HOUR", "8"))
 DAILY_UPDATE_EST_MINUTE = int(os.getenv("DAILY_UPDATE_EST_MINUTE", "0"))
 DAILY_UPDATE_TOTAL_ROI_BASELINE_DOLLARS = float(os.getenv("DAILY_UPDATE_TOTAL_ROI_BASELINE_DOLLARS", "294"))
+ACCOUNT_DEPOSITS_DOLLARS = float(
+    os.getenv(
+        "ACCOUNT_DEPOSITS_DOLLARS",
+        os.getenv("DAILY_UPDATE_TOTAL_ROI_BASELINE_DOLLARS", "294"),
+    )
+)
 NYC_FORECAST_BRIEF_ENABLED = env_bool("NYC_FORECAST_BRIEF_ENABLED", default=True)
 NYC_FORECAST_BRIEF_CITY = os.getenv("NYC_FORECAST_BRIEF_CITY", "New York City").strip() or "New York City"
 _nyc_forecast_brief_temp_side_raw = os.getenv("NYC_FORECAST_BRIEF_TEMP_SIDE", "high").strip().lower()
@@ -2578,6 +2584,17 @@ def load_live_trade_log_rows() -> List[dict]:
             continue
     return rows
 
+def live_trade_log_date_bounds() -> Tuple[Optional[str], Optional[str]]:
+    rows = load_live_trade_log_rows()
+    dates = sorted({
+        str(r.get("date", "")).strip()
+        for r in rows
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", str(r.get("date", "")).strip())
+    })
+    if not dates:
+        return None, None
+    return dates[0], dates[-1]
+
 def rewrite_live_trade_log_rows(path: str, rows: List[dict]) -> None:
     if not path:
         return
@@ -4959,6 +4976,17 @@ def home():
             <span id="sourceHealthText">Loading...</span>
           </div>
         </div>
+        <div class="meta" style="margin-top:8px;">Account Reconciliation</div>
+        <div class="row">
+          <div class="stat"><div class="k">Deposits</div><div class="v" id="reconDeposits">-</div></div>
+          <div class="stat"><div class="k">Equity</div><div class="v" id="reconEquity">-</div></div>
+          <div class="stat"><div class="k">Cash</div><div class="v" id="reconCash">-</div></div>
+          <div class="stat"><div class="k">Positions Value</div><div class="v" id="reconPositions">-</div></div>
+          <div class="stat"><div class="k">Net P/L</div><div class="v" id="reconNet">-</div></div>
+          <div class="stat"><div class="k">Bot Realized</div><div class="v" id="reconBotRealized">-</div></div>
+          <div class="stat"><div class="k">Manual Realized</div><div class="v" id="reconManualRealized">-</div></div>
+          <div class="stat"><div class="k">Unrealized/Residual</div><div class="v" id="reconResidual">-</div></div>
+        </div>
         <div class="table-wrap" style="margin-top:8px;">
           <table>
             <thead><tr><th>Time</th><th>City</th><th>Ticker</th><th>Status</th><th>Error</th></tr></thead>
@@ -5468,14 +5496,15 @@ def home():
         qManual.set("start", ymd(manualStart));
         qManual.set("end", ymd(end));
       }
-      const [dataSettled, dataInsights, dataDaily, dataCity, dataLadder] = await Promise.all([
+      const [dataSettled, dataInsights, dataDaily, dataCity, dataLadder, dataRecon, dataManual] = await Promise.all([
         fetch(`/analytics/live-scorecard?${q.toString()}`).then(r => r.json()),
         fetch(`/analytics/live-insights?${q.toString()}`).then(r => r.json()),
         fetch(`/analytics/live-insights?${qDaily.toString()}`).then(r => r.json()),
         fetch(`/analytics/live-insights?${qCity.toString()}`).then(r => r.json()),
         fetch(`/analytics/live-insights?${qLadder.toString()}`).then(r => r.json()),
+        fetch(`/analytics/account-reconciliation`).then(r => r.json()),
+        fetch(`/analytics/manual-positions?${qManual.toString()}`).then(r => r.json()),
       ]);
-      const dataManual = await fetch(`/analytics/manual-positions?${qManual.toString()}`).then(r => r.json());
       const iq = (dataInsights && dataInsights.summary) || {};
       $("modelFills").textContent = iq.fills ?? "-";
       $("modelSettled").textContent = iq.settled_count ?? "-";
@@ -5506,6 +5535,15 @@ def home():
 
       const f = (dataInsights && dataInsights.funnel) || {};
       $("funnelText").textContent = `attempted ${f.orders_attempted ?? 0} -> rejected ${f.orders_rejected ?? 0} -> not filled ${f.orders_not_filled ?? 0} -> filled rows ${f.fill_rows ?? 0} -> positions ${f.positions_filled ?? 0} -> settled ${f.settled_positions ?? 0}`;
+      const recon = dataRecon || {};
+      $("reconDeposits").textContent = money(recon.deposits_dollars);
+      $("reconEquity").textContent = money(recon.equity_dollars);
+      $("reconCash").textContent = money(recon.cash_dollars);
+      $("reconPositions").textContent = money(recon.positions_dollars);
+      $("reconNet").textContent = money(recon.account_net_pnl_dollars);
+      $("reconBotRealized").textContent = money(recon.bot_realized_pnl_dollars);
+      $("reconManualRealized").textContent = money(recon.manual_realized_pnl_dollars);
+      $("reconResidual").textContent = money(recon.unrealized_residual_pnl_dollars);
 
       const errs = Array.isArray(dataInsights.recent_errors) ? dataInsights.recent_errors : [];
       $("errorRows").innerHTML = errs.length ? errs.map(e => `
@@ -5758,6 +5796,7 @@ def health():
         "manual_market_block_enabled": MANUAL_MARKET_BLOCK_ENABLED,
         "manual_positions_path": manual_positions_path(),
         "manual_positions_count": len(load_manual_positions_rows()),
+        "account_deposits_dollars": ACCOUNT_DEPOSITS_DOLLARS,
         "live_max_orders_per_scan": LIVE_MAX_ORDERS_PER_SCAN,
         "live_max_orders_per_day": LIVE_MAX_ORDERS_PER_DAY,
         "live_max_orders_per_market_per_day": LIVE_MAX_ORDERS_PER_MARKET_PER_DAY,
@@ -7688,6 +7727,69 @@ def analytics_manual_positions(
             "realized_pnl_dollars": realized_total,
         },
         "rows": out,
+    }
+
+@app.get("/analytics/account-reconciliation")
+def analytics_account_reconciliation():
+    now_local = datetime.now(tz=LOCAL_TZ)
+    today_iso = now_local.date().isoformat()
+    first_date, _last_date = live_trade_log_date_bounds()
+    start_iso = first_date or today_iso
+
+    bot_realized = 0.0
+    bot_settled = 0
+    try:
+        bot = analytics_live_scorecard(
+            start=start_iso,
+            end=today_iso,
+            finalized_only=True,
+            trade_limit=0,
+        )
+        s = (bot or {}).get("summary", {}) or {}
+        bot_realized = float(_to_float(s.get("total_realized_pnl_dollars")) or 0.0)
+        bot_settled = int(_to_float(s.get("realized_count")) or 0)
+    except Exception:
+        bot_realized = 0.0
+        bot_settled = 0
+
+    manual_realized = 0.0
+    manual_settled = 0
+    try:
+        m = analytics_manual_positions()
+        ms = (m or {}).get("summary", {}) or {}
+        manual_realized = float(_to_float(ms.get("realized_pnl_dollars")) or 0.0)
+        manual_settled = int(_to_float(ms.get("resolved_positions")) or 0)
+    except Exception:
+        manual_realized = 0.0
+        manual_settled = 0
+
+    comp = _fetch_portfolio_components_dollars()
+    cash = _to_float(comp.get("cash_dollars"))
+    positions = _to_float(comp.get("positions_dollars"))
+    equity = _to_float(comp.get("total_dollars"))
+    deposits = float(ACCOUNT_DEPOSITS_DOLLARS)
+    account_net = (float(equity) - float(deposits)) if equity is not None else None
+    unrealized_residual = (
+        float(account_net) - float(bot_realized) - float(manual_realized)
+        if account_net is not None
+        else None
+    )
+
+    return {
+        "ok": True,
+        "as_of_est": fmt_est(now_local),
+        "deposits_dollars": deposits,
+        "cash_dollars": cash,
+        "positions_dollars": positions,
+        "equity_dollars": equity,
+        "account_net_pnl_dollars": account_net,
+        "bot_realized_pnl_dollars": bot_realized,
+        "bot_settled_count": bot_settled,
+        "manual_realized_pnl_dollars": manual_realized,
+        "manual_settled_count": manual_settled,
+        "unrealized_residual_pnl_dollars": unrealized_residual,
+        "bot_window_start": start_iso,
+        "bot_window_end": today_iso,
     }
 
 def summarize_live_window(

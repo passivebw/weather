@@ -4626,34 +4626,34 @@ def home():
   <title>Kalshi Weather Trading Dashboard</title>
   <style>
     :root {
-      --bg: #f3f7f3;
-      --ink: #102217;
-      --muted: #4a5d53;
+      --bg: #f4f7fb;
+      --ink: #10233b;
+      --muted: #4a607a;
       --card: #ffffff;
-      --line: #d4e3d7;
-      --accent: #17633a;
-      --accent-2: #9c6f1a;
-      --red: #b02424;
-      --good: #0f7a3f;
-      --warn: #8a641c;
+      --line: #d6e0ec;
+      --accent: #0b5cad;
+      --accent-2: #0f8a72;
+      --red: #b4233c;
+      --good: #1e8e5a;
+      --warn: #9c6b11;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       color: var(--ink);
-      font-family: "Bahnschrift", "Gill Sans MT", "Trebuchet MS", sans-serif;
+      font-family: "Avenir Next", "Segoe UI", "Trebuchet MS", sans-serif;
       background:
-        radial-gradient(900px 500px at -10% -20%, #dbeedb 0%, transparent 55%),
-        radial-gradient(900px 500px at 110% -15%, #f0e6d1 0%, transparent 55%),
+        radial-gradient(900px 500px at -10% -20%, #d9e7fa 0%, transparent 55%),
+        radial-gradient(900px 500px at 110% -15%, #dff3ee 0%, transparent 55%),
         var(--bg);
     }
     .wrap { max-width: 1260px; margin: 0 auto; padding: 18px 14px 32px; }
     .hero {
       border: 1px solid var(--line);
       border-radius: 16px;
-      background: linear-gradient(135deg, #f7fff9, #fffaf2);
+      background: linear-gradient(125deg, #f8fbff, #f4fffb);
       padding: 16px;
-      box-shadow: 0 12px 24px #10301814;
+      box-shadow: 0 12px 28px #0e1f3a14;
     }
     h1 { margin: 0; font-size: 30px; letter-spacing: 0.3px; }
     .sub { color: var(--muted); margin-top: 6px; }
@@ -4666,7 +4666,7 @@ def home():
     .stat {
       border: 1px solid var(--line);
       border-radius: 12px;
-      background: #fff;
+      background: linear-gradient(180deg, #ffffff, #f9fcff);
       padding: 10px;
     }
     .k { font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; }
@@ -4722,6 +4722,7 @@ def home():
       border-radius: 14px;
       background: var(--card);
       padding: 12px;
+      box-shadow: 0 6px 18px #1233540c;
     }
     .card h2 { margin: 0 0 8px; font-size: 18px; }
     .meta { color: var(--muted); font-size: 12px; }
@@ -4826,6 +4827,8 @@ def home():
       </div>
       <div class="tabs">
         <button class="tab-btn active" data-tab-target="overviewTab">Overview</button>
+        <button class="tab-btn" data-tab-target="cityTab">City Attribution</button>
+        <button class="tab-btn" data-tab-target="ladderTab">Edge Ladder</button>
         <button class="tab-btn" data-tab-target="evTab">EV Chart</button>
         <button class="tab-btn" data-tab-target="dailyTab">Daily Stats</button>
       </div>
@@ -4869,26 +4872,7 @@ def home():
           <div class="stat"><div class="k">Realized - Expected</div><div class="v" id="modelGap">-</div></div>
           <div class="stat"><div class="k">Order Reject Rate</div><div class="v" id="modelRejectRate">-</div></div>
         </div>
-        <div class="split" style="margin-top:8px;">
-          <div>
-            <div class="meta">City x Side Attribution</div>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>City</th><th>Side</th><th>Fills</th><th>Settled</th><th>Avg Edge</th><th>Exp Win%</th><th>Act Win%</th><th>Expected</th><th>Realized</th></tr></thead>
-                <tbody id="citySideRows"><tr><td colspan="9">Loading...</td></tr></tbody>
-              </table>
-            </div>
-          </div>
-          <div>
-            <div class="meta">Edge Ladder Accuracy</div>
-            <div class="table-wrap">
-              <table>
-                <thead><tr><th>Edge Bucket</th><th>N</th><th>Avg Edge</th><th>Exp Win%</th><th>Act Win%</th><th>Expected</th><th>Realized</th><th>ROI</th></tr></thead>
-                <tbody id="ladderRows"><tr><td colspan="8">Loading...</td></tr></tbody>
-              </table>
-            </div>
-          </div>
-        </div>
+        <div class="meta" style="margin-top:8px;">Detailed city and ladder breakdowns are available in their dedicated tabs.</div>
         <div class="split" style="margin-top:8px;">
           <div class="item">
             <b>Opportunity Funnel</b>
@@ -4905,6 +4889,42 @@ def home():
             <tbody id="errorRows"><tr><td colspan="5">Loading...</td></tr></tbody>
           </table>
         </div>
+      </div>
+    </section>
+    </section>
+
+    <section id="cityTab" class="tab-content">
+    <section class="card" id="cityAttr">
+      <h2>City Attribution</h2>
+      <div class="meta">City x side performance sorted by realized P/L (best to worst).</div>
+      <div class="toolbar">
+        <button class="btn active" data-city-days="7">City 7D</button>
+        <button class="btn" data-city-days="14">City 14D</button>
+        <button class="btn" data-city-days="30">City 30D</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>City</th><th>Side</th><th>Fills</th><th>Settled</th><th>Avg Edge</th><th>Exp Win%</th><th>Act Win%</th><th>Expected</th><th>Realized</th></tr></thead>
+          <tbody id="citySideRows"><tr><td colspan="9">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+    </section>
+
+    <section id="ladderTab" class="tab-content">
+    <section class="card" id="ladderAcc">
+      <h2>Edge Ladder Accuracy</h2>
+      <div class="meta">Edge bucket hit rates and realized performance.</div>
+      <div class="toolbar">
+        <button class="btn active" data-ladder-days="7">Ladder 7D</button>
+        <button class="btn" data-ladder-days="14">Ladder 14D</button>
+        <button class="btn" data-ladder-days="30">Ladder 30D</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Edge Bucket</th><th>N</th><th>Avg Edge</th><th>Exp Win%</th><th>Act Win%</th><th>Expected</th><th>Realized</th><th>ROI</th></tr></thead>
+          <tbody id="ladderRows"><tr><td colspan="8">Loading...</td></tr></tbody>
+        </table>
       </div>
     </section>
     </section>
@@ -4966,6 +4986,8 @@ def home():
   <script>
     const $ = (id) => document.getElementById(id);
     let rangeDays = 7;
+    let cityRangeDays = 7;
+    let ladderRangeDays = 7;
     let evRangeDays = 7;
     let dailyRangeDays = 14;
     let liveStatusCache = {};
@@ -5163,6 +5185,12 @@ def home():
       const start = new Date();
       start.setDate(end.getDate() - (rangeDays - 1));
       const q = new URLSearchParams({ start: ymd(start), end: ymd(end) });
+      const cityStart = new Date();
+      cityStart.setDate(end.getDate() - (cityRangeDays - 1));
+      const qCity = new URLSearchParams({ start: ymd(cityStart), end: ymd(end) });
+      const ladderStart = new Date();
+      ladderStart.setDate(end.getDate() - (ladderRangeDays - 1));
+      const qLadder = new URLSearchParams({ start: ymd(ladderStart), end: ymd(end) });
       const dailyStart = new Date();
       dailyStart.setDate(end.getDate() - (dailyRangeDays - 1));
       const qDaily = new URLSearchParams({ start: ymd(dailyStart), end: ymd(end) });
@@ -5171,10 +5199,12 @@ def home():
       const firstTradeDate = String((liveStatusCache && liveStatusCache.first_trade_date) || "").trim();
       const historyStart = (firstTradeDate && /^\\d{4}-\\d{2}-\\d{2}$/.test(firstTradeDate)) ? firstTradeDate : ymd(evStart);
       const qEv = new URLSearchParams({ start: historyStart, end: ymd(end) });
-      const [dataSettled, dataInsights, dataDaily] = await Promise.all([
+      const [dataSettled, dataInsights, dataDaily, dataCity, dataLadder] = await Promise.all([
         fetch(`/analytics/live-scorecard?${q.toString()}`).then(r => r.json()),
         fetch(`/analytics/live-insights?${q.toString()}`).then(r => r.json()),
         fetch(`/analytics/live-insights?${qDaily.toString()}`).then(r => r.json()),
+        fetch(`/analytics/live-insights?${qCity.toString()}`).then(r => r.json()),
+        fetch(`/analytics/live-insights?${qLadder.toString()}`).then(r => r.json()),
       ]);
       const iq = (dataInsights && dataInsights.summary) || {};
       $("modelFills").textContent = iq.fills ?? "-";
@@ -5186,8 +5216,8 @@ def home():
       $("modelGap").textContent = money(iq.ev_gap_dollars);
       $("modelRejectRate").textContent = pct(iq.rejected_rate_pct);
 
-      const cityRows = Array.isArray(dataInsights.city_side) ? dataInsights.city_side : [];
-      $("citySideRows").innerHTML = cityRows.length ? cityRows.slice(0, 20).map(r => `
+      const cityRows = Array.isArray(dataCity.city_side) ? dataCity.city_side : [];
+      $("citySideRows").innerHTML = cityRows.length ? cityRows.map(r => `
         <tr>
           <td>${esc(r.city)}</td>
           <td>${esc(r.temp_side)}</td>
@@ -5201,7 +5231,7 @@ def home():
         </tr>
       `).join("") : "<tr><td colspan='9'>No data in this window.</td></tr>";
 
-      const ladderRows = Array.isArray(dataInsights.edge_ladder) ? dataInsights.edge_ladder : [];
+      const ladderRows = Array.isArray(dataLadder.edge_ladder) ? dataLadder.edge_ladder : [];
       $("ladderRows").innerHTML = ladderRows.length ? ladderRows.map(r => `
         <tr>
           <td>${esc(r.bucket)}</td>
@@ -5335,6 +5365,24 @@ def home():
       btn.addEventListener("click", async () => {
         rangeDays = Number(btn.dataset.modelDays || "7");
         document.querySelectorAll(".btn[data-model-days]").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        await loadAnalytics();
+      });
+    });
+
+    document.querySelectorAll(".btn[data-city-days]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        cityRangeDays = Number(btn.dataset.cityDays || "7");
+        document.querySelectorAll(".btn[data-city-days]").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        await loadAnalytics();
+      });
+    });
+
+    document.querySelectorAll(".btn[data-ladder-days]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        ladderRangeDays = Number(btn.dataset.ladderDays || "7");
+        document.querySelectorAll(".btn[data-ladder-days]").forEach(b => b.classList.remove("active"));
         btn.classList.add("active");
         await loadAnalytics();
       });

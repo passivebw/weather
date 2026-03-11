@@ -4780,6 +4780,10 @@ def home():
       background: #f5faf6; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px;
       font-size: 11px;
     }
+    th.sortable-th { cursor: pointer; user-select: none; }
+    th.sortable-th::after { content: "  <>"; color: #9ab0a2; font-size: 10px; }
+    th.sortable-th.active.asc::after { content: "  ^"; color: #2b6a47; }
+    th.sortable-th.active.desc::after { content: "  v"; color: #2b6a47; }
     .pill {
       display: inline-block;
       border-radius: 999px;
@@ -4947,7 +4951,7 @@ def home():
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Edge Bucket</th><th>N</th><th>Avg Edge</th><th>Exp Win%</th><th>Act Win%</th><th>Expected</th><th>Realized</th><th>ROI</th></tr></thead>
+          <thead><tr><th class="sortable-th" data-sort-table="ladder" data-sort-key="bucket" data-sort-type="bucket">Edge Bucket</th><th class="sortable-th" data-sort-table="ladder" data-sort-key="n" data-sort-type="number">N</th><th class="sortable-th" data-sort-table="ladder" data-sort-key="avg_edge_pct" data-sort-type="number">Avg Edge</th><th class="sortable-th" data-sort-table="ladder" data-sort-key="expected_win_rate_pct" data-sort-type="number">Exp Win%</th><th class="sortable-th" data-sort-table="ladder" data-sort-key="actual_win_rate_pct" data-sort-type="number">Act Win%</th><th class="sortable-th" data-sort-table="ladder" data-sort-key="expected_net_dollars" data-sort-type="number">Expected</th><th class="sortable-th" data-sort-table="ladder" data-sort-key="realized_dollars" data-sort-type="number">Realized</th><th class="sortable-th" data-sort-table="ladder" data-sort-key="realized_roi_pct_on_stake" data-sort-type="number">ROI</th></tr></thead>
           <tbody id="ladderRows"><tr><td colspan="8">Loading...</td></tr></tbody>
         </table>
       </div>
@@ -4986,21 +4990,21 @@ def home():
       <div class="meta" style="margin-top:8px;">Daily Breakdown</div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Date</th><th>Fills</th><th>Settled</th><th>Expected</th><th>Realized</th><th>Gap</th><th>Win Rate</th><th>ROI</th><th>Attempts</th><th>Rejected</th><th>Reject Rate</th></tr></thead>
+          <thead><tr><th class="sortable-th" data-sort-table="daily" data-sort-key="date" data-sort-type="date">Date</th><th class="sortable-th" data-sort-table="daily" data-sort-key="fills" data-sort-type="number">Fills</th><th class="sortable-th" data-sort-table="daily" data-sort-key="settled_count" data-sort-type="number">Settled</th><th class="sortable-th" data-sort-table="daily" data-sort-key="expected_net_dollars" data-sort-type="number">Expected</th><th class="sortable-th" data-sort-table="daily" data-sort-key="realized_dollars" data-sort-type="number">Realized</th><th class="sortable-th" data-sort-table="daily" data-sort-key="ev_gap_dollars" data-sort-type="number">Gap</th><th class="sortable-th" data-sort-table="daily" data-sort-key="realized_win_rate_pct" data-sort-type="number">Win Rate</th><th class="sortable-th" data-sort-table="daily" data-sort-key="realized_roi_pct_on_stake" data-sort-type="number">ROI</th><th class="sortable-th" data-sort-table="daily" data-sort-key="orders_attempted" data-sort-type="number">Attempts</th><th class="sortable-th" data-sort-table="daily" data-sort-key="orders_rejected" data-sort-type="number">Rejected</th><th class="sortable-th" data-sort-table="daily" data-sort-key="rejected_rate_pct" data-sort-type="number">Reject Rate</th></tr></thead>
           <tbody id="dailyRows"><tr><td colspan="11">Loading...</td></tr></tbody>
         </table>
       </div>
       <div class="meta" style="margin-top:10px;">Weekly Rollup</div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Week</th><th>Days</th><th>Fills</th><th>Settled</th><th>Expected</th><th>Realized</th><th>Gap</th><th>Win Rate</th><th>ROI</th><th>Attempts</th><th>Rejected</th><th>Reject Rate</th></tr></thead>
+          <thead><tr><th class="sortable-th" data-sort-table="weekly" data-sort-key="key" data-sort-type="text">Week</th><th class="sortable-th" data-sort-table="weekly" data-sort-key="days" data-sort-type="number">Days</th><th class="sortable-th" data-sort-table="weekly" data-sort-key="fills" data-sort-type="number">Fills</th><th class="sortable-th" data-sort-table="weekly" data-sort-key="settled_count" data-sort-type="number">Settled</th><th class="sortable-th" data-sort-table="weekly" data-sort-key="expected" data-sort-type="number">Expected</th><th class="sortable-th" data-sort-table="weekly" data-sort-key="realized" data-sort-type="number">Realized</th><th class="sortable-th" data-sort-table="weekly" data-sort-key="ev_gap_dollars" data-sort-type="number">Gap</th><th class="sortable-th" data-sort-table="weekly" data-sort-key="realized_win_rate_pct" data-sort-type="number">Win Rate</th><th class="sortable-th" data-sort-table="weekly" data-sort-key="realized_roi_pct_on_stake" data-sort-type="number">ROI</th><th class="sortable-th" data-sort-table="weekly" data-sort-key="attempts" data-sort-type="number">Attempts</th><th class="sortable-th" data-sort-table="weekly" data-sort-key="rejected" data-sort-type="number">Rejected</th><th class="sortable-th" data-sort-table="weekly" data-sort-key="rejected_rate_pct" data-sort-type="number">Reject Rate</th></tr></thead>
           <tbody id="weeklyRows"><tr><td colspan="12">Loading...</td></tr></tbody>
         </table>
       </div>
       <div class="meta" style="margin-top:10px;">Monthly Rollup</div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Month</th><th>Days</th><th>Fills</th><th>Settled</th><th>Expected</th><th>Realized</th><th>Gap</th><th>Win Rate</th><th>ROI</th><th>Attempts</th><th>Rejected</th><th>Reject Rate</th></tr></thead>
+          <thead><tr><th class="sortable-th" data-sort-table="monthly" data-sort-key="key" data-sort-type="text">Month</th><th class="sortable-th" data-sort-table="monthly" data-sort-key="days" data-sort-type="number">Days</th><th class="sortable-th" data-sort-table="monthly" data-sort-key="fills" data-sort-type="number">Fills</th><th class="sortable-th" data-sort-table="monthly" data-sort-key="settled_count" data-sort-type="number">Settled</th><th class="sortable-th" data-sort-table="monthly" data-sort-key="expected" data-sort-type="number">Expected</th><th class="sortable-th" data-sort-table="monthly" data-sort-key="realized" data-sort-type="number">Realized</th><th class="sortable-th" data-sort-table="monthly" data-sort-key="ev_gap_dollars" data-sort-type="number">Gap</th><th class="sortable-th" data-sort-table="monthly" data-sort-key="realized_win_rate_pct" data-sort-type="number">Win Rate</th><th class="sortable-th" data-sort-table="monthly" data-sort-key="realized_roi_pct_on_stake" data-sort-type="number">ROI</th><th class="sortable-th" data-sort-table="monthly" data-sort-key="attempts" data-sort-type="number">Attempts</th><th class="sortable-th" data-sort-table="monthly" data-sort-key="rejected" data-sort-type="number">Rejected</th><th class="sortable-th" data-sort-table="monthly" data-sort-key="rejected_rate_pct" data-sort-type="number">Reject Rate</th></tr></thead>
           <tbody id="monthlyRows"><tr><td colspan="12">Loading...</td></tr></tbody>
         </table>
       </div>
@@ -5016,6 +5020,16 @@ def home():
     let evRangeDays = 7;
     let dailyRangeDays = 14;
     let liveStatusCache = {};
+    let ladderRowsData = [];
+    let dailyRowsData = [];
+    let weeklyRowsData = [];
+    let monthlyRowsData = [];
+    const tableSortState = {
+      ladder: { key: "realized_dollars", dir: "desc", type: "number" },
+      daily: { key: "date", dir: "desc", type: "date" },
+      weekly: { key: "key", dir: "desc", type: "text" },
+      monthly: { key: "key", dir: "desc", type: "text" },
+    };
 
     function esc(v) { return String(v ?? ""); }
     function money(v) { return (v == null || isNaN(v)) ? "-" : `$${Number(v).toFixed(2)}`; }
@@ -5082,6 +5096,152 @@ def home():
         }
       }
       return Array.from(m.values()).sort((a, b) => String(b.key).localeCompare(String(a.key)));
+    }
+
+    function ladderBucketRank(v) {
+      const s = String(v || "");
+      const rank = { "<5%": 0, "5-10%": 1, "10-20%": 2, "20-30%": 3, "30%+": 4 };
+      return (s in rank) ? rank[s] : 99;
+    }
+
+    function sortedRows(rows, state) {
+      const key = String((state && state.key) || "").trim();
+      const dir = String((state && state.dir) || "desc").toLowerCase() === "asc" ? 1 : -1;
+      const type = String((state && state.type) || "text").toLowerCase();
+      if (!key) return rows.slice();
+      return rows.slice().sort((a, b) => {
+        let av = a ? a[key] : null;
+        let bv = b ? b[key] : null;
+        let cmp = 0;
+        if (type === "number") {
+          cmp = Number(av || 0) - Number(bv || 0);
+        } else if (type === "date") {
+          cmp = String(av || "").localeCompare(String(bv || ""));
+        } else if (type === "bucket") {
+          cmp = ladderBucketRank(av) - ladderBucketRank(bv);
+        } else {
+          cmp = String(av || "").localeCompare(String(bv || ""), undefined, { numeric: true, sensitivity: "base" });
+        }
+        return cmp * dir;
+      });
+    }
+
+    function setActiveSortHeader(tableName) {
+      const st = tableSortState[tableName] || {};
+      document.querySelectorAll(`th.sortable-th[data-sort-table="${tableName}"]`).forEach(th => {
+        th.classList.remove("active", "asc", "desc");
+        if (th.dataset.sortKey === st.key) {
+          th.classList.add("active");
+          th.classList.add(st.dir === "asc" ? "asc" : "desc");
+        }
+      });
+    }
+
+    function renderLadderRows() {
+      const rows = sortedRows(ladderRowsData, tableSortState.ladder);
+      $("ladderRows").innerHTML = rows.length ? rows.map(r => `
+        <tr>
+          <td>${esc(r.bucket)}</td>
+          <td>${esc(r.n)}</td>
+          <td>${pct(r.avg_edge_pct)}</td>
+          <td>${pct(r.expected_win_rate_pct)}</td>
+          <td>${pct(r.actual_win_rate_pct)}</td>
+          <td>${money(r.expected_net_dollars)}</td>
+          <td>${money(r.realized_dollars)}</td>
+          <td>${pct(r.realized_roi_pct_on_stake)}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='8'>No data in this window.</td></tr>";
+      setActiveSortHeader("ladder");
+    }
+
+    function renderDailyRows() {
+      const rows = sortedRows(dailyRowsData, tableSortState.daily);
+      $("dailyRows").innerHTML = rows.length ? rows.map(d => `
+        <tr>
+          <td>${esc(d.date)}</td>
+          <td>${esc(d.fills)}</td>
+          <td>${esc(d.settled_count)}</td>
+          <td>${money(d.expected_net_dollars)}</td>
+          <td>${money(d.realized_dollars)}</td>
+          <td>${money(d.ev_gap_dollars)}</td>
+          <td>${pct(d.realized_win_rate_pct)}</td>
+          <td>${pct(d.realized_roi_pct_on_stake)}</td>
+          <td>${esc(d.orders_attempted)}</td>
+          <td>${esc(d.orders_rejected)}</td>
+          <td>${pct(d.rejected_rate_pct)}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='11'>No daily data in this window.</td></tr>";
+      setActiveSortHeader("daily");
+    }
+
+    function renderWeeklyRows() {
+      const rows = sortedRows(weeklyRowsData, tableSortState.weekly);
+      $("weeklyRows").innerHTML = rows.length ? rows.map(w => `
+        <tr>
+          <td>${esc(w.key)}</td>
+          <td>${esc(w.days)}</td>
+          <td>${esc(w.fills)}</td>
+          <td>${esc(w.settled_count)}</td>
+          <td>${money(w.expected)}</td>
+          <td>${money(w.realized)}</td>
+          <td>${money(w.ev_gap_dollars)}</td>
+          <td>${pct(w.realized_win_rate_pct)}</td>
+          <td>${pct(w.realized_roi_pct_on_stake)}</td>
+          <td>${esc(w.attempts)}</td>
+          <td>${esc(w.rejected)}</td>
+          <td>${pct(w.rejected_rate_pct)}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='12'>No weekly data in this window.</td></tr>";
+      setActiveSortHeader("weekly");
+    }
+
+    function renderMonthlyRows() {
+      const rows = sortedRows(monthlyRowsData, tableSortState.monthly);
+      $("monthlyRows").innerHTML = rows.length ? rows.map(mo => `
+        <tr>
+          <td>${esc(mo.key)}</td>
+          <td>${esc(mo.days)}</td>
+          <td>${esc(mo.fills)}</td>
+          <td>${esc(mo.settled_count)}</td>
+          <td>${money(mo.expected)}</td>
+          <td>${money(mo.realized)}</td>
+          <td>${money(mo.ev_gap_dollars)}</td>
+          <td>${pct(mo.realized_win_rate_pct)}</td>
+          <td>${pct(mo.realized_roi_pct_on_stake)}</td>
+          <td>${esc(mo.attempts)}</td>
+          <td>${esc(mo.rejected)}</td>
+          <td>${pct(mo.rejected_rate_pct)}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='12'>No monthly data in this window.</td></tr>";
+      setActiveSortHeader("monthly");
+    }
+
+    function renderSortableTable(tableName) {
+      if (tableName === "ladder") renderLadderRows();
+      if (tableName === "daily") renderDailyRows();
+      if (tableName === "weekly") renderWeeklyRows();
+      if (tableName === "monthly") renderMonthlyRows();
+    }
+
+    function setupSortableHeaders() {
+      document.querySelectorAll("th.sortable-th").forEach(th => {
+        if (th.dataset.sortBound === "1") return;
+        th.dataset.sortBound = "1";
+        th.addEventListener("click", () => {
+          const table = String(th.dataset.sortTable || "").trim();
+          const key = String(th.dataset.sortKey || "").trim();
+          const type = String(th.dataset.sortType || "text").trim();
+          if (!table || !key) return;
+          const prev = tableSortState[table] || {};
+          const nextDir = (prev.key === key && prev.dir === "desc") ? "asc" : "desc";
+          tableSortState[table] = { key, dir: nextDir, type };
+          renderSortableTable(table);
+        });
+      });
+      setActiveSortHeader("ladder");
+      setActiveSortHeader("daily");
+      setActiveSortHeader("weekly");
+      setActiveSortHeader("monthly");
     }
 
     let chartCache = { labels: [], exp: [], real: [] };
@@ -5256,19 +5416,8 @@ def home():
         </tr>
       `).join("") : "<tr><td colspan='9'>No data in this window.</td></tr>";
 
-      const ladderRows = Array.isArray(dataLadder.edge_ladder) ? dataLadder.edge_ladder : [];
-      $("ladderRows").innerHTML = ladderRows.length ? ladderRows.map(r => `
-        <tr>
-          <td>${esc(r.bucket)}</td>
-          <td>${esc(r.n)}</td>
-          <td>${pct(r.avg_edge_pct)}</td>
-          <td>${pct(r.expected_win_rate_pct)}</td>
-          <td>${pct(r.actual_win_rate_pct)}</td>
-          <td>${money(r.expected_net_dollars)}</td>
-          <td>${money(r.realized_dollars)}</td>
-          <td>${pct(r.realized_roi_pct_on_stake)}</td>
-        </tr>
-      `).join("") : "<tr><td colspan='8'>No data in this window.</td></tr>";
+      ladderRowsData = Array.isArray(dataLadder.edge_ladder) ? dataLadder.edge_ladder : [];
+      renderLadderRows();
 
       const f = (dataInsights && dataInsights.funnel) || {};
       $("funnelText").textContent = `attempted ${f.orders_attempted ?? 0} -> rejected ${f.orders_rejected ?? 0} -> not filled ${f.orders_not_filled ?? 0} -> filled rows ${f.fill_rows ?? 0} -> positions ${f.positions_filled ?? 0} -> settled ${f.settled_positions ?? 0}`;
@@ -5284,56 +5433,24 @@ def home():
         </tr>
       `).join("") : "<tr><td colspan='5'>No recent errors in this window.</td></tr>";
 
-      const dailyRows = Array.isArray(dataDaily.per_day) ? dataDaily.per_day : [];
-      $("dailyRows").innerHTML = dailyRows.length ? dailyRows.slice().reverse().map(d => `
-        <tr>
-          <td>${esc(d.date)}</td>
-          <td>${esc(d.fills)}</td>
-          <td>${esc(d.settled_count)}</td>
-          <td>${money(d.expected_net_dollars)}</td>
-          <td>${money(d.realized_dollars)}</td>
-          <td>${money(d.ev_gap_dollars)}</td>
-          <td>${pct(d.realized_win_rate_pct)}</td>
-          <td>${pct(d.realized_roi_pct_on_stake)}</td>
-          <td>${esc(d.orders_attempted)}</td>
-          <td>${esc(d.orders_rejected)}</td>
-          <td>${pct(d.rejected_rate_pct)}</td>
-        </tr>
-      `).join("") : "<tr><td colspan='11'>No daily data in this window.</td></tr>";
-      const weekly = rollupRows(dailyRows, (r) => isoWeekKey(String(r.date || "")));
-      $("weeklyRows").innerHTML = weekly.length ? weekly.map(w => `
-        <tr>
-          <td>${esc(w.key)}</td>
-          <td>${esc(w.days)}</td>
-          <td>${esc(w.fills)}</td>
-          <td>${esc(w.settled_count)}</td>
-          <td>${money(w.expected)}</td>
-          <td>${money(w.realized)}</td>
-          <td>${money(w.realized - w.expected)}</td>
-          <td>${pct(w.win_weight_den > 0 ? (w.win_weighted_sum / w.win_weight_den) : null)}</td>
-          <td>${pct(w.stake > 0 ? ((100.0 * w.realized) / w.stake) : null)}</td>
-          <td>${esc(w.attempts)}</td>
-          <td>${esc(w.rejected)}</td>
-          <td>${pct(w.attempts > 0 ? ((100.0 * w.rejected) / w.attempts) : null)}</td>
-        </tr>
-      `).join("") : "<tr><td colspan='12'>No weekly data in this window.</td></tr>";
-      const monthly = rollupRows(dailyRows, (r) => String(r.date || "").slice(0, 7));
-      $("monthlyRows").innerHTML = monthly.length ? monthly.map(mo => `
-        <tr>
-          <td>${esc(mo.key)}</td>
-          <td>${esc(mo.days)}</td>
-          <td>${esc(mo.fills)}</td>
-          <td>${esc(mo.settled_count)}</td>
-          <td>${money(mo.expected)}</td>
-          <td>${money(mo.realized)}</td>
-          <td>${money(mo.realized - mo.expected)}</td>
-          <td>${pct(mo.win_weight_den > 0 ? (mo.win_weighted_sum / mo.win_weight_den) : null)}</td>
-          <td>${pct(mo.stake > 0 ? ((100.0 * mo.realized) / mo.stake) : null)}</td>
-          <td>${esc(mo.attempts)}</td>
-          <td>${esc(mo.rejected)}</td>
-          <td>${pct(mo.attempts > 0 ? ((100.0 * mo.rejected) / mo.attempts) : null)}</td>
-        </tr>
-      `).join("") : "<tr><td colspan='12'>No monthly data in this window.</td></tr>";
+      dailyRowsData = Array.isArray(dataDaily.per_day) ? dataDaily.per_day : [];
+      weeklyRowsData = rollupRows(dailyRowsData, (r) => isoWeekKey(String(r.date || ""))).map(w => ({
+        ...w,
+        ev_gap_dollars: Number(w.realized || 0) - Number(w.expected || 0),
+        realized_win_rate_pct: w.win_weight_den > 0 ? (w.win_weighted_sum / w.win_weight_den) : null,
+        realized_roi_pct_on_stake: w.stake > 0 ? ((100.0 * Number(w.realized || 0)) / Number(w.stake || 0)) : null,
+        rejected_rate_pct: w.attempts > 0 ? ((100.0 * Number(w.rejected || 0)) / Number(w.attempts || 0)) : null,
+      }));
+      monthlyRowsData = rollupRows(dailyRowsData, (r) => String(r.date || "").slice(0, 7)).map(mo => ({
+        ...mo,
+        ev_gap_dollars: Number(mo.realized || 0) - Number(mo.expected || 0),
+        realized_win_rate_pct: mo.win_weight_den > 0 ? (mo.win_weighted_sum / mo.win_weight_den) : null,
+        realized_roi_pct_on_stake: mo.stake > 0 ? ((100.0 * Number(mo.realized || 0)) / Number(mo.stake || 0)) : null,
+        rejected_rate_pct: mo.attempts > 0 ? ((100.0 * Number(mo.rejected || 0)) / Number(mo.attempts || 0)) : null,
+      }));
+      renderDailyRows();
+      renderWeeklyRows();
+      renderMonthlyRows();
 
       const dataEv = await fetch(`/analytics/live-scorecard?${qEv.toString()}`).then(r => r.json());
       const perAll = Array.isArray(dataEv.per_day) ? dataEv.per_day.filter(x => x.ok) : [];
@@ -5442,6 +5559,7 @@ def home():
       });
     });
 
+    setupSortableHeaders();
     loadAll().catch(() => {
       $("sys").textContent = "Unavailable";
     });

@@ -4938,10 +4938,25 @@ def home():
         <button class="btn" data-daily-days="14">Daily 14D</button>
         <button class="btn" data-daily-days="30">Daily 30D</button>
       </div>
+      <div class="meta" style="margin-top:8px;">Daily Breakdown</div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Date</th><th>Fills</th><th>Settled</th><th>Expected</th><th>Realized</th><th>Gap</th><th>Win Rate</th><th>ROI</th><th>Attempts</th><th>Rejected</th><th>Reject Rate</th></tr></thead>
           <tbody id="dailyRows"><tr><td colspan="11">Loading...</td></tr></tbody>
+        </table>
+      </div>
+      <div class="meta" style="margin-top:10px;">Weekly Rollup</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Week</th><th>Days</th><th>Fills</th><th>Settled</th><th>Expected</th><th>Realized</th><th>Gap</th><th>Win Rate</th><th>ROI</th><th>Attempts</th><th>Rejected</th><th>Reject Rate</th></tr></thead>
+          <tbody id="weeklyRows"><tr><td colspan="12">Loading...</td></tr></tbody>
+        </table>
+      </div>
+      <div class="meta" style="margin-top:10px;">Monthly Rollup</div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Month</th><th>Days</th><th>Fills</th><th>Settled</th><th>Expected</th><th>Realized</th><th>Gap</th><th>Win Rate</th><th>ROI</th><th>Attempts</th><th>Rejected</th><th>Reject Rate</th></tr></thead>
+          <tbody id="monthlyRows"><tr><td colspan="12">Loading...</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -4971,6 +4986,55 @@ def home():
       const m = String(d.getMonth() + 1).padStart(2, "0");
       const day = String(d.getDate()).padStart(2, "0");
       return `${y}-${m}-${day}`;
+    }
+
+    function isoWeekKey(dateStr) {
+      const dt = new Date(`${dateStr}T00:00:00Z`);
+      const day = (dt.getUTCDay() + 6) % 7; // Mon=0..Sun=6
+      dt.setUTCDate(dt.getUTCDate() - day + 3); // Thursday of this ISO week
+      const isoYear = dt.getUTCFullYear();
+      const jan4 = new Date(Date.UTC(isoYear, 0, 4));
+      const jan4Day = (jan4.getUTCDay() + 6) % 7;
+      jan4.setUTCDate(jan4.getUTCDate() - jan4Day + 3);
+      const week = 1 + Math.round((dt - jan4) / (7 * 24 * 3600 * 1000));
+      return `${isoYear}-W${String(week).padStart(2, "0")}`;
+    }
+
+    function rollupRows(rows, keyFn) {
+      const m = new Map();
+      for (const r of rows) {
+        const key = keyFn(r);
+        if (!m.has(key)) {
+          m.set(key, {
+            key,
+            days: 0,
+            fills: 0,
+            settled_count: 0,
+            stake: 0,
+            expected: 0,
+            realized: 0,
+            attempts: 0,
+            rejected: 0,
+            win_weighted_sum: 0,
+            win_weight_den: 0,
+          });
+        }
+        const a = m.get(key);
+        const settled = Number(r.settled_count || 0);
+        a.days += 1;
+        a.fills += Number(r.fills || 0);
+        a.settled_count += settled;
+        a.stake += Number(r.total_stake_dollars || 0);
+        a.expected += Number(r.expected_net_dollars || 0);
+        a.realized += Number(r.realized_dollars || 0);
+        a.attempts += Number(r.orders_attempted || 0);
+        a.rejected += Number(r.orders_rejected || 0);
+        if (r.realized_win_rate_pct != null && settled > 0) {
+          a.win_weighted_sum += Number(r.realized_win_rate_pct) * settled;
+          a.win_weight_den += settled;
+        }
+      }
+      return Array.from(m.values()).sort((a, b) => String(b.key).localeCompare(String(a.key)));
     }
 
     let chartCache = { labels: [], exp: [], real: [] };
@@ -5181,6 +5245,40 @@ def home():
           <td>${pct(d.rejected_rate_pct)}</td>
         </tr>
       `).join("") : "<tr><td colspan='11'>No daily data in this window.</td></tr>";
+      const weekly = rollupRows(dailyRows, (r) => isoWeekKey(String(r.date || "")));
+      $("weeklyRows").innerHTML = weekly.length ? weekly.map(w => `
+        <tr>
+          <td>${esc(w.key)}</td>
+          <td>${esc(w.days)}</td>
+          <td>${esc(w.fills)}</td>
+          <td>${esc(w.settled_count)}</td>
+          <td>${money(w.expected)}</td>
+          <td>${money(w.realized)}</td>
+          <td>${money(w.realized - w.expected)}</td>
+          <td>${pct(w.win_weight_den > 0 ? (w.win_weighted_sum / w.win_weight_den) : null)}</td>
+          <td>${pct(w.stake > 0 ? ((100.0 * w.realized) / w.stake) : null)}</td>
+          <td>${esc(w.attempts)}</td>
+          <td>${esc(w.rejected)}</td>
+          <td>${pct(w.attempts > 0 ? ((100.0 * w.rejected) / w.attempts) : null)}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='12'>No weekly data in this window.</td></tr>";
+      const monthly = rollupRows(dailyRows, (r) => String(r.date || "").slice(0, 7));
+      $("monthlyRows").innerHTML = monthly.length ? monthly.map(mo => `
+        <tr>
+          <td>${esc(mo.key)}</td>
+          <td>${esc(mo.days)}</td>
+          <td>${esc(mo.fills)}</td>
+          <td>${esc(mo.settled_count)}</td>
+          <td>${money(mo.expected)}</td>
+          <td>${money(mo.realized)}</td>
+          <td>${money(mo.realized - mo.expected)}</td>
+          <td>${pct(mo.win_weight_den > 0 ? (mo.win_weighted_sum / mo.win_weight_den) : null)}</td>
+          <td>${pct(mo.stake > 0 ? ((100.0 * mo.realized) / mo.stake) : null)}</td>
+          <td>${esc(mo.attempts)}</td>
+          <td>${esc(mo.rejected)}</td>
+          <td>${pct(mo.attempts > 0 ? ((100.0 * mo.rejected) / mo.attempts) : null)}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='12'>No monthly data in this window.</td></tr>";
 
       const dataEv = await fetch(`/analytics/live-scorecard?${qEv.toString()}`).then(r => r.json());
       const perAll = Array.isArray(dataEv.per_day) ? dataEv.per_day.filter(x => x.ok) : [];
@@ -7134,6 +7232,8 @@ def analytics_live_insights(
             "date": day_key,
             "fills": int(_to_float(d.get("fills")) or 0),
             "settled_count": int(_to_float(d.get("realized_count")) or 0),
+            "total_stake_dollars": float(_to_float(d.get("total_stake_dollars")) or 0.0),
+            "total_fees_dollars": float(_to_float(d.get("total_fees_dollars")) or 0.0),
             "expected_net_dollars": exp_net_day,
             "realized_dollars": realized_day,
             "ev_gap_dollars": realized_day - exp_net_day,

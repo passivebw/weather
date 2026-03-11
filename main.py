@@ -63,6 +63,19 @@ def normalize_time_in_force(tif: str, *, default: str = "fill_or_kill") -> str:
     }
     return aliases.get(raw, default)
 
+def sanitize_time_in_force_for_order(tif: str, *, default: str = "fill_or_kill") -> str:
+    """
+    Weather order flow currently accepts FOK/IOC reliably; sanitize unsupported TIFs.
+    """
+    allowed = {"fill_or_kill", "immediate_or_cancel"}
+    safe_default = normalize_time_in_force(default, default="fill_or_kill")
+    if safe_default not in allowed:
+        safe_default = "fill_or_kill"
+    tif_norm = normalize_time_in_force(tif, default=safe_default)
+    if tif_norm in allowed:
+        return tif_norm
+    return safe_default
+
 
 def fmt_est(dt: datetime) -> str:
     est_tz = tz.tzoffset("EST", -5 * 3600)
@@ -142,7 +155,10 @@ LIVE_MAX_ORDERS_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_DAY", "25"))
 LIVE_MAX_ORDERS_PER_MARKET_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_MARKET_PER_DAY", "1"))
 LIVE_MAX_ORDERS_PER_CITY_SIDE_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_CITY_SIDE_PER_DAY", "2"))
 LIVE_ORDER_FILL_MODE = os.getenv("LIVE_ORDER_FILL_MODE", "one_cent_worse").strip().lower()
-LIVE_ORDER_TIME_IN_FORCE = os.getenv("LIVE_ORDER_TIME_IN_FORCE", "fill_or_kill").strip().lower()
+LIVE_ORDER_TIME_IN_FORCE = sanitize_time_in_force_for_order(
+    os.getenv("LIVE_ORDER_TIME_IN_FORCE", "fill_or_kill"),
+    default="fill_or_kill",
+)
 LIVE_ORDER_EXPIRATION_SECONDS = int(os.getenv("LIVE_ORDER_EXPIRATION_SECONDS", "30"))
 LIVE_MAX_CONTRACTS_PER_ORDER = int(os.getenv("LIVE_MAX_CONTRACTS_PER_ORDER", "10"))
 LIVE_MIN_STAKE_DOLLARS = float(os.getenv("LIVE_MIN_STAKE_DOLLARS", "0.5"))
@@ -150,7 +166,10 @@ LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT = float(os.getenv("LIVE_EDGE_IMMEDIATE_AGGRES
 LIVE_EDGE_PASSIVE_THEN_AGGR_PCT = float(os.getenv("LIVE_EDGE_PASSIVE_THEN_AGGR_PCT", "12.0"))
 LIVE_PASSIVE_WAIT_SECONDS_MID = int(os.getenv("LIVE_PASSIVE_WAIT_SECONDS_MID", "20"))
 LIVE_PASSIVE_WAIT_SECONDS_LOW = int(os.getenv("LIVE_PASSIVE_WAIT_SECONDS_LOW", "45"))
-LIVE_PASSIVE_TIME_IN_FORCE = os.getenv("LIVE_PASSIVE_TIME_IN_FORCE", "fill_or_kill").strip().lower()
+LIVE_PASSIVE_TIME_IN_FORCE = sanitize_time_in_force_for_order(
+    os.getenv("LIVE_PASSIVE_TIME_IN_FORCE", "fill_or_kill"),
+    default=LIVE_ORDER_TIME_IN_FORCE,
+)
 LIVE_PASSIVE_REPRICE_STEP_CENTS = int(os.getenv("LIVE_PASSIVE_REPRICE_STEP_CENTS", "1"))
 LIVE_PASSIVE_REPRICE_STEPS_MID = int(os.getenv("LIVE_PASSIVE_REPRICE_STEPS_MID", "2"))
 LIVE_PASSIVE_REPRICE_STEPS_LOW = int(os.getenv("LIVE_PASSIVE_REPRICE_STEPS_LOW", "2"))
@@ -188,10 +207,16 @@ LIVE_EXIT_MAX_ORDERS_PER_SCAN = int(os.getenv("LIVE_EXIT_MAX_ORDERS_PER_SCAN", "
 LIVE_EXIT_PASSIVE_WAIT_SECONDS = int(os.getenv("LIVE_EXIT_PASSIVE_WAIT_SECONDS", "90"))
 LIVE_EXIT_PASSIVE_REPRICE_STEP_CENTS = int(os.getenv("LIVE_EXIT_PASSIVE_REPRICE_STEP_CENTS", "1"))
 LIVE_EXIT_PASSIVE_REPRICE_STEPS = int(os.getenv("LIVE_EXIT_PASSIVE_REPRICE_STEPS", "2"))
-LIVE_EXIT_PASSIVE_TIME_IN_FORCE = os.getenv("LIVE_EXIT_PASSIVE_TIME_IN_FORCE", "good_til_cancelled").strip().lower()
+LIVE_EXIT_PASSIVE_TIME_IN_FORCE = sanitize_time_in_force_for_order(
+    os.getenv("LIVE_EXIT_PASSIVE_TIME_IN_FORCE", "fill_or_kill"),
+    default="fill_or_kill",
+)
 LIVE_EXIT_REQUIRE_CANCEL_BEFORE_AGGRESSIVE = env_bool("LIVE_EXIT_REQUIRE_CANCEL_BEFORE_AGGRESSIVE", default=True)
 LIVE_EXIT_AGGRESSIVE_FALLBACK_ENABLED = env_bool("LIVE_EXIT_AGGRESSIVE_FALLBACK_ENABLED", default=True)
-LIVE_EXIT_AGGRESSIVE_TIME_IN_FORCE = os.getenv("LIVE_EXIT_AGGRESSIVE_TIME_IN_FORCE", "fill_or_kill").strip().lower()
+LIVE_EXIT_AGGRESSIVE_TIME_IN_FORCE = sanitize_time_in_force_for_order(
+    os.getenv("LIVE_EXIT_AGGRESSIVE_TIME_IN_FORCE", "fill_or_kill"),
+    default="fill_or_kill",
+)
 LIVE_EXIT_MAX_SPREAD_CENTS = int(os.getenv("LIVE_EXIT_MAX_SPREAD_CENTS", "8"))
 LIVE_EXIT_ONLY_WHEN_LOSING = env_bool("LIVE_EXIT_ONLY_WHEN_LOSING", default=True)
 LIVE_EDGE_DROP_EXIT_ENABLED = env_bool("LIVE_EDGE_DROP_EXIT_ENABLED", default=True)
@@ -3453,7 +3478,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             def _submit_limit(limit_price: int, tif: str, mode: str, spread_cents: Optional[int], desired_count: Optional[int] = None) -> dict:
                 count_local = int(desired_count) if desired_count is not None else _compute_contract_count(stake_dollars, int(limit_price))
                 count_local = max(1, min(LIVE_MAX_CONTRACTS_PER_ORDER, int(count_local)))
-                tif_norm = normalize_time_in_force(
+                tif_norm = sanitize_time_in_force_for_order(
                     tif,
                     default=("fill_or_kill" if str(mode).strip().lower() == "aggressive" else "good_til_cancelled"),
                 )
@@ -3979,7 +4004,7 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
                         )
                 if not aggressive_gate:
                     continue
-            tif_norm = normalize_time_in_force(
+            tif_norm = sanitize_time_in_force_for_order(
                 str(a["tif"]),
                 default=("fill_or_kill" if str(a.get("kind", "")).strip().lower() == "aggressive" else "good_til_cancelled"),
             )

@@ -176,7 +176,14 @@ LIVE_EXIT_EDGE_SOFT_PCT = float(os.getenv("LIVE_EXIT_EDGE_SOFT_PCT", "-4.0"))
 LIVE_EXIT_EDGE_HARD_PCT = float(os.getenv("LIVE_EXIT_EDGE_HARD_PCT", "-12.0"))
 LIVE_EXIT_EDGE_DROP_PCT = float(os.getenv("LIVE_EXIT_EDGE_DROP_PCT", "30.0"))
 LIVE_EXIT_SOFT_MAX_ENTRY_EDGE_PCT = float(os.getenv("LIVE_EXIT_SOFT_MAX_ENTRY_EDGE_PCT", "30.0"))
-LIVE_EXIT_CONSECUTIVE_SCANS = int(os.getenv("LIVE_EXIT_CONSECUTIVE_SCANS", "2"))
+LIVE_EXIT_CONSECUTIVE_SCANS = int(os.getenv("LIVE_EXIT_CONSECUTIVE_SCANS", "3"))
+LIVE_EXIT_CONSECUTIVE_MINUTES = float(os.getenv("LIVE_EXIT_CONSECUTIVE_MINUTES", "15.0"))
+LIVE_EXIT_HYSTERESIS_ENABLED = env_bool("LIVE_EXIT_HYSTERESIS_ENABLED", default=True)
+LIVE_EXIT_HYSTERESIS_MIN_DROP_PCT_POINTS = float(os.getenv("LIVE_EXIT_HYSTERESIS_MIN_DROP_PCT_POINTS", "8.0"))
+LIVE_EXIT_HOLD_TO_SETTLE_ENABLED = env_bool("LIVE_EXIT_HOLD_TO_SETTLE_ENABLED", default=True)
+LIVE_EXIT_HOLD_TO_SETTLE_HOURS_BEFORE_CLOSE = float(os.getenv("LIVE_EXIT_HOLD_TO_SETTLE_HOURS_BEFORE_CLOSE", "6.0"))
+LIVE_EXIT_HOLD_TO_SETTLE_MODEL_YES_INVALIDATION_PCT = float(os.getenv("LIVE_EXIT_HOLD_TO_SETTLE_MODEL_YES_INVALIDATION_PCT", "97.0"))
+LIVE_EXIT_HOLD_TO_SETTLE_EDGE_INVALIDATION_PCT = float(os.getenv("LIVE_EXIT_HOLD_TO_SETTLE_EDGE_INVALIDATION_PCT", "-35.0"))
 LIVE_EXIT_MAX_ORDERS_PER_SCAN = int(os.getenv("LIVE_EXIT_MAX_ORDERS_PER_SCAN", "4"))
 LIVE_EXIT_PASSIVE_WAIT_SECONDS = int(os.getenv("LIVE_EXIT_PASSIVE_WAIT_SECONDS", "90"))
 LIVE_EXIT_PASSIVE_REPRICE_STEP_CENTS = int(os.getenv("LIVE_EXIT_PASSIVE_REPRICE_STEP_CENTS", "1"))
@@ -1700,6 +1707,30 @@ def build_city_bucket_comparison(
     consensus = consensus_override if consensus_override is not None else build_expert_consensus(city, now_local, temp_side=side)
     if consensus is None:
         return None
+    side_markets = [m for m in markets if normalize_temp_side(getattr(m, "temp_side", "high")) == side]
+    if not side_markets:
+        return None
+
+    city_now_lst = city_lst_now(now_local, city)
+    city_today_iso = city_now_lst.date().isoformat()
+    target_date: Optional[str] = None
+    date_counts: Dict[str, int] = {}
+    for m in side_markets:
+        d = getattr(m, "market_date_iso", "") or parse_market_date_iso_from_ticker(m.ticker) or ""
+        if not d:
+            continue
+        date_counts[d] = date_counts.get(d, 0) + 1
+    if date_counts:
+        if city_today_iso in date_counts:
+            target_date = city_today_iso
+        else:
+            future_keys = [k for k in date_counts.keys() if k >= city_today_iso]
+            if future_keys:
+                target_date = sorted(future_keys)[0]
+            else:
+                target_date = max(date_counts.keys())
+        side_markets = [m for m in side_markets if ((getattr(m, "market_date_iso", "") or parse_market_date_iso_from_ticker(m.ticker) or "") == target_date)]
+
     obs_context = {
         "current_f": None,
         "max_so_far_f": None,
@@ -1714,14 +1745,14 @@ def build_city_bucket_comparison(
 
     consensus_mu = float(consensus["mu"])
     consensus_sigma = float(consensus["sigma"])
-    city_now_lst = city_lst_now(now_local, city)
     city_hour_lst = city_now_lst.hour
     forecast_ceiling_f: Optional[float] = None
     if side == "high":
         vals = [float(s.get("high_f")) for s in consensus.get("sources", []) if s.get("high_f") is not None]
         if vals:
             forecast_ceiling_f = max(vals)
-    if side in ("high", "low"):
+    apply_intraday_obs_adjustments = (target_date is None) or (target_date == city_today_iso)
+    if side in ("high", "low") and apply_intraday_obs_adjustments:
         try:
             station = CITY_CONFIG[city]["station"]
             current_f, max_so_far_f, min_so_far_f, obs_time = nws_get_today_temp_stats_f(
@@ -1742,27 +1773,6 @@ def build_city_bucket_comparison(
                 consensus_sigma = max(0.7, consensus_sigma * intraday_high_sigma_factor(now_local))
         except Exception:
             pass
-
-    side_markets = [m for m in markets if normalize_temp_side(getattr(m, "temp_side", "high")) == side]
-    if not side_markets:
-        return None
-    date_counts: Dict[str, int] = {}
-    for m in side_markets:
-        d = getattr(m, "market_date_iso", "") or parse_market_date_iso_from_ticker(m.ticker) or ""
-        if not d:
-            continue
-        date_counts[d] = date_counts.get(d, 0) + 1
-    if date_counts:
-        today_iso = now_local.date().isoformat()
-        if today_iso in date_counts:
-            target_date = today_iso
-        else:
-            future_keys = [k for k in date_counts.keys() if k >= today_iso]
-            if future_keys:
-                target_date = sorted(future_keys)[0]
-            else:
-                target_date = max(date_counts.keys())
-        side_markets = [m for m in side_markets if ((getattr(m, "market_date_iso", "") or parse_market_date_iso_from_ticker(m.ticker) or "") == target_date)]
 
     rows: List[dict] = []
     parsed_buckets: List[Tuple[float, float]] = []
@@ -1876,6 +1886,8 @@ def build_city_bucket_comparison(
     return {
         "city": city,
         "temp_side": side,
+        "as_of_est": fmt_est(now_local),
+        "market_date_selected": target_date,
         "kalshi_mean_f": kalshi_mean,
         "consensus_mu_f": consensus_mu,
         "consensus_sigma_f": consensus_sigma,
@@ -3799,6 +3811,19 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
         edge_now = _net_edge_now_pct_for_side(bet_side, model_yes_prob_pct, yes_bid, yes_ask)
         if edge_now is None:
             continue
+        lead_h_to_close = lead_hours_to_market_close(now_local, market_date)
+        if (
+            LIVE_EXIT_HOLD_TO_SETTLE_ENABLED and
+            bet_side == "BUY NO" and
+            lead_h_to_close is not None and
+            0.0 <= float(lead_h_to_close) <= max(0.0, float(LIVE_EXIT_HOLD_TO_SETTLE_HOURS_BEFORE_CLOSE))
+        ):
+            hard_invalidation = (
+                float(model_yes_prob_pct) >= float(LIVE_EXIT_HOLD_TO_SETTLE_MODEL_YES_INVALIDATION_PCT) or
+                float(edge_now) <= float(LIVE_EXIT_HOLD_TO_SETTLE_EDGE_INVALIDATION_PCT)
+            )
+            if not hard_invalidation:
+                continue
         entry_edge = float(pos.get("entry_edge_pct", 0.0))
         drop = entry_edge - float(edge_now)
         quotes = {
@@ -3823,6 +3848,9 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
         partial_taken = bool(prior.get("partial_taken", False))
         exit_plan = ""  # "partial" | "full" | ""
         trigger_name = ""
+        hysteresis_ok = True
+        if LIVE_EXIT_HYSTERESIS_ENABLED:
+            hysteresis_ok = float(drop) >= float(LIVE_EXIT_HYSTERESIS_MIN_DROP_PCT_POINTS)
 
         if LIVE_EDGE_DROP_EXIT_ENABLED and entry_edge > 0:
             edge_drop_points = float(entry_edge) - float(edge_now)
@@ -3831,7 +3859,7 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
                 0.0,
                 float(stake_open_dollars) * max(0.0, float(LIVE_EDGE_DROP_SMALL_GREEN_MAX_PCT_OF_STAKE)) / 100.0,
             )
-            if edge_drop_triggered:
+            if edge_drop_triggered and hysteresis_ok:
                 if pnl_net is not None and float(pnl_net) < 0.0:
                     exit_plan = "full"
                     trigger_name = "edge_drop_red"
@@ -3846,17 +3874,24 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
                 float(edge_now) <= LIVE_EXIT_EDGE_SOFT_PCT and
                 drop >= LIVE_EXIT_EDGE_DROP_PCT
             )
+            if not hysteresis_ok:
+                soft_trigger = False
             if hard_trigger or soft_trigger:
                 exit_plan = "full"
                 trigger_name = ("hard" if hard_trigger else "soft")
 
         should_exit = bool(exit_plan)
         streak = int(prior.get("streak", 0))
+        candidate_since = parse_ts_est(str(prior.get("candidate_since_ts_est", "")))
+        if candidate_since is None:
+            candidate_since = now_local
+        dwell_minutes = max(0.0, (now_local - candidate_since).total_seconds() / 60.0)
         streak = streak + 1 if should_exit else 0
         if should_exit:
             exit_state[pos_sig] = {
                 "streak": streak,
                 "last_ts_est": fmt_est(now_local),
+                "candidate_since_ts_est": fmt_est(candidate_since),
                 "edge_now_pct": round(float(edge_now), 4),
                 "entry_edge_pct": round(float(entry_edge), 4),
                 "trigger": trigger_name,
@@ -3870,6 +3905,7 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
                     "edge_now_pct": round(float(edge_now), 4),
                     "entry_edge_pct": round(float(entry_edge), 4),
                     "trigger": "",
+                    "candidate_since_ts_est": "",
                     "partial_taken": True,
                 }
             elif pos_sig in exit_state:
@@ -3877,6 +3913,8 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
         if not should_exit:
             continue
         if streak < max(1, LIVE_EXIT_CONSECUTIVE_SCANS):
+            continue
+        if dwell_minutes < max(0.0, float(LIVE_EXIT_CONSECUTIVE_MINUTES)):
             continue
 
         ticker = str(pos.get("ticker", "")).strip()
@@ -4034,6 +4072,7 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
                     "edge_now_pct": round(float(edge_now), 4),
                     "entry_edge_pct": round(float(entry_edge), 4),
                     "trigger": trigger_name,
+                    "candidate_since_ts_est": "",
                     "partial_taken": True,
                 }
             elif pos_sig in exit_state:
@@ -5167,6 +5206,13 @@ def health():
         "live_exit_edge_drop_pct": LIVE_EXIT_EDGE_DROP_PCT,
         "live_exit_soft_max_entry_edge_pct": LIVE_EXIT_SOFT_MAX_ENTRY_EDGE_PCT,
         "live_exit_consecutive_scans": LIVE_EXIT_CONSECUTIVE_SCANS,
+        "live_exit_consecutive_minutes": LIVE_EXIT_CONSECUTIVE_MINUTES,
+        "live_exit_hysteresis_enabled": LIVE_EXIT_HYSTERESIS_ENABLED,
+        "live_exit_hysteresis_min_drop_pct_points": LIVE_EXIT_HYSTERESIS_MIN_DROP_PCT_POINTS,
+        "live_exit_hold_to_settle_enabled": LIVE_EXIT_HOLD_TO_SETTLE_ENABLED,
+        "live_exit_hold_to_settle_hours_before_close": LIVE_EXIT_HOLD_TO_SETTLE_HOURS_BEFORE_CLOSE,
+        "live_exit_hold_to_settle_model_yes_invalidation_pct": LIVE_EXIT_HOLD_TO_SETTLE_MODEL_YES_INVALIDATION_PCT,
+        "live_exit_hold_to_settle_edge_invalidation_pct": LIVE_EXIT_HOLD_TO_SETTLE_EDGE_INVALIDATION_PCT,
         "live_exit_max_orders_per_scan": LIVE_EXIT_MAX_ORDERS_PER_SCAN,
         "live_exit_passive_time_in_force": LIVE_EXIT_PASSIVE_TIME_IN_FORCE,
         "live_exit_passive_wait_seconds": LIVE_EXIT_PASSIVE_WAIT_SECONDS,

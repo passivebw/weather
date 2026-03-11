@@ -150,6 +150,7 @@ DISCORD_LEADERBOARD_ENABLED = env_bool("DISCORD_LEADERBOARD_ENABLED", default=Tr
 DISCORD_DISCREPANCY_ENABLED = env_bool("DISCORD_DISCREPANCY_ENABLED", default=True)
 LIVE_TRADING_ENABLED = env_bool("LIVE_TRADING_ENABLED", default=False)
 LIVE_KILL_SWITCH = env_bool("LIVE_KILL_SWITCH", default=False)
+MANUAL_MARKET_BLOCK_ENABLED = env_bool("MANUAL_MARKET_BLOCK_ENABLED", default=True)
 LIVE_MAX_ORDERS_PER_SCAN = int(os.getenv("LIVE_MAX_ORDERS_PER_SCAN", "3"))
 LIVE_MAX_ORDERS_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_DAY", "25"))
 LIVE_MAX_ORDERS_PER_MARKET_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_MARKET_PER_DAY", "1"))
@@ -2549,6 +2550,16 @@ def load_manual_positions_rows() -> List[dict]:
         return []
     return rows
 
+def _manual_blocked_tickers() -> set:
+    if not MANUAL_MARKET_BLOCK_ENABLED:
+        return set()
+    blocked = set()
+    for r in load_manual_positions_rows():
+        t = str(r.get("ticker", "")).strip()
+        if t:
+            blocked.add(t)
+    return blocked
+
 def list_live_trade_log_paths() -> List[str]:
     os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
     pattern = os.path.join(SNAPSHOT_LOG_DIR, "live_trade_orders*.csv")
@@ -3446,6 +3457,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
 
     done: List[dict] = []
     placed = 0
+    blocked_tickers = _manual_blocked_tickers()
     now_et = now_local.astimezone(LOCAL_TZ)
     hour_et = int(now_et.hour)
     early_session = (
@@ -3476,6 +3488,8 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
 
         ticker = str(b.get("ticker", "")).strip()
         if not ticker:
+            continue
+        if ticker in blocked_tickers:
             continue
         try:
             b = _refresh_trade_signal_with_fresh_accuweather(b, now_local)
@@ -3811,6 +3825,7 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
     placed = 0
     exit_logs: List[dict] = []
     detail_cache: Dict[Tuple[str, str, str], dict] = {}
+    blocked_tickers = _manual_blocked_tickers()
 
     for pos in open_positions:
         if placed >= max(1, LIVE_EXIT_MAX_ORDERS_PER_SCAN):
@@ -3824,6 +3839,9 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
         city = str(pos.get("city", "")).strip()
         side = normalize_temp_side(str(pos.get("temp_type", "high")))
         market_date = str(pos.get("date", "")).strip()
+        ticker = str(pos.get("ticker", "")).strip()
+        if ticker in blocked_tickers:
+            continue
         bet_side = str(pos.get("bet", "")).strip().upper()
         order_side, price_field = _bet_side_and_price_field(bet_side)
         if order_side is None or price_field is None:
@@ -3971,7 +3989,6 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
         if dwell_minutes < max(0.0, float(LIVE_EXIT_CONSECUTIVE_MINUTES)):
             continue
 
-        ticker = str(pos.get("ticker", "")).strip()
         if exit_plan == "partial":
             frac = clamp(float(LIVE_EDGE_DROP_PARTIAL_SELL_FRACTION), 0.01, 0.99)
             target_count = max(1, int(math.ceil(float(open_count_total) * frac)))
@@ -5738,6 +5755,9 @@ def health():
         "live_trading_enabled": LIVE_TRADING_ENABLED,
         "live_kill_switch": _live_kill_switch_state,
         "live_kill_switch_default": LIVE_KILL_SWITCH,
+        "manual_market_block_enabled": MANUAL_MARKET_BLOCK_ENABLED,
+        "manual_positions_path": manual_positions_path(),
+        "manual_positions_count": len(load_manual_positions_rows()),
         "live_max_orders_per_scan": LIVE_MAX_ORDERS_PER_SCAN,
         "live_max_orders_per_day": LIVE_MAX_ORDERS_PER_DAY,
         "live_max_orders_per_market_per_day": LIVE_MAX_ORDERS_PER_MARKET_PER_DAY,

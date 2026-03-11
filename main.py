@@ -4794,7 +4794,7 @@ def home():
   <main class="wrap">
     <section class="hero">
       <h1>Kalshi Weather Trade Control</h1>
-      <div class="sub">Live criteria, execution tracking, and EV vs realized performance in one view.</div>
+      <div class="sub">Live criteria, model calibration, and EV vs realized progression in one view.</div>
       <div class="top-grid">
         <div class="stat"><div class="k">System</div><div class="v" id="sys">Loading</div></div>
         <div class="stat"><div class="k">As Of</div><div class="v" id="asOf">-</div></div>
@@ -4804,8 +4804,8 @@ def home():
       </div>
       <div class="nav-grid">
         <a class="nav-box" href="#criteria"><b>Trade Criteria</b><span>edge floors, ladder size, scan cadence, gating</span></a>
-        <a class="nav-box" href="#execution"><b>Execution Stats</b><span>wins/losses summary + recent order attempts</span></a>
-        <a class="nav-box" href="#ev"><b>EV vs Outcome</b><span>daily expected P/L against realized P/L</span></a>
+        <a class="nav-box" href="#model"><b>Model Quality</b><span>city/side attribution, ladder accuracy, rejection health</span></a>
+        <a class="nav-box" href="#ev"><b>EV vs Outcome</b><span>cumulative expected P/L against realized P/L</span></a>
       </div>
     </section>
 
@@ -4828,28 +4828,58 @@ def home():
         </div>
       </div>
 
-      <div class="card" id="execution">
-        <h2>Executed Trades</h2>
-        <div class="meta">Live-only fills and outcomes from <span class="mono">logs/live_trade_orders.csv</span>.</div>
-        <div class="row">
-          <div class="stat"><div class="k">Live Wins</div><div class="v" id="wins">-</div></div>
-          <div class="stat"><div class="k">Live Losses</div><div class="v" id="losses">-</div></div>
-          <div class="stat"><div class="k">Live Win Rate</div><div class="v" id="winRate">-</div></div>
-          <div class="stat"><div class="k">Settled ROI (Net)</div><div class="v" id="roi">-</div></div>
-          <div class="stat"><div class="k">Settled P/L (Net)</div><div class="v" id="settledPnl">-</div></div>
-          <div class="stat"><div class="k">Open+Settled P/L (Proxy)</div><div class="v" id="proxyPnl">-</div></div>
-          <div class="stat"><div class="k">Fees Paid</div><div class="v" id="feesPaid">-</div></div>
-          <div class="stat"><div class="k">Fees / Stake</div><div class="v" id="feeRate">-</div></div>
-        </div>
+      <div class="card" id="model">
+        <h2>Model Quality</h2>
+        <div class="meta">Calibration and attribution from <span class="mono">/analytics/live-insights</span>.</div>
         <div class="toolbar">
-          <button class="btn active" data-days="7">Last 7D</button>
-          <button class="btn" data-days="14">Last 14D</button>
-          <button class="btn" data-days="30">Last 30D</button>
+          <button class="btn active" data-model-days="7">Model 7D</button>
+          <button class="btn" data-model-days="14">Model 14D</button>
+          <button class="btn" data-model-days="30">Model 30D</button>
         </div>
-        <div class="table-wrap">
+        <div class="row">
+          <div class="stat"><div class="k">Filled Positions</div><div class="v" id="modelFills">-</div></div>
+          <div class="stat"><div class="k">Settled Positions</div><div class="v" id="modelSettled">-</div></div>
+          <div class="stat"><div class="k">Settled Win Rate</div><div class="v" id="modelWinRate">-</div></div>
+          <div class="stat"><div class="k">Avg Entry Edge</div><div class="v" id="modelAvgEdge">-</div></div>
+          <div class="stat"><div class="k">Expected Net P/L</div><div class="v" id="modelExpected">-</div></div>
+          <div class="stat"><div class="k">Realized Net P/L</div><div class="v" id="modelRealized">-</div></div>
+          <div class="stat"><div class="k">Realized - Expected</div><div class="v" id="modelGap">-</div></div>
+          <div class="stat"><div class="k">Order Reject Rate</div><div class="v" id="modelRejectRate">-</div></div>
+        </div>
+        <div class="split" style="margin-top:8px;">
+          <div>
+            <div class="meta">City x Side Attribution</div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>City</th><th>Side</th><th>Fills</th><th>Settled</th><th>Avg Edge</th><th>Exp Win%</th><th>Act Win%</th><th>Expected</th><th>Realized</th></tr></thead>
+                <tbody id="citySideRows"><tr><td colspan="9">Loading...</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <div class="meta">Edge Ladder Accuracy</div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Edge Bucket</th><th>N</th><th>Avg Edge</th><th>Exp Win%</th><th>Act Win%</th><th>Expected</th><th>Realized</th><th>ROI</th></tr></thead>
+                <tbody id="ladderRows"><tr><td colspan="8">Loading...</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div class="split" style="margin-top:8px;">
+          <div class="item">
+            <b>Opportunity Funnel</b>
+            <span id="funnelText">Loading...</span>
+          </div>
+          <div class="item">
+            <b>Source Health</b>
+            <span id="sourceHealthText">Loading...</span>
+          </div>
+        </div>
+        <div class="table-wrap" style="margin-top:8px;">
           <table>
-            <thead><tr><th>Time</th><th>City</th><th>Bet</th><th>Ticker</th><th>Status</th><th>Count</th><th>Price</th><th>Error</th></tr></thead>
-            <tbody id="orderRows"><tr><td colspan="8">Loading...</td></tr></tbody>
+            <thead><tr><th>Time</th><th>City</th><th>Ticker</th><th>Status</th><th>Error</th></tr></thead>
+            <tbody id="errorRows"><tr><td colspan="5">Loading...</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -4985,10 +5015,9 @@ def home():
     }
 
     async function loadAll() {
-      const [healthRes, liveRes, ordRes] = await Promise.all([
+      const [healthRes, liveRes] = await Promise.all([
         fetch("/health").then(r => r.json()),
-        fetch("/live/status").then(r => r.json()),
-        fetch("/live/last-orders?limit=30").then(r => r.json())
+        fetch("/live/status").then(r => r.json())
       ]);
       liveStatusCache = liveRes || {};
 
@@ -5012,24 +5041,15 @@ def home():
       $("ladderText").textContent = "10-20%: 0.5u, 20-25%: 1u, 25-40%: 1.5u, 40%+: 2u (capped)";
       $("safetyText").textContent = `max ${healthRes.live_max_orders_per_market_per_day}/market/day, max ${healthRes.live_max_orders_per_scan}/scan, kill switch: ${healthRes.live_kill_switch ? "ON" : "OFF"}`;
 
-      const orders = Array.isArray(ordRes.orders) ? ordRes.orders : [];
-      $("orderRows").innerHTML = orders.length ? orders.map(o => `
-        <tr>
-          <td>${esc(o.ts_est)}</td>
-          <td>${esc(o.city)}</td>
-          <td>${esc(o.bet)}</td>
-          <td class="mono">${esc(o.ticker)}</td>
-          <td>${statusPill(o.status)}</td>
-          <td>${esc(o.count)}</td>
-          <td>${esc(o.limit_price_cents)}c</td>
-          <td>${esc(o.error || "")}</td>
-        </tr>
-      `).join("") : "<tr><td colspan='8'>No live orders logged yet.</td></tr>";
+      const src = Array.isArray(healthRes.consensus_sources) ? healthRes.consensus_sources.join(", ") : "-";
+      const awErr = String(healthRes.accuweather_last_error || "").trim();
+      const awHealth = awErr ? `AccuWeather issue: ${awErr.slice(0, 90)}...` : "AccuWeather OK";
+      $("sourceHealthText").textContent = `Sources: ${src}. ${awHealth} NWS stale threshold: ${healthRes.nws_obs_stale_minutes}m.`;
 
-      await loadScorecard();
+      await loadAnalytics();
     }
 
-    async function loadScorecard() {
+    async function loadAnalytics() {
       const end = new Date();
       const start = new Date();
       start.setDate(end.getDate() - (rangeDays - 1));
@@ -5039,20 +5059,63 @@ def home():
       const firstTradeDate = String((liveStatusCache && liveStatusCache.first_trade_date) || "").trim();
       const historyStart = (firstTradeDate && /^\\d{4}-\\d{2}-\\d{2}$/.test(firstTradeDate)) ? firstTradeDate : ymd(evStart);
       const qEv = new URLSearchParams({ start: historyStart, end: ymd(end) });
-      const [dataSettled, dataProxy] = await Promise.all([
+      const [dataSettled, dataInsights] = await Promise.all([
         fetch(`/analytics/live-scorecard?${q.toString()}`).then(r => r.json()),
-        fetch(`/analytics/live-scorecard?${q.toString()}&finalized_only=false`).then(r => r.json()),
+        fetch(`/analytics/live-insights?${q.toString()}`).then(r => r.json()),
       ]);
       const s = (dataSettled && dataSettled.summary) || {};
-      const sp = (dataProxy && dataProxy.summary) || {};
-      $("wins").textContent = s.realized_win_count ?? "-";
-      $("losses").textContent = s.realized_loss_count ?? "-";
-      $("winRate").textContent = pct(s.realized_win_rate_pct);
-      $("roi").textContent = pct(s.realized_roi_pct_on_stake);
-      $("settledPnl").textContent = money(s.total_realized_pnl_dollars);
-      $("proxyPnl").textContent = money(sp.total_realized_pnl_dollars);
-      $("feesPaid").textContent = money(s.total_fees_dollars);
-      $("feeRate").textContent = pct(s.fees_pct_on_stake);
+      const iq = (dataInsights && dataInsights.summary) || {};
+      $("modelFills").textContent = iq.fills ?? "-";
+      $("modelSettled").textContent = iq.settled_count ?? "-";
+      $("modelWinRate").textContent = pct(iq.realized_win_rate_pct);
+      $("modelAvgEdge").textContent = pct(iq.avg_edge_pct);
+      $("modelExpected").textContent = money(iq.expected_net_dollars);
+      $("modelRealized").textContent = money(iq.realized_dollars);
+      $("modelGap").textContent = money(iq.ev_gap_dollars);
+      $("modelRejectRate").textContent = pct(iq.rejected_rate_pct);
+
+      const cityRows = Array.isArray(dataInsights.city_side) ? dataInsights.city_side : [];
+      $("citySideRows").innerHTML = cityRows.length ? cityRows.slice(0, 20).map(r => `
+        <tr>
+          <td>${esc(r.city)}</td>
+          <td>${esc(r.temp_side)}</td>
+          <td>${esc(r.fills)}</td>
+          <td>${esc(r.settled_count)}</td>
+          <td>${pct(r.avg_edge_pct)}</td>
+          <td>${pct(r.expected_win_rate_pct)}</td>
+          <td>${pct(r.actual_win_rate_pct)}</td>
+          <td>${money(r.expected_net_dollars)}</td>
+          <td>${money(r.realized_dollars)}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='9'>No data in this window.</td></tr>";
+
+      const ladderRows = Array.isArray(dataInsights.edge_ladder) ? dataInsights.edge_ladder : [];
+      $("ladderRows").innerHTML = ladderRows.length ? ladderRows.map(r => `
+        <tr>
+          <td>${esc(r.bucket)}</td>
+          <td>${esc(r.n)}</td>
+          <td>${pct(r.avg_edge_pct)}</td>
+          <td>${pct(r.expected_win_rate_pct)}</td>
+          <td>${pct(r.actual_win_rate_pct)}</td>
+          <td>${money(r.expected_net_dollars)}</td>
+          <td>${money(r.realized_dollars)}</td>
+          <td>${pct(r.realized_roi_pct_on_stake)}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='8'>No data in this window.</td></tr>";
+
+      const f = (dataInsights && dataInsights.funnel) || {};
+      $("funnelText").textContent = `attempted ${f.orders_attempted ?? 0} -> rejected ${f.orders_rejected ?? 0} -> not filled ${f.orders_not_filled ?? 0} -> filled rows ${f.fill_rows ?? 0} -> positions ${f.positions_filled ?? 0} -> settled ${f.settled_positions ?? 0}`;
+
+      const errs = Array.isArray(dataInsights.recent_errors) ? dataInsights.recent_errors : [];
+      $("errorRows").innerHTML = errs.length ? errs.map(e => `
+        <tr>
+          <td>${esc(e.ts_est)}</td>
+          <td>${esc(e.city)}</td>
+          <td class="mono">${esc(e.ticker)}</td>
+          <td>${statusPill(e.status)}</td>
+          <td>${esc(e.error)}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='5'>No recent errors in this window.</td></tr>";
 
       const dataEv = await fetch(`/analytics/live-scorecard?${qEv.toString()}`).then(r => r.json());
       const perAll = Array.isArray(dataEv.per_day) ? dataEv.per_day.filter(x => x.ok) : [];
@@ -5105,12 +5168,12 @@ def home():
       });
     }
 
-    document.querySelectorAll(".btn[data-days]").forEach(btn => {
+    document.querySelectorAll(".btn[data-model-days]").forEach(btn => {
       btn.addEventListener("click", async () => {
-        rangeDays = Number(btn.dataset.days || "7");
-        document.querySelectorAll(".btn[data-days]").forEach(b => b.classList.remove("active"));
+        rangeDays = Number(btn.dataset.modelDays || "7");
+        document.querySelectorAll(".btn[data-model-days]").forEach(b => b.classList.remove("active"));
         btn.classList.add("active");
-        await loadScorecard();
+        await loadAnalytics();
       });
     });
 
@@ -5119,7 +5182,7 @@ def home():
         evRangeDays = Number(btn.dataset.evDays || "7");
         document.querySelectorAll(".btn[data-ev-days]").forEach(b => b.classList.remove("active"));
         btn.classList.add("active");
-        await loadScorecard();
+        await loadAnalytics();
       });
     });
 
@@ -6490,6 +6553,7 @@ def analytics_live_scorecard(
     city: Optional[str] = None,
     temp_side: Optional[str] = None,
     finalized_only: bool = True,
+    trade_limit: int = 200,
 ):
     try:
         d0 = datetime.fromisoformat(start).date()
@@ -6761,7 +6825,233 @@ def analytics_live_scorecard(
             "realized_roi_pct_on_stake": ((100.0 * total_realized / total_stake) if total_stake > 0 else None),
         },
         "per_day": per_day,
-        "trades": trades[-200:],
+        "trades": (
+            trades
+            if int(trade_limit) <= 0
+            else trades[-max(1, min(5000, int(trade_limit))):]
+        ),
+    }
+
+
+@app.get("/analytics/live-insights")
+def analytics_live_insights(
+    start: str,
+    end: str,
+    city: Optional[str] = None,
+    temp_side: Optional[str] = None,
+    finalized_only: bool = True,
+):
+    base = analytics_live_scorecard(
+        start=start,
+        end=end,
+        city=city,
+        temp_side=temp_side,
+        finalized_only=finalized_only,
+        trade_limit=0,
+    )
+    if not base.get("ok"):
+        return base
+
+    trades = [dict(t) for t in (base.get("trades", []) or [])]
+    summary = dict(base.get("summary", {}) or {})
+
+    city_side_acc: Dict[Tuple[str, str], dict] = {}
+    ladder_acc: Dict[str, dict] = {}
+    ladder_order = ["<5%", "5-10%", "10-20%", "20-30%", "30%+"]
+
+    def _ladder_bucket(edge_pct: float) -> str:
+        e = float(edge_pct)
+        if e < 5.0:
+            return "<5%"
+        if e < 10.0:
+            return "5-10%"
+        if e < 20.0:
+            return "10-20%"
+        if e < 30.0:
+            return "20-30%"
+        return "30%+"
+
+    for t in trades:
+        city_name = str(t.get("city", "")).strip()
+        side = normalize_temp_side(str(t.get("temp_side", "high")))
+        edge_pct = float(_to_float(t.get("edge_pct")) or 0.0)
+        stake = float(_to_float(t.get("stake_dollars")) or 0.0)
+        exp_net = float(_to_float(t.get("expected_profit_net_dollars")) or 0.0)
+        realized = _to_float(t.get("realized_pnl_dollars"))
+        model_win = float(_to_float(t.get("model_win_prob_pct")) or 0.0)
+        realized_correct = t.get("realized_correct")
+
+        k_cs = (city_name, side)
+        a = city_side_acc.setdefault(k_cs, {
+            "city": city_name,
+            "temp_side": side,
+            "fills": 0,
+            "stake": 0.0,
+            "expected_net": 0.0,
+            "realized": 0.0,
+            "realized_n": 0,
+            "wins": 0,
+            "edge_sum": 0.0,
+            "model_win_sum": 0.0,
+        })
+        a["fills"] += 1
+        a["stake"] += stake
+        a["expected_net"] += exp_net
+        a["edge_sum"] += edge_pct
+        a["model_win_sum"] += model_win
+        if realized is not None:
+            a["realized"] += float(realized)
+            a["realized_n"] += 1
+            if bool(realized_correct):
+                a["wins"] += 1
+
+        lb = _ladder_bucket(edge_pct)
+        b = ladder_acc.setdefault(lb, {
+            "bucket": lb,
+            "n": 0,
+            "stake": 0.0,
+            "edge_sum": 0.0,
+            "model_win_sum": 0.0,
+            "expected_net": 0.0,
+            "realized": 0.0,
+            "realized_n": 0,
+            "wins": 0,
+        })
+        b["n"] += 1
+        b["stake"] += stake
+        b["edge_sum"] += edge_pct
+        b["model_win_sum"] += model_win
+        b["expected_net"] += exp_net
+        if realized is not None:
+            b["realized"] += float(realized)
+            b["realized_n"] += 1
+            if bool(realized_correct):
+                b["wins"] += 1
+
+    city_side = []
+    for _, a in city_side_acc.items():
+        n = max(1, int(a["fills"]))
+        realized_n = int(a["realized_n"])
+        wins = int(a["wins"])
+        city_side.append({
+            "city": a["city"],
+            "temp_side": a["temp_side"],
+            "fills": int(a["fills"]),
+            "settled_count": realized_n,
+            "avg_edge_pct": float(a["edge_sum"]) / n,
+            "expected_win_rate_pct": float(a["model_win_sum"]) / n,
+            "actual_win_rate_pct": ((100.0 * wins / realized_n) if realized_n > 0 else None),
+            "expected_net_dollars": float(a["expected_net"]),
+            "realized_dollars": float(a["realized"]),
+            "realized_roi_pct_on_stake": ((100.0 * float(a["realized"]) / float(a["stake"])) if float(a["stake"]) > 0 else None),
+        })
+    city_side.sort(key=lambda x: (x.get("realized_dollars", 0.0), x.get("expected_net_dollars", 0.0)), reverse=True)
+
+    edge_ladder = []
+    for lb in ladder_order:
+        b = ladder_acc.get(lb)
+        if not b:
+            edge_ladder.append({
+                "bucket": lb, "n": 0, "avg_edge_pct": None, "expected_win_rate_pct": None,
+                "actual_win_rate_pct": None, "expected_net_dollars": 0.0, "realized_dollars": 0.0,
+                "realized_roi_pct_on_stake": None,
+            })
+            continue
+        n = max(1, int(b["n"]))
+        realized_n = int(b["realized_n"])
+        wins = int(b["wins"])
+        edge_ladder.append({
+            "bucket": lb,
+            "n": int(b["n"]),
+            "avg_edge_pct": float(b["edge_sum"]) / n,
+            "expected_win_rate_pct": float(b["model_win_sum"]) / n,
+            "actual_win_rate_pct": ((100.0 * wins / realized_n) if realized_n > 0 else None),
+            "expected_net_dollars": float(b["expected_net"]),
+            "realized_dollars": float(b["realized"]),
+            "realized_roi_pct_on_stake": ((100.0 * float(b["realized"]) / float(b["stake"])) if float(b["stake"]) > 0 else None),
+        })
+
+    d0 = datetime.fromisoformat(start).date()
+    d1 = datetime.fromisoformat(end).date()
+    rows = load_live_trade_log_rows()
+    attempts = []
+    for r in rows:
+        d = str(r.get("date", "")).strip()
+        try:
+            dd = datetime.fromisoformat(d).date()
+        except Exception:
+            continue
+        if not (d0 <= dd <= d1):
+            continue
+        if city and str(r.get("city", "")).strip().lower() != str(city).strip().lower():
+            continue
+        if temp_side and normalize_temp_side(str(r.get("temp_type", "high"))) != normalize_temp_side(temp_side):
+            continue
+        attempts.append(r)
+
+    attempted_orders = len(attempts)
+    rejected_orders = 0
+    not_filled_orders = 0
+    filled_rows = 0
+    contracts_filled = 0
+    recent_errors = []
+    for r in attempts:
+        st = str(r.get("status", "")).strip().lower()
+        cnt = int(float(_to_float(r.get("count")) or 0))
+        if st == "rejected":
+            rejected_orders += 1
+        elif st in ("not_filled", "edge_gone", "cancel_failed"):
+            not_filled_orders += 1
+        elif st in ("submitted", "partial", "partial_filled"):
+            filled_rows += 1
+            contracts_filled += max(0, cnt)
+        err = str(r.get("error", "") or "").strip()
+        if err:
+            recent_errors.append({
+                "ts_est": r.get("ts_est"),
+                "city": r.get("city"),
+                "ticker": r.get("ticker"),
+                "status": r.get("status"),
+                "error": err[:240],
+            })
+    recent_errors = recent_errors[-5:][::-1]
+
+    settled_count = int(summary.get("realized_count", 0) or 0)
+    fills = int(summary.get("fills", 0) or 0)
+    expected_net = float(summary.get("total_expected_profit_net_dollars", 0.0) or 0.0)
+    realized_total = float(summary.get("total_realized_pnl_dollars", 0.0) or 0.0)
+    ev_gap = realized_total - expected_net
+    avg_edge = (sum(float(_to_float(t.get("edge_pct")) or 0.0) for t in trades) / len(trades)) if trades else None
+
+    return {
+        "ok": True,
+        "start": base.get("start"),
+        "end": base.get("end"),
+        "finalized_only": bool(finalized_only),
+        "summary": {
+            "fills": fills,
+            "settled_count": settled_count,
+            "expected_net_dollars": expected_net,
+            "realized_dollars": realized_total,
+            "ev_gap_dollars": ev_gap,
+            "avg_edge_pct": avg_edge,
+            "realized_win_rate_pct": summary.get("realized_win_rate_pct"),
+            "orders_attempted": attempted_orders,
+            "orders_rejected": rejected_orders,
+            "rejected_rate_pct": ((100.0 * rejected_orders / attempted_orders) if attempted_orders > 0 else None),
+        },
+        "funnel": {
+            "orders_attempted": attempted_orders,
+            "orders_rejected": rejected_orders,
+            "orders_not_filled": not_filled_orders,
+            "fill_rows": filled_rows,
+            "contracts_filled": contracts_filled,
+            "positions_filled": fills,
+            "settled_positions": settled_count,
+        },
+        "city_side": city_side,
+        "edge_ladder": edge_ladder,
+        "recent_errors": recent_errors,
     }
 
 def summarize_live_window(

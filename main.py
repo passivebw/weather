@@ -2522,6 +2522,33 @@ def _fetch_portfolio_components_dollars() -> Dict[str, Optional[float]]:
 def live_trade_log_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "live_trade_orders.csv")
 
+def manual_positions_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "manual_positions.csv")
+
+def ensure_manual_positions_header() -> None:
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = manual_positions_path()
+    if os.path.exists(path):
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "opened_ts_est", "date", "city", "temp_side", "ticker", "bet",
+            "line", "price_cents", "count", "source", "note",
+        ])
+
+def load_manual_positions_rows() -> List[dict]:
+    ensure_manual_positions_header()
+    path = manual_positions_path()
+    rows: List[dict] = []
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                rows.append(dict(r))
+    except Exception:
+        return []
+    return rows
+
 def list_live_trade_log_paths() -> List[str]:
     os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
     pattern = os.path.join(SNAPSHOT_LOG_DIR, "live_trade_orders*.csv")
@@ -4862,6 +4889,7 @@ def home():
         <button class="tab-btn" data-tab-target="ladderTab">Edge Ladder</button>
         <button class="tab-btn" data-tab-target="evTab">EV Chart</button>
         <button class="tab-btn" data-tab-target="dailyTab">Daily Stats</button>
+        <button class="tab-btn" data-tab-target="manualTab">Manual Positions</button>
       </div>
     </section>
 
@@ -5012,6 +5040,33 @@ def home():
       </div>
     </section>
     </section>
+
+    <section id="manualTab" class="tab-content">
+    <section class="card" id="manualPos">
+      <h2>Manual Positions</h2>
+      <div class="meta">Manual entries loaded from <span class="mono" id="manualPath">manual_positions.csv</span>.</div>
+      <div class="toolbar">
+        <button class="btn" data-manual-days="7">Manual 7D</button>
+        <button class="btn active" data-manual-days="30">Manual 30D</button>
+        <button class="btn" data-manual-days="90">Manual 90D</button>
+        <button class="btn" data-manual-days="0">All</button>
+      </div>
+      <div class="row">
+        <div class="stat"><div class="k">Positions</div><div class="v" id="manualPositions">-</div></div>
+        <div class="stat"><div class="k">Contracts</div><div class="v" id="manualContracts">-</div></div>
+        <div class="stat"><div class="k">Stake</div><div class="v" id="manualStake">-</div></div>
+        <div class="stat"><div class="k">Resolved</div><div class="v" id="manualResolved">-</div></div>
+        <div class="stat"><div class="k">Open</div><div class="v" id="manualOpen">-</div></div>
+        <div class="stat"><div class="k">Realized P/L</div><div class="v" id="manualRealized">-</div></div>
+      </div>
+      <div class="table-wrap" style="margin-top:8px;">
+        <table>
+          <thead><tr><th>Date</th><th>City</th><th>Side</th><th>Bet</th><th>Line</th><th>Ticker</th><th>Price</th><th>Count</th><th>Stake</th><th>Status</th><th>Realized</th><th>Source</th></tr></thead>
+          <tbody id="manualRows"><tr><td colspan="12">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+    </section>
   </main>
 
   <script>
@@ -5021,6 +5076,7 @@ def home():
     let ladderRangeDays = 7;
     let evRangeDays = 7;
     let dailyRangeDays = 14;
+    let manualRangeDays = 30;
     let liveStatusCache = {};
     let ladderRowsData = [];
     let dailyRowsData = [];
@@ -5040,6 +5096,8 @@ def home():
     function statusPill(status) {
       const s = String(status || "").toLowerCase();
       if (s.includes("submitted") || s.includes("partial")) return '<span class="pill ok">' + esc(status) + '</span>';
+      if (s.includes("resolved_win")) return '<span class="pill ok">' + esc(status) + '</span>';
+      if (s.includes("open")) return '<span class="pill warn">' + esc(status) + '</span>';
       if (s.includes("not_filled") || s.includes("edge_gone")) return '<span class="pill warn">' + esc(status) + '</span>';
       return '<span class="pill bad">' + esc(status || "unknown") + '</span>';
     }
@@ -5386,6 +5444,13 @@ def home():
       const firstTradeDate = String((liveStatusCache && liveStatusCache.first_trade_date) || "").trim();
       const historyStart = (firstTradeDate && /^\\d{4}-\\d{2}-\\d{2}$/.test(firstTradeDate)) ? firstTradeDate : ymd(evStart);
       const qEv = new URLSearchParams({ start: historyStart, end: ymd(end) });
+      const manualStart = new Date();
+      manualStart.setDate(end.getDate() - (Math.max(1, manualRangeDays) - 1));
+      const qManual = new URLSearchParams();
+      if (manualRangeDays > 0) {
+        qManual.set("start", ymd(manualStart));
+        qManual.set("end", ymd(end));
+      }
       const [dataSettled, dataInsights, dataDaily, dataCity, dataLadder] = await Promise.all([
         fetch(`/analytics/live-scorecard?${q.toString()}`).then(r => r.json()),
         fetch(`/analytics/live-insights?${q.toString()}`).then(r => r.json()),
@@ -5393,6 +5458,7 @@ def home():
         fetch(`/analytics/live-insights?${qCity.toString()}`).then(r => r.json()),
         fetch(`/analytics/live-insights?${qLadder.toString()}`).then(r => r.json()),
       ]);
+      const dataManual = await fetch(`/analytics/manual-positions?${qManual.toString()}`).then(r => r.json());
       const iq = (dataInsights && dataInsights.summary) || {};
       $("modelFills").textContent = iq.fills ?? "-";
       $("modelSettled").textContent = iq.settled_count ?? "-";
@@ -5453,6 +5519,32 @@ def home():
       renderDailyRows();
       renderWeeklyRows();
       renderMonthlyRows();
+
+      const ms = (dataManual && dataManual.summary) || {};
+      $("manualPath").textContent = String((dataManual && dataManual.path) || "manual_positions.csv");
+      $("manualPositions").textContent = ms.positions ?? "-";
+      $("manualContracts").textContent = ms.contracts ?? "-";
+      $("manualStake").textContent = money(ms.stake_dollars);
+      $("manualResolved").textContent = ms.resolved_positions ?? "-";
+      $("manualOpen").textContent = ms.open_positions ?? "-";
+      $("manualRealized").textContent = money(ms.realized_pnl_dollars);
+      const manualRows = Array.isArray(dataManual.rows) ? dataManual.rows : [];
+      $("manualRows").innerHTML = manualRows.length ? manualRows.map(r => `
+        <tr>
+          <td>${esc(r.date)}</td>
+          <td>${esc(r.city)}</td>
+          <td>${esc(r.temp_side)}</td>
+          <td>${esc(r.bet)}</td>
+          <td>${esc(r.line)}</td>
+          <td class="mono">${esc(r.ticker)}</td>
+          <td>${esc(Number(r.price_cents || 0).toFixed(1))}c</td>
+          <td>${esc(r.count)}</td>
+          <td>${money(r.stake_dollars)}</td>
+          <td>${statusPill(r.settled ? (r.is_win ? "resolved_win" : "resolved_loss") : "open")}</td>
+          <td>${money(r.realized_pnl_dollars)}</td>
+          <td>${esc(r.source || "")}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='12'>No manual positions in this window.</td></tr>";
 
       const dataEv = await fetch(`/analytics/live-scorecard?${qEv.toString()}`).then(r => r.json());
       const perAll = Array.isArray(dataEv.per_day) ? dataEv.per_day.filter(x => x.ok) : [];
@@ -5545,6 +5637,15 @@ def home():
       btn.addEventListener("click", async () => {
         dailyRangeDays = Number(btn.dataset.dailyDays || "14");
         document.querySelectorAll(".btn[data-daily-days]").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        await loadAnalytics();
+      });
+    });
+
+    document.querySelectorAll(".btn[data-manual-days]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        manualRangeDays = Number(btn.dataset.manualDays || "30");
+        document.querySelectorAll(".btn[data-manual-days]").forEach(b => b.classList.remove("active"));
         btn.classList.add("active");
         await loadAnalytics();
       });
@@ -7470,6 +7571,103 @@ def analytics_live_insights(
         "edge_ladder": edge_ladder,
         "recent_errors": recent_errors,
         "per_day": per_day_out,
+    }
+
+@app.get("/analytics/manual-positions")
+def analytics_manual_positions(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    rows = load_manual_positions_rows()
+    d0 = None
+    d1 = None
+    try:
+        if start:
+            d0 = datetime.fromisoformat(str(start)).date()
+    except Exception:
+        d0 = None
+    try:
+        if end:
+            d1 = datetime.fromisoformat(str(end)).date()
+    except Exception:
+        d1 = None
+
+    out = []
+    cost_total = 0.0
+    contracts_total = 0
+    resolved_count = 0
+    realized_total = 0.0
+
+    for r in rows:
+        date_iso = str(r.get("date", "")).strip()
+        try:
+            dd = datetime.fromisoformat(date_iso).date()
+        except Exception:
+            dd = None
+        if d0 and dd and dd < d0:
+            continue
+        if d1 and dd and dd > d1:
+            continue
+
+        city = str(r.get("city", "")).strip()
+        side = normalize_temp_side(str(r.get("temp_side", "high")))
+        bet = str(r.get("bet", "")).strip().upper()
+        ticker = str(r.get("ticker", "")).strip()
+        line = str(r.get("line", "")).strip()
+        price_cents = float(_to_float(r.get("price_cents")) or 0.0)
+        count = int(float(_to_float(r.get("count")) or 0))
+        price_dollars = max(0.0, price_cents / 100.0)
+        stake_dollars = max(0.0, price_dollars * max(0, count))
+        contracts_total += max(0, count)
+        cost_total += stake_dollars
+
+        outcome_f = get_final_outcome_f(date_iso, city, side) if date_iso and city else None
+        bucket = parse_bucket_from_line(line)
+        settled = (outcome_f is not None and bucket is not None and count > 0)
+        is_win = None
+        realized_pnl = None
+        if settled and bucket is not None:
+            yes_outcome = _bucket_yes_from_outcome(float(outcome_f), float(bucket[0]), float(bucket[1]))
+            is_buy_yes = "YES" in bet
+            is_win = bool(yes_outcome) if is_buy_yes else (not bool(yes_outcome))
+            payout = float(count) if bool(is_win) else 0.0
+            realized_pnl = payout - stake_dollars
+            resolved_count += 1
+            realized_total += float(realized_pnl)
+
+        out.append({
+            "opened_ts_est": r.get("opened_ts_est"),
+            "date": date_iso,
+            "city": city,
+            "temp_side": side,
+            "ticker": ticker,
+            "bet": bet,
+            "line": line,
+            "price_cents": price_cents,
+            "count": count,
+            "stake_dollars": stake_dollars,
+            "source": r.get("source"),
+            "note": r.get("note"),
+            "settled": bool(settled),
+            "outcome_f": outcome_f,
+            "realized_pnl_dollars": realized_pnl,
+            "is_win": is_win,
+        })
+
+    out.sort(key=lambda x: (str(x.get("date", "")), str(x.get("opened_ts_est", ""))), reverse=True)
+    return {
+        "ok": True,
+        "path": manual_positions_path(),
+        "count": len(out),
+        "summary": {
+            "positions": len(out),
+            "contracts": contracts_total,
+            "stake_dollars": cost_total,
+            "resolved_positions": resolved_count,
+            "open_positions": max(0, len(out) - resolved_count),
+            "realized_pnl_dollars": realized_total,
+        },
+        "rows": out,
     }
 
 def summarize_live_window(

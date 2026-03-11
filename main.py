@@ -4712,27 +4712,30 @@ def home():
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Kalshi Weather Trading Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #f4f7fb;
-      --ink: #10233b;
-      --muted: #4a607a;
+      --bg: #edf1f7;
+      --ink: #0f2135;
+      --muted: #546b86;
       --card: #ffffff;
-      --line: #d6e0ec;
-      --accent: #0b5cad;
-      --accent-2: #0f8a72;
-      --red: #b4233c;
-      --good: #1e8e5a;
-      --warn: #9c6b11;
+      --line: #d2dce9;
+      --accent: #0e5a9b;
+      --accent-2: #0b8a73;
+      --red: #bc2f45;
+      --good: #1f8d57;
+      --warn: #9e6a18;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       color: var(--ink);
-      font-family: "Avenir Next", "Segoe UI", "Trebuchet MS", sans-serif;
+      font-family: "Manrope", "Avenir Next", "Trebuchet MS", sans-serif;
       background:
-        radial-gradient(900px 500px at -10% -20%, #d9e7fa 0%, transparent 55%),
-        radial-gradient(900px 500px at 110% -15%, #dff3ee 0%, transparent 55%),
+        radial-gradient(1000px 540px at -8% -18%, #d7e5fa 0%, transparent 57%),
+        radial-gradient(980px 520px at 108% -16%, #d8f0e8 0%, transparent 58%),
         var(--bg);
     }
     .wrap { max-width: 1260px; margin: 0 auto; padding: 18px 14px 32px; }
@@ -4743,7 +4746,7 @@ def home():
       padding: 16px;
       box-shadow: 0 12px 28px #0e1f3a14;
     }
-    h1 { margin: 0; font-size: 30px; letter-spacing: 0.3px; }
+    h1 { margin: 0; font-size: 40px; letter-spacing: 0.2px; font-weight: 800; }
     .sub { color: var(--muted); margin-top: 6px; }
     .top-grid {
       margin-top: 12px;
@@ -4757,8 +4760,10 @@ def home():
       background: linear-gradient(180deg, #ffffff, #f9fcff);
       padding: 10px;
     }
-    .k { font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; }
+    .k { font-size: 10px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.6px; font-weight: 700; }
     .v { margin-top: 5px; font-size: 18px; font-weight: 700; word-break: break-word; }
+    .v.good-tone { color: var(--good); }
+    .v.bad-tone { color: var(--red); }
     .nav-grid {
       margin-top: 10px;
       display: grid;
@@ -4795,13 +4800,14 @@ def home():
     .tab-btn.active {
       border-color: var(--accent);
       color: var(--accent);
-      background: #f5fbf6;
+      background: linear-gradient(180deg, #f4fbff, #eef8ff);
+      box-shadow: inset 0 0 0 1px #d7e6f7;
     }
     .tab-content { display: none; margin-top: 12px; }
     .tab-content.active { display: block; }
     .sections {
       display: grid;
-      grid-template-columns: 1.15fr 1fr;
+      grid-template-columns: 0.9fr 1.1fr;
       gap: 12px;
       align-items: start;
     }
@@ -4812,8 +4818,24 @@ def home():
       padding: 12px;
       box-shadow: 0 6px 18px #1233540c;
     }
-    .card h2 { margin: 0 0 8px; font-size: 18px; }
+    .card h2 { margin: 0 0 8px; font-size: 22px; letter-spacing: 0.1px; }
     .meta { color: var(--muted); font-size: 12px; }
+    .criteria-panel summary {
+      list-style: none;
+      cursor: pointer;
+      font-size: 22px;
+      font-weight: 800;
+      margin: 0 0 8px;
+    }
+    .criteria-panel summary::-webkit-details-marker { display: none; }
+    .criteria-panel summary::after {
+      content: "Show/Hide";
+      float: right;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      margin-top: 6px;
+    }
     .list {
       display: grid;
       gap: 7px;
@@ -4838,6 +4860,7 @@ def home():
     }
     table { border-collapse: collapse; width: 100%; min-width: 760px; }
     th, td { padding: 8px; border-bottom: 1px solid #e8f0ea; text-align: left; font-size: 12px; }
+    tbody tr:hover { background: #f5f9ff; }
     th {
       position: sticky; top: 0; z-index: 1;
       background: #f5faf6; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px;
@@ -4857,7 +4880,7 @@ def home():
     .ok { background: #ddf6e5; color: #0d6a36; }
     .warn { background: #fff3d9; color: #6f5117; }
     .bad { background: #fde2e2; color: #8f1f1f; }
-    .mono { font-family: "Consolas", "Courier New", monospace; }
+    .mono { font-family: "JetBrains Mono", "Consolas", "Courier New", monospace; }
     .row {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -4865,6 +4888,33 @@ def home():
       margin-top: 8px;
     }
     .row .stat { padding: 8px; }
+    .kpi-strip {
+      margin-top: 10px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 8px;
+    }
+    .kpi {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      background: linear-gradient(180deg, #ffffff, #f7fbff);
+    }
+    .kpi .label {
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      font-weight: 700;
+    }
+    .kpi .value {
+      margin-top: 6px;
+      font-size: 24px;
+      font-weight: 800;
+      line-height: 1;
+    }
+    .kpi .value.good-tone { color: var(--good); }
+    .kpi .value.bad-tone { color: var(--red); }
     .chart-wrap {
       border: 1px solid var(--line);
       border-radius: 10px;
@@ -4900,6 +4950,7 @@ def home():
     }
     .btn.active { border-color: var(--accent); color: var(--accent); }
     @media (max-width: 980px) {
+      h1 { font-size: 30px; }
       .sections { grid-template-columns: 1fr; }
       .split { grid-template-columns: 1fr; }
     }
@@ -4929,27 +4980,35 @@ def home():
 
     <section id="overviewTab" class="tab-content active">
     <section class="sections">
-      <div class="card" id="criteria">
-        <h2>Trade Criteria</h2>
-        <div class="meta">Current live strategy parameters pulled from <span class="mono">/health</span>.</div>
-        <div class="split">
-          <div class="list" id="criteriaList"></div>
-          <div class="list">
-            <div class="item">
-              <b>Ladder Sizing</b>
-              <span id="ladderText">Loading...</span>
-            </div>
-            <div class="item">
-              <b>Live Safety</b>
-              <span id="safetyText">Loading...</span>
+      <div class="card criteria-panel" id="criteria">
+        <details open>
+          <summary>Trade Criteria</summary>
+          <div class="meta">Current live strategy parameters pulled from <span class="mono">/health</span>.</div>
+          <div class="split">
+            <div class="list" id="criteriaList"></div>
+            <div class="list">
+              <div class="item">
+                <b>Ladder Sizing</b>
+                <span id="ladderText">Loading...</span>
+              </div>
+              <div class="item">
+                <b>Live Safety</b>
+                <span id="safetyText">Loading...</span>
+              </div>
             </div>
           </div>
-        </div>
+        </details>
       </div>
 
       <div class="card" id="model">
         <h2>Model Quality</h2>
         <div class="meta">Calibration and attribution from <span class="mono">/analytics/live-insights</span>.</div>
+        <div class="kpi-strip">
+          <div class="kpi"><div class="label">Net P/L</div><div class="value" id="kpiNetPnl">-</div></div>
+          <div class="kpi"><div class="label">EV Gap</div><div class="value" id="kpiEvGap">-</div></div>
+          <div class="kpi"><div class="label">Reject Rate</div><div class="value" id="kpiRejectRate">-</div></div>
+          <div class="kpi"><div class="label">Settled Win Rate</div><div class="value" id="kpiWinRate">-</div></div>
+        </div>
         <div class="toolbar">
           <button class="btn active" data-model-days="7">Model 7D</button>
           <button class="btn" data-model-days="14">Model 14D</button>
@@ -5137,6 +5196,17 @@ def home():
     function esc(v) { return String(v ?? ""); }
     function money(v) { return (v == null || isNaN(v)) ? "-" : `$${Number(v).toFixed(2)}`; }
     function pct(v) { return (v == null || isNaN(v)) ? "-" : `${Number(v).toFixed(1)}%`; }
+    function toneValue(elId, v, invert=false) {
+      const el = $(elId);
+      if (!el) return;
+      el.classList.remove("good-tone", "bad-tone");
+      if (v == null || isNaN(v)) return;
+      const n = Number(v);
+      const good = invert ? (n < 0) : (n > 0);
+      const bad = invert ? (n > 0) : (n < 0);
+      if (good) el.classList.add("good-tone");
+      if (bad) el.classList.add("bad-tone");
+    }
 
     function statusPill(status) {
       const s = String(status || "").toLowerCase();
@@ -5384,7 +5454,7 @@ def home():
         ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(w - pad.r, yy); ctx.stroke();
         const val = yMax - ((yMax - yMin) * g / 4);
         ctx.fillStyle = "#4a5d53";
-        ctx.font = "11px Bahnschrift";
+        ctx.font = "11px JetBrains Mono";
         ctx.fillText(val.toFixed(0), 6, yy + 4);
       }
       const yZero = y(0);
@@ -5410,14 +5480,14 @@ def home():
       plot(pointsRealized, "#15803d");
 
       ctx.fillStyle = "#4a5d53";
-      ctx.font = "11px Bahnschrift";
+      ctx.font = "11px JetBrains Mono";
       labels.forEach((lbl, i) => {
         if (labels.length > 10 && (i % 2) !== 0) return;
         const xx = x(i) - 16;
         ctx.fillText(lbl.slice(5), xx, h - 10);
       });
       ctx.fillStyle = "#4a5d53";
-      ctx.font = "12px Bahnschrift";
+      ctx.font = "12px Manrope";
       ctx.fillText("P/L ($)", pad.l, 12);
       ctx.fillText("Date (ET)", w - 72, h - 10);
 
@@ -5514,6 +5584,14 @@ def home():
       $("modelRealized").textContent = money(iq.realized_dollars);
       $("modelGap").textContent = money(iq.ev_gap_dollars);
       $("modelRejectRate").textContent = pct(iq.rejected_rate_pct);
+      $("kpiEvGap").textContent = money(iq.ev_gap_dollars);
+      $("kpiRejectRate").textContent = pct(iq.rejected_rate_pct);
+      $("kpiWinRate").textContent = pct(iq.realized_win_rate_pct);
+      toneValue("modelRealized", iq.realized_dollars);
+      toneValue("modelGap", iq.ev_gap_dollars);
+      toneValue("modelRejectRate", iq.rejected_rate_pct, true);
+      toneValue("kpiEvGap", iq.ev_gap_dollars);
+      toneValue("kpiRejectRate", iq.rejected_rate_pct, true);
 
       const cityRows = Array.isArray(dataCity.city_side) ? dataCity.city_side : [];
       $("citySideRows").innerHTML = cityRows.length ? cityRows.map(r => `
@@ -5544,6 +5622,12 @@ def home():
       $("reconBotRealized").textContent = money(recon.bot_realized_pnl_dollars);
       $("reconManualRealized").textContent = money(recon.manual_realized_pnl_dollars);
       $("reconResidual").textContent = money(recon.unrealized_residual_pnl_dollars);
+      $("kpiNetPnl").textContent = money(recon.account_net_pnl_dollars);
+      toneValue("reconNet", recon.account_net_pnl_dollars);
+      toneValue("reconBotRealized", recon.bot_realized_pnl_dollars);
+      toneValue("reconManualRealized", recon.manual_realized_pnl_dollars);
+      toneValue("reconResidual", recon.unrealized_residual_pnl_dollars);
+      toneValue("kpiNetPnl", recon.account_net_pnl_dollars);
 
       const errs = Array.isArray(dataInsights.recent_errors) ? dataInsights.recent_errors : [];
       $("errorRows").innerHTML = errs.length ? errs.map(e => `

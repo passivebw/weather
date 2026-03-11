@@ -4688,8 +4688,30 @@ def home():
     }
     .nav-box b { display: block; font-size: 14px; }
     .nav-box span { color: var(--muted); font-size: 12px; }
+    .tabs {
+      margin-top: 10px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .tab-btn {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 7px 12px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .tab-btn.active {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: #f5fbf6;
+    }
+    .tab-content { display: none; margin-top: 12px; }
+    .tab-content.active { display: block; }
     .sections {
-      margin-top: 12px;
       display: grid;
       grid-template-columns: 1.15fr 1fr;
       gap: 12px;
@@ -4802,14 +4824,14 @@ def home():
         <div class="stat"><div class="k">Cities</div><div class="v" id="cityCount">-</div></div>
         <div class="stat"><div class="k">Host</div><div class="v mono" id="host">-</div></div>
       </div>
-      <div class="nav-grid">
-        <a class="nav-box" href="#criteria"><b>Trade Criteria</b><span>edge floors, ladder size, scan cadence, gating</span></a>
-        <a class="nav-box" href="#model"><b>Model Quality</b><span>city/side attribution, ladder accuracy, rejection health</span></a>
-        <a class="nav-box" href="#ev"><b>EV vs Outcome</b><span>cumulative expected P/L against realized P/L</span></a>
-        <a class="nav-box" href="#daily"><b>Daily Stats</b><span>per-day scorecard for fills, EV gap, and execution quality</span></a>
+      <div class="tabs">
+        <button class="tab-btn active" data-tab-target="overviewTab">Overview</button>
+        <button class="tab-btn" data-tab-target="evTab">EV Chart</button>
+        <button class="tab-btn" data-tab-target="dailyTab">Daily Stats</button>
       </div>
     </section>
 
+    <section id="overviewTab" class="tab-content active">
     <section class="sections">
       <div class="card" id="criteria">
         <h2>Trade Criteria</h2>
@@ -4885,8 +4907,10 @@ def home():
         </div>
       </div>
     </section>
+    </section>
 
-    <section class="card" id="ev" style="margin-top:12px;">
+    <section id="evTab" class="tab-content">
+    <section class="card" id="ev">
       <h2>Expected Value vs Actual Outcome</h2>
       <div class="meta">Live-only daily totals from <span class="mono">/analytics/live-scorecard</span>.</div>
       <div class="toolbar">
@@ -4903,8 +4927,10 @@ def home():
         <span><i class="dot green"></i>Realized P/L NET Cumulative ($)</span>
       </div>
     </section>
+    </section>
 
-    <section class="card" id="daily" style="margin-top:12px;">
+    <section id="dailyTab" class="tab-content">
+    <section class="card" id="daily">
       <h2>Daily Stats</h2>
       <div class="meta">Day-level outcomes and execution quality from <span class="mono">/analytics/live-insights</span>.</div>
       <div class="toolbar">
@@ -4918,6 +4944,7 @@ def home():
           <tbody id="dailyRows"><tr><td colspan="11">Loading...</td></tr></tbody>
         </table>
       </div>
+    </section>
     </section>
   </main>
 
@@ -5230,6 +5257,17 @@ def home():
         document.querySelectorAll(".btn[data-daily-days]").forEach(b => b.classList.remove("active"));
         btn.classList.add("active");
         await loadAnalytics();
+      });
+    });
+
+    document.querySelectorAll(".tab-btn[data-tab-target]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const target = String(btn.dataset.tabTarget || "").trim();
+        document.querySelectorAll(".tab-btn[data-tab-target]").forEach(b => b.classList.remove("active"));
+        document.querySelectorAll(".tab-content").forEach(p => p.classList.remove("active"));
+        btn.classList.add("active");
+        const panel = document.getElementById(target);
+        if (panel) panel.classList.add("active");
       });
     });
 

@@ -2612,6 +2612,7 @@ def _ensure_csv_header_contains(path: str, required_fields: List[str]) -> None:
 def ensure_manual_positions_header() -> None:
     path = manual_positions_path()
     _ensure_csv_header_contains(path, [
+        "manual_trade_id", "position_origin",
         "market_type", "market_name",
         "opened_ts_est", "date", "city", "temp_side", "ticker", "bet",
         "line", "price_cents", "count",
@@ -2622,6 +2623,7 @@ def ensure_manual_positions_header() -> None:
 def ensure_manual_btc_positions_header() -> None:
     path = manual_btc_positions_path()
     _ensure_csv_header_contains(path, [
+        "manual_trade_id", "position_origin",
         "opened_ts_est", "date", "market_type", "market_name", "ticker", "bet", "outcome",
         "total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars",
         "source", "note",
@@ -2630,12 +2632,44 @@ def ensure_manual_btc_positions_header() -> None:
 def ensure_manual_auto_weather_positions_header() -> None:
     path = manual_auto_weather_positions_path()
     _ensure_csv_header_contains(path, [
+        "manual_trade_id", "position_origin",
         "market_type", "market_name",
         "opened_ts_est", "date", "city", "temp_side", "ticker", "bet",
         "line", "price_cents", "count",
         "outcome", "total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars",
         "source", "note",
     ])
+
+def _new_manual_trade_id() -> str:
+    return f"m_{uuid.uuid4().hex}"
+
+def _row_position_origin(r: dict, default_origin: str = "user_manual") -> str:
+    raw = str((r or {}).get("position_origin", "")).strip().lower()
+    if raw in {"user_manual", "auto_kalshi_settlement", "bot_live"}:
+        return raw
+    src = str((r or {}).get("source", "")).strip().lower()
+    if src == "auto_kalshi_settlement":
+        return "auto_kalshi_settlement"
+    return default_origin
+
+def _normalize_manual_row_metadata(rows: List[dict], default_origin: str = "user_manual") -> bool:
+    changed = False
+    seen_ids = set()
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        tid = str(r.get("manual_trade_id", "")).strip()
+        if not tid or tid in seen_ids:
+            r["manual_trade_id"] = _new_manual_trade_id()
+            tid = str(r.get("manual_trade_id", "")).strip()
+            changed = True
+        if tid:
+            seen_ids.add(tid)
+        origin = _row_position_origin(r, default_origin=default_origin)
+        if str(r.get("position_origin", "")).strip().lower() != origin:
+            r["position_origin"] = origin
+            changed = True
+    return changed
 
 def load_manual_positions_rows() -> List[dict]:
     ensure_manual_positions_header()
@@ -2647,6 +2681,7 @@ def load_manual_positions_rows() -> List[dict]:
                 rows.append(dict(r))
     except Exception:
         return []
+    _normalize_manual_row_metadata(rows, default_origin="user_manual")
     return rows
 
 def load_manual_btc_positions_rows() -> List[dict]:
@@ -2659,6 +2694,7 @@ def load_manual_btc_positions_rows() -> List[dict]:
                 rows.append(dict(r))
     except Exception:
         return []
+    _normalize_manual_row_metadata(rows, default_origin="user_manual")
     return rows
 
 def load_manual_auto_weather_positions_rows() -> List[dict]:
@@ -2671,6 +2707,7 @@ def load_manual_auto_weather_positions_rows() -> List[dict]:
                 rows.append(dict(r))
     except Exception:
         return []
+    _normalize_manual_row_metadata(rows, default_origin="auto_kalshi_settlement")
     return rows
 
 def _manual_market_type(r: dict) -> str:
@@ -2791,9 +2828,14 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
         ensure_manual_btc_positions_header()
         b_header, b_rows = _read_csv_rows_with_header(btc_path)
 
-    idx_user_weather: Dict[Tuple[str, str], int] = {}
+    _normalize_manual_row_metadata(uw_rows, default_origin="user_manual")
+    _normalize_manual_row_metadata(aw_rows, default_origin="auto_kalshi_settlement")
+    _normalize_manual_row_metadata(b_rows, default_origin="user_manual")
+
+    idx_user_weather: Dict[Tuple[str, str], List[int]] = {}
     for i, r in enumerate(uw_rows):
-        idx_user_weather[(str(r.get("ticker", "")).strip().upper(), str(r.get("date", "")).strip())] = i
+        key = (str(r.get("ticker", "")).strip().upper(), str(r.get("date", "")).strip())
+        idx_user_weather.setdefault(key, []).append(i)
     idx_auto_weather: Dict[Tuple[str, str], int] = {}
     for i, r in enumerate(aw_rows):
         idx_auto_weather[(str(r.get("ticker", "")).strip().upper(), str(r.get("date", "")).strip())] = i
@@ -2867,6 +2909,8 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
             side_cost_d = total_cost_d
 
         base = {
+            "manual_trade_id": _new_manual_trade_id(),
+            "position_origin": "auto_kalshi_settlement",
             "opened_ts_est": settled_time_est or fmt_est(datetime.now(tz=LOCAL_TZ)),
             "date": date_iso,
             "ticker": ticker,
@@ -2894,10 +2938,9 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
             })
             key = (ticker, date_iso)
             # User-manual rows always win: apply settlement onto that row if present.
-            if key in idx_user_weather:
-                rr = uw_rows[idx_user_weather[key]]
+            if key in idx_user_weather and idx_user_weather[key]:
+                rr = uw_rows[idx_user_weather[key][0]]
                 changed = False
-                src_user = str(rr.get("source", "")).strip().lower()
                 cnt_user = float(_to_float(rr.get("count")) or 0.0)
                 px_user = float(_to_float(rr.get("price_cents")) or 0.0)
                 has_manual_fill = (cnt_user > 0.0 and px_user > 0.0)
@@ -2906,16 +2949,22 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
                     if str(rr.get("outcome", "")) != str(row.get("outcome", "")):
                         rr["outcome"] = row.get("outcome", "")
                         changed = True
-                can_update_econ = (src_user == "auto_kalshi_settlement") or (not has_manual_fill)
+                can_update_econ = (not has_manual_fill)
                 if can_update_econ:
                     for k in ("total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars"):
                         v = row.get(k, "")
-                        if force_update or not str(rr.get(k, "")).strip():
+                        if (force_update and not has_manual_fill) or not str(rr.get(k, "")).strip():
                             if str(rr.get(k, "")) != str(v):
                                 rr[k] = v
                                 changed = True
                 if not str(rr.get("market_type", "")).strip():
                     rr["market_type"] = "weather"
+                    changed = True
+                if str(rr.get("position_origin", "")).strip().lower() != "user_manual":
+                    rr["position_origin"] = "user_manual"
+                    changed = True
+                if not str(rr.get("manual_trade_id", "")).strip():
+                    rr["manual_trade_id"] = _new_manual_trade_id()
                     changed = True
                 if changed:
                     updated_weather += 1
@@ -2996,6 +3045,8 @@ def _manual_blocked_tickers() -> set:
     blocked = set()
     for r in load_manual_positions_rows():
         if not _manual_is_weather_row(r):
+            continue
+        if _row_position_origin(r, default_origin="user_manual") != "user_manual":
             continue
         t = str(r.get("ticker", "")).strip()
         if t:
@@ -8329,6 +8380,8 @@ def analytics_manual_positions(
             realized_total += float(realized_pnl)
 
         row_out = {
+            "manual_trade_id": str(r.get("manual_trade_id", "")).strip(),
+            "position_origin": _row_position_origin(r, default_origin=("auto_kalshi_settlement" if str(r.get("source", "")).strip().lower() == "auto_kalshi_settlement" else "user_manual")),
             "opened_ts_est": r.get("opened_ts_est"),
             "date": date_iso,
             "market_type": market_type,
@@ -8373,6 +8426,10 @@ def analytics_manual_positions(
     out.sort(key=lambda x: (str(x.get("date", "")), str(x.get("opened_ts_est", ""))), reverse=True)
     weather_rows.sort(key=lambda x: (str(x.get("date", "")), str(x.get("opened_ts_est", ""))), reverse=True)
     btc_rows.sort(key=lambda x: (str(x.get("date", "")), str(x.get("opened_ts_est", ""))), reverse=True)
+    origin_counts: Dict[str, int] = {}
+    for r in out:
+        o = str(r.get("position_origin", "")).strip().lower() or "unknown"
+        origin_counts[o] = int(origin_counts.get(o, 0)) + 1
     return {
         "ok": True,
         "path": manual_positions_path(),
@@ -8403,6 +8460,7 @@ def analytics_manual_positions(
             "open_positions": max(0, len(btc_rows) - btc_resolved_count),
             "realized_pnl_dollars": btc_realized_total,
         },
+        "position_origin_counts": origin_counts,
         "rows": out,
         "weather_rows": weather_rows,
         "btc_rows": btc_rows,

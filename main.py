@@ -254,6 +254,11 @@ NWS_OBS_UPDATE_MINUTE = int(os.getenv("NWS_OBS_UPDATE_MINUTE", "51"))
 NWS_OBS_HISTORY_LIMIT = int(os.getenv("NWS_OBS_HISTORY_LIMIT", "500"))
 HIGH_LOCK_MARGIN_F = float(os.getenv("HIGH_LOCK_MARGIN_F", "0.0"))
 LOW_LOCK_MARGIN_F = float(os.getenv("LOW_LOCK_MARGIN_F", "0.0"))
+# Observation-to-settlement boundary uncertainty (F) used to soften near-threshold locks.
+OBS_BOUNDARY_SIGMA_F = float(os.getenv("OBS_BOUNDARY_SIGMA_F", "0.35"))
+# Keep deterministic impossible-locks only for clearly separated observations.
+HIGH_HARD_LOCK_EXTRA_MARGIN_F = float(os.getenv("HIGH_HARD_LOCK_EXTRA_MARGIN_F", "1.5"))
+LOW_HARD_LOCK_EXTRA_MARGIN_F = float(os.getenv("LOW_HARD_LOCK_EXTRA_MARGIN_F", "1.5"))
 HIGH_EARLY_EDGE_DAMPING_MULTIPLIER = float(os.getenv("HIGH_EARLY_EDGE_DAMPING_MULTIPLIER", "0.8"))
 HIGH_EARLY_DAMPING_HOUR_LST = int(os.getenv("HIGH_EARLY_DAMPING_HOUR_LST", "12"))
 OPEN_METEO_HIST_MAE_F = float(os.getenv("OPEN_METEO_HIST_MAE_F", "2.4"))
@@ -1619,6 +1624,14 @@ def conditional_high_bucket_prob(mu: float, sigma: float, lo: float, hi: float, 
     denom = max(1e-9, 1.0 - normal_cdf(float(min_final_high_int) - 0.5, mu, sigma))
     return clamp(numer / denom, 0.0, 1.0)
 
+def _obs_tail_prob_at_or_above(obs_f: float, threshold_f: float, sigma_f: float) -> float:
+    s = max(1e-6, float(sigma_f))
+    return clamp(1.0 - normal_cdf(float(threshold_f), float(obs_f), s), 0.0, 1.0)
+
+def _obs_tail_prob_at_or_below(obs_f: float, threshold_f: float, sigma_f: float) -> float:
+    s = max(1e-6, float(sigma_f))
+    return clamp(normal_cdf(float(threshold_f), float(obs_f), s), 0.0, 1.0)
+
 def next_nws_update_time(now_local: datetime) -> datetime:
     minute = max(0, min(59, int(NWS_OBS_UPDATE_MINUTE)))
     candidate = now_local.replace(minute=minute, second=0, microsecond=0)
@@ -1852,30 +1865,45 @@ def build_city_bucket_comparison(
         kalshi_yes_p = r["kalshi_yes_mid_prob"] / total_mid
         locked_outcome = False
         locked_reason = ""
+        obs_impossible_prob = 0.0
         if side == "high" and obs_context["obs_fresh"] and obs_context["max_so_far_f"] is not None:
             max_so_far_f = float(obs_context["max_so_far_f"])
-            # If observed max implies a rounded final high above bucket top, YES is impossible.
-            if max_so_far_f >= (float(r["hi"]) + 0.5 + HIGH_LOCK_MARGIN_F):
+            high_impossible_boundary_f = float(r["hi"]) + 0.5 + HIGH_LOCK_MARGIN_F
+            # Keep hard lock only when observation is clearly beyond boundary.
+            if max_so_far_f >= (high_impossible_boundary_f + HIGH_HARD_LOCK_EXTRA_MARGIN_F):
                 source_yes_p_raw = 0.0
                 locked_outcome = True
                 locked_reason = "high_obs_exceeded_bucket"
             else:
-                source_yes_p_raw = conditional_high_bucket_prob(
+                base_yes_p = conditional_high_bucket_prob(
                     consensus_mu,
                     consensus_sigma,
                     r["lo"],
                     r["hi"],
                     max_so_far_f,
                 )
+                obs_impossible_prob = _obs_tail_prob_at_or_above(
+                    max_so_far_f,
+                    high_impossible_boundary_f,
+                    OBS_BOUNDARY_SIGMA_F,
+                )
+                source_yes_p_raw = base_yes_p * (1.0 - obs_impossible_prob)
         elif side == "low" and obs_context["obs_fresh"] and obs_context["min_so_far_f"] is not None:
             min_so_far_f = float(obs_context["min_so_far_f"])
-            # If observed min implies rounded final low below bucket floor, YES is impossible.
-            if min_so_far_f <= (float(r["lo"]) - 0.5 - LOW_LOCK_MARGIN_F):
+            low_impossible_boundary_f = float(r["lo"]) - 0.5 - LOW_LOCK_MARGIN_F
+            # Keep hard lock only when observation is clearly beyond boundary.
+            if min_so_far_f <= (low_impossible_boundary_f - LOW_HARD_LOCK_EXTRA_MARGIN_F):
                 source_yes_p_raw = 0.0
                 locked_outcome = True
                 locked_reason = "low_obs_below_bucket"
             else:
-                source_yes_p_raw = prob_between_inclusive(consensus_mu, consensus_sigma, r["lo"], r["hi"])
+                base_yes_p = prob_between_inclusive(consensus_mu, consensus_sigma, r["lo"], r["hi"])
+                obs_impossible_prob = _obs_tail_prob_at_or_below(
+                    min_so_far_f,
+                    low_impossible_boundary_f,
+                    OBS_BOUNDARY_SIGMA_F,
+                )
+                source_yes_p_raw = base_yes_p * (1.0 - obs_impossible_prob)
         else:
             source_yes_p_raw = prob_between_inclusive(consensus_mu, consensus_sigma, r["lo"], r["hi"])
         source_yes_p = (
@@ -1908,6 +1936,7 @@ def build_city_bucket_comparison(
         r["source_yes_prob"] = source_yes_p
         r["locked_outcome"] = locked_outcome
         r["locked_reason"] = locked_reason
+        r["obs_impossible_prob"] = obs_impossible_prob
         r["prob_gap"] = gap
         r["best_side"] = best_side
         r["best_edge"] = best_edge
@@ -5857,6 +5886,9 @@ def health():
         "model_win_prob_ceil_pct": MODEL_WIN_PROB_CEIL * 100.0,
         "high_lock_margin_f": HIGH_LOCK_MARGIN_F,
         "low_lock_margin_f": LOW_LOCK_MARGIN_F,
+        "obs_boundary_sigma_f": OBS_BOUNDARY_SIGMA_F,
+        "high_hard_lock_extra_margin_f": HIGH_HARD_LOCK_EXTRA_MARGIN_F,
+        "low_hard_lock_extra_margin_f": LOW_HARD_LOCK_EXTRA_MARGIN_F,
         "high_early_edge_damping_multiplier": HIGH_EARLY_EDGE_DAMPING_MULTIPLIER,
         "high_early_damping_hour_lst": HIGH_EARLY_DAMPING_HOUR_LST,
         "policy_min_net_edge_pct": POLICY_MIN_NET_EDGE_PCT,

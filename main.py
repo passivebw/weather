@@ -157,6 +157,8 @@ DISCORD_DISCREPANCY_ENABLED = env_bool("DISCORD_DISCREPANCY_ENABLED", default=Tr
 LIVE_TRADING_ENABLED = env_bool("LIVE_TRADING_ENABLED", default=False)
 LIVE_KILL_SWITCH = env_bool("LIVE_KILL_SWITCH", default=False)
 MANUAL_MARKET_BLOCK_ENABLED = env_bool("MANUAL_MARKET_BLOCK_ENABLED", default=True)
+MANUAL_AUTO_SYNC_ENABLED = env_bool("MANUAL_AUTO_SYNC_ENABLED", default=True)
+MANUAL_AUTO_SYNC_INTERVAL_MINUTES = int(os.getenv("MANUAL_AUTO_SYNC_INTERVAL_MINUTES", "30"))
 LIVE_MAX_ORDERS_PER_SCAN = int(os.getenv("LIVE_MAX_ORDERS_PER_SCAN", "3"))
 LIVE_MAX_ORDERS_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_DAY", "25"))
 LIVE_MAX_ORDERS_PER_MARKET_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_MARKET_PER_DAY", "1"))
@@ -364,6 +366,7 @@ _accuweather_last_success_est = ""
 _accuweather_last_error = ""
 _accuweather_last_error_est = ""
 _accuweather_location_lookup_last_ts = 0.0
+_manual_auto_sync_last_ts = 0.0
 
 
 # -----------------------
@@ -2564,33 +2567,62 @@ def manual_positions_path() -> str:
 def manual_btc_positions_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "manual_positions_btc.csv")
 
-def ensure_manual_positions_header() -> None:
-    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
-    path = manual_positions_path()
-    if os.path.exists(path):
-        return
+def _read_csv_rows_with_header(path: str) -> Tuple[List[str], List[dict]]:
+    if not os.path.exists(path):
+        return [], []
+    rows: List[dict] = []
+    header: List[str] = []
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            header = [str(h) for h in (reader.fieldnames or []) if str(h).strip()]
+            for r in reader:
+                rows.append(dict(r))
+    except Exception:
+        return [], []
+    return header, rows
+
+def _rewrite_csv_with_header(path: str, fieldnames: List[str], rows: List[dict]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "market_type", "market_name",
-            "opened_ts_est", "date", "city", "temp_side", "ticker", "bet",
-            "line", "price_cents", "count",
-            "outcome", "total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars",
-            "source", "note",
-        ])
+        w = csv.DictWriter(f, fieldnames=list(fieldnames))
+        w.writeheader()
+        for r in rows:
+            rr = {k: r.get(k, "") for k in fieldnames}
+            w.writerow(rr)
+
+def _ensure_csv_header_contains(path: str, required_fields: List[str]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if not os.path.exists(path):
+        _rewrite_csv_with_header(path, required_fields, [])
+        return
+    header, rows = _read_csv_rows_with_header(path)
+    if not header:
+        _rewrite_csv_with_header(path, required_fields, rows)
+        return
+    missing = [f for f in required_fields if f not in header]
+    if not missing:
+        return
+    merged_header = list(header) + missing
+    _rewrite_csv_with_header(path, merged_header, rows)
+
+def ensure_manual_positions_header() -> None:
+    path = manual_positions_path()
+    _ensure_csv_header_contains(path, [
+        "market_type", "market_name",
+        "opened_ts_est", "date", "city", "temp_side", "ticker", "bet",
+        "line", "price_cents", "count",
+        "outcome", "total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars",
+        "source", "note",
+    ])
 
 def ensure_manual_btc_positions_header() -> None:
-    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
     path = manual_btc_positions_path()
-    if os.path.exists(path):
-        return
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "opened_ts_est", "date", "market_type", "market_name", "ticker", "bet", "outcome",
-            "total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars",
-            "source", "note",
-        ])
+    _ensure_csv_header_contains(path, [
+        "opened_ts_est", "date", "market_type", "market_name", "ticker", "bet", "outcome",
+        "total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars",
+        "source", "note",
+    ])
 
 def load_manual_positions_rows() -> List[dict]:
     ensure_manual_positions_header()
@@ -2640,6 +2672,244 @@ def _manual_is_btc_row(r: dict) -> bool:
     ticker = str((r or {}).get("ticker", "")).strip().lower()
     market_name = str((r or {}).get("market_name", "")).strip().lower()
     return ("btc" in ticker) or ("btc" in market_name)
+
+def _manual_weather_city_by_code() -> Dict[str, str]:
+    return {
+        "ATL": "Atlanta",
+        "AUS": "Austin",
+        "BOS": "Boston",
+        "CHI": "Chicago",
+        "DEN": "Denver",
+        "LAS": "Las Vegas",
+        "LAX": "Los Angeles",
+        "MIA": "Miami",
+        "PHIL": "Philadelphia",
+        "SEA": "Seattle",
+        "DCA": "Washington DC",
+        "OKC": "Oklahoma City",
+        "SFO": "San Francisco",
+        "HOU": "Houston",
+        "DFW": "Dallas",
+        "DAL": "Dallas",
+        "PHX": "Phoenix",
+        "MSY": "New Orleans",
+        "MSP": "Minneapolis",
+        "SAT": "San Antonio",
+        "NY": "New York City",
+        "NYC": "New York City",
+    }
+
+def _decode_weather_ticker_fields(ticker: str) -> Optional[dict]:
+    t = str(ticker or "").strip().upper()
+    m = re.match(r"^KX(?P<side>HIGH|LOW)T?(?P<city>[A-Z]+)-(?P<date>\d{2}[A-Z]{3}\d{2})-(?P<bound>[BT])(?P<val>-?\d+(?:\.\d+)?)$", t)
+    if not m:
+        return None
+    side = "high" if m.group("side") == "HIGH" else "low"
+    city_code = str(m.group("city")).strip().upper()
+    city = _manual_weather_city_by_code().get(city_code, "")
+    val = float(m.group("val"))
+    bound = str(m.group("bound")).strip().upper()
+    line = ""
+    if bound == "B":
+        lo = int(math.floor(val))
+        hi = lo + 1
+        line = f"{lo}F to {hi}F"
+    elif bound == "T":
+        lo = int(math.floor(val)) + 1
+        line = f"{lo}F or above"
+    return {
+        "city": city,
+        "temp_side": side,
+        "line": line,
+        "market_date_iso": parse_market_date_iso_from_ticker(t) or "",
+    }
+
+def _bot_logged_weather_tickers() -> set:
+    out = set()
+    for r in load_live_trade_log_rows():
+        st = str(r.get("status", "")).strip().lower()
+        if st not in ("submitted", "partial", "partial_filled"):
+            continue
+        if str(r.get("order_action", "buy")).strip().lower() != "buy":
+            continue
+        t = str(r.get("ticker", "")).strip().upper()
+        if t.startswith("KXHIGH") or t.startswith("KXLOW"):
+            out.add(t)
+    return out
+
+def _to_money_2(v: Optional[float]) -> Optional[float]:
+    if v is None:
+        return None
+    return round(float(v), 2)
+
+def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int = 200, force_update: bool = False, dry_run: bool = False) -> dict:
+    ensure_manual_positions_header()
+    ensure_manual_btc_positions_header()
+    if not kalshi_has_auth_config():
+        return {"ok": False, "error": "kalshi auth not configured"}
+
+    weather_path = manual_positions_path()
+    btc_path = manual_btc_positions_path()
+    w_header, w_rows = _read_csv_rows_with_header(weather_path)
+    b_header, b_rows = _read_csv_rows_with_header(btc_path)
+    if not w_header:
+        ensure_manual_positions_header()
+        w_header, w_rows = _read_csv_rows_with_header(weather_path)
+    if not b_header:
+        ensure_manual_btc_positions_header()
+        b_header, b_rows = _read_csv_rows_with_header(btc_path)
+
+    idx_w: Dict[Tuple[str, str], int] = {}
+    for i, r in enumerate(w_rows):
+        idx_w[(str(r.get("ticker", "")).strip().upper(), str(r.get("date", "")).strip())] = i
+    idx_b: Dict[Tuple[str, str], int] = {}
+    for i, r in enumerate(b_rows):
+        idx_b[(str(r.get("ticker", "")).strip().upper(), str(r.get("date", "")).strip())] = i
+
+    bot_weather_tickers = _bot_logged_weather_tickers()
+    settlements = _fetch_kalshi_settlements(max_pages=max(1, int(max_pages)), per_page_limit=max(1, int(per_page_limit)))
+    inserted_weather = 0
+    inserted_btc = 0
+    updated_weather = 0
+    updated_btc = 0
+    skipped_bot_weather = 0
+    skipped_unclassified = 0
+    skipped_missing_ticker = 0
+
+    for s in settlements:
+        ticker = str(s.get("ticker") or s.get("market_ticker") or "").strip().upper()
+        if not ticker:
+            skipped_missing_ticker += 1
+            continue
+        market_date = parse_market_date_iso_from_ticker(ticker) or ""
+        settled_time_iso = str(s.get("settled_time", "")).strip()
+        settled_time_est = ""
+        if settled_time_iso:
+            try:
+                settled_time_est = fmt_est(datetime.fromisoformat(settled_time_iso.replace("Z", "+00:00")))
+            except Exception:
+                settled_time_est = ""
+        date_iso = market_date
+        if not date_iso and settled_time_iso:
+            try:
+                date_iso = datetime.fromisoformat(settled_time_iso.replace("Z", "+00:00")).date().isoformat()
+            except Exception:
+                date_iso = ""
+
+        yes_cost_c = float(_to_float(s.get("yes_total_cost")) or 0.0)
+        no_cost_c = float(_to_float(s.get("no_total_cost")) or 0.0)
+        revenue_c = float(_to_float(s.get("revenue")) or 0.0)
+        fee_d = float(_to_float(s.get("fee_cost")) or 0.0)
+        total_cost_d = (yes_cost_c + no_cost_c) / 100.0
+        total_payout_d = revenue_c / 100.0
+        total_return_d = (revenue_c - yes_cost_c - no_cost_c) / 100.0 - fee_d
+        market_result = str(s.get("market_result", "")).strip().upper()
+        market_title = str(s.get("market_title") or s.get("title") or "").strip()
+
+        is_weather = ticker.startswith("KXHIGH") or ticker.startswith("KXLOW")
+        is_btc = ("BTC" in ticker) or ("BTC" in market_title.upper())
+        if is_weather and ticker in bot_weather_tickers:
+            skipped_bot_weather += 1
+            continue
+        if not is_weather and not is_btc:
+            skipped_unclassified += 1
+            continue
+
+        if yes_cost_c > 0 and no_cost_c <= 0:
+            bet = "BUY YES"
+            side_cost_d = yes_cost_c / 100.0
+        elif no_cost_c > 0 and yes_cost_c <= 0:
+            bet = "BUY NO"
+            side_cost_d = no_cost_c / 100.0
+        else:
+            bet = "MIXED"
+            side_cost_d = total_cost_d
+
+        base = {
+            "opened_ts_est": settled_time_est or fmt_est(datetime.now(tz=LOCAL_TZ)),
+            "date": date_iso,
+            "ticker": ticker,
+            "bet": bet,
+            "outcome": market_result,
+            "total_cost_dollars": f"{_to_money_2(side_cost_d):.2f}",
+            "fees_dollars": f"{_to_money_2(fee_d):.2f}",
+            "total_payout_dollars": f"{_to_money_2(total_payout_d):.2f}",
+            "total_return_dollars": f"{_to_money_2(total_return_d):.2f}",
+            "source": "auto_kalshi_settlement",
+            "note": f"auto_sync settled={settled_time_iso or 'unknown'}",
+        }
+
+        if is_weather:
+            decoded = _decode_weather_ticker_fields(ticker) or {}
+            row = dict(base)
+            row.update({
+                "market_type": "weather",
+                "market_name": market_title or "Weather",
+                "city": str(decoded.get("city", "")),
+                "temp_side": str(decoded.get("temp_side", "")),
+                "line": str(decoded.get("line", "")),
+                "price_cents": "",
+                "count": "",
+            })
+            key = (ticker, date_iso)
+            if key in idx_w:
+                rr = w_rows[idx_w[key]]
+                changed = False
+                for k, v in row.items():
+                    if force_update or not str(rr.get(k, "")).strip():
+                        if str(rr.get(k, "")) != str(v):
+                            rr[k] = v
+                            changed = True
+                if changed:
+                    updated_weather += 1
+            else:
+                w_rows.append(row)
+                idx_w[key] = len(w_rows) - 1
+                inserted_weather += 1
+            continue
+
+        if is_btc:
+            row = dict(base)
+            row.update({
+                "market_type": "btc_up_down",
+                "market_name": market_title or "BTC Up or Down",
+            })
+            key = (ticker, date_iso)
+            if key in idx_b:
+                rr = b_rows[idx_b[key]]
+                changed = False
+                for k, v in row.items():
+                    if force_update or not str(rr.get(k, "")).strip():
+                        if str(rr.get(k, "")) != str(v):
+                            rr[k] = v
+                            changed = True
+                if changed:
+                    updated_btc += 1
+            else:
+                b_rows.append(row)
+                idx_b[key] = len(b_rows) - 1
+                inserted_btc += 1
+            continue
+
+    if not dry_run:
+        _rewrite_csv_with_header(weather_path, w_header, w_rows)
+        _rewrite_csv_with_header(btc_path, b_header, b_rows)
+
+    return {
+        "ok": True,
+        "dry_run": bool(dry_run),
+        "force_update": bool(force_update),
+        "settlements_scanned": len(settlements),
+        "inserted_weather": inserted_weather,
+        "updated_weather": updated_weather,
+        "inserted_btc": inserted_btc,
+        "updated_btc": updated_btc,
+        "skipped_bot_weather": skipped_bot_weather,
+        "skipped_unclassified": skipped_unclassified,
+        "skipped_missing_ticker": skipped_missing_ticker,
+        "weather_path": weather_path,
+        "btc_path": btc_path,
+    }
 
 def _manual_blocked_tickers() -> set:
     if not MANUAL_MARKET_BLOCK_ENABLED:
@@ -6009,6 +6279,8 @@ def health():
         "live_kill_switch": _live_kill_switch_state,
         "live_kill_switch_default": LIVE_KILL_SWITCH,
         "manual_market_block_enabled": MANUAL_MARKET_BLOCK_ENABLED,
+        "manual_auto_sync_enabled": MANUAL_AUTO_SYNC_ENABLED,
+        "manual_auto_sync_interval_minutes": MANUAL_AUTO_SYNC_INTERVAL_MINUTES,
         "manual_positions_path": manual_positions_path(),
         "manual_positions_count": len(load_manual_positions_rows()),
         "manual_btc_positions_path": manual_btc_positions_path(),
@@ -7924,9 +8196,15 @@ def analytics_manual_positions(
 
         outcome_f = get_final_outcome_f(date_iso, city, side) if (is_weather and date_iso and city) else None
         bucket = parse_bucket_from_line(line) if is_weather else None
-        settled = (outcome_f is not None and bucket is not None and count > 0) if is_weather else bool(
-            (total_return_dollars is not None) or (total_payout_dollars is not None) or outcome_text
-        )
+        if is_weather:
+            settled = bool(
+                (outcome_f is not None and bucket is not None and count > 0)
+                or (total_return_dollars is not None)
+                or (total_payout_dollars is not None and stake_dollars > 0.0)
+                or outcome_text
+            )
+        else:
+            settled = bool((total_return_dollars is not None) or (total_payout_dollars is not None) or outcome_text)
         is_win = None
         realized_pnl = None
         if settled and bucket is not None and is_weather:
@@ -8033,6 +8311,20 @@ def analytics_manual_positions(
         "weather_rows": weather_rows,
         "btc_rows": btc_rows,
     }
+
+@app.post("/manual/sync-kalshi")
+def manual_sync_kalshi(
+    max_pages: int = 30,
+    per_page_limit: int = 200,
+    force_update: bool = False,
+    dry_run: bool = False,
+):
+    return sync_manual_positions_from_kalshi(
+        max_pages=max_pages,
+        per_page_limit=per_page_limit,
+        force_update=force_update,
+        dry_run=dry_run,
+    )
 
 @app.get("/analytics/account-reconciliation")
 def analytics_account_reconciliation():
@@ -8729,6 +9021,23 @@ def maybe_post_daily_update(now_local: datetime) -> bool:
     _save_last_daily_update_date(today_est)
     return True
 
+def maybe_auto_sync_manual_positions(now_local: datetime) -> bool:
+    global _manual_auto_sync_last_ts
+    if not MANUAL_AUTO_SYNC_ENABLED:
+        return False
+    if not kalshi_has_auth_config():
+        return False
+    now_ts = float(time.time())
+    min_gap_s = max(300.0, float(max(1, MANUAL_AUTO_SYNC_INTERVAL_MINUTES)) * 60.0)
+    if _manual_auto_sync_last_ts > 0 and (now_ts - _manual_auto_sync_last_ts) < min_gap_s:
+        return False
+    _manual_auto_sync_last_ts = now_ts
+    try:
+        sync_manual_positions_from_kalshi(max_pages=20, per_page_limit=200, force_update=False, dry_run=False)
+        return True
+    except Exception:
+        return False
+
 @app.get("/scan")
 def scan():
     now_local = datetime.now(tz=LOCAL_TZ)
@@ -9098,6 +9407,10 @@ def background_loop():
                 pass
             try:
                 maybe_post_nyc_forecast_brief(now_local)
+            except Exception:
+                pass
+            try:
+                maybe_auto_sync_manual_positions(now_local)
             except Exception:
                 pass
         except Exception:

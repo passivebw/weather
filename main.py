@@ -2561,6 +2561,9 @@ def live_trade_log_path() -> str:
 def manual_positions_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "manual_positions.csv")
 
+def manual_btc_positions_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "manual_positions_btc.csv")
+
 def ensure_manual_positions_header() -> None:
     os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
     path = manual_positions_path()
@@ -2569,8 +2572,24 @@ def ensure_manual_positions_header() -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
+            "market_type", "market_name",
             "opened_ts_est", "date", "city", "temp_side", "ticker", "bet",
-            "line", "price_cents", "count", "source", "note",
+            "line", "price_cents", "count",
+            "outcome", "total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars",
+            "source", "note",
+        ])
+
+def ensure_manual_btc_positions_header() -> None:
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = manual_btc_positions_path()
+    if os.path.exists(path):
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "opened_ts_est", "date", "market_type", "market_name", "ticker", "bet", "outcome",
+            "total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars",
+            "source", "note",
         ])
 
 def load_manual_positions_rows() -> List[dict]:
@@ -2585,11 +2604,50 @@ def load_manual_positions_rows() -> List[dict]:
         return []
     return rows
 
+def load_manual_btc_positions_rows() -> List[dict]:
+    ensure_manual_btc_positions_header()
+    path = manual_btc_positions_path()
+    rows: List[dict] = []
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                rows.append(dict(r))
+    except Exception:
+        return []
+    return rows
+
+def _manual_market_type(r: dict) -> str:
+    raw = str((r or {}).get("market_type", "")).strip().lower()
+    if raw:
+        return raw
+    ticker = str((r or {}).get("ticker", "")).strip().upper()
+    market_name = str((r or {}).get("market_name", "")).strip().lower()
+    city = str((r or {}).get("city", "")).strip()
+    side = str((r or {}).get("temp_side", "")).strip().lower()
+    if ticker.startswith("KXHIGH") or ticker.startswith("KXLOW") or city or side in {"high", "low"}:
+        return "weather"
+    if "btc" in ticker.lower() or "btc" in market_name:
+        return "btc_up_down"
+    return "other"
+
+def _manual_is_weather_row(r: dict) -> bool:
+    return _manual_market_type(r) == "weather"
+
+def _manual_is_btc_row(r: dict) -> bool:
+    mt = _manual_market_type(r)
+    if mt in {"btc", "btc_up_down", "crypto"}:
+        return True
+    ticker = str((r or {}).get("ticker", "")).strip().lower()
+    market_name = str((r or {}).get("market_name", "")).strip().lower()
+    return ("btc" in ticker) or ("btc" in market_name)
+
 def _manual_blocked_tickers() -> set:
     if not MANUAL_MARKET_BLOCK_ENABLED:
         return set()
     blocked = set()
     for r in load_manual_positions_rows():
+        if not _manual_is_weather_row(r):
+            continue
         t = str(r.get("ticker", "")).strip()
         if t:
             blocked.add(t)
@@ -5177,7 +5235,7 @@ def home():
     <section id="manualTab" class="tab-content">
     <section class="card" id="manualPos">
       <h2>Manual Positions</h2>
-      <div class="meta">Manual entries loaded from <span class="mono" id="manualPath">manual_positions.csv</span>.</div>
+      <div class="meta">Weather file: <span class="mono" id="manualPath">manual_positions.csv</span> | BTC file: <span class="mono" id="manualBtcPath">manual_positions_btc.csv</span>.</div>
       <div class="toolbar">
         <button class="btn" data-manual-days="7">Manual 7D</button>
         <button class="btn active" data-manual-days="30">Manual 30D</button>
@@ -5192,10 +5250,25 @@ def home():
         <div class="stat"><div class="k">Open</div><div class="v" id="manualOpen">-</div></div>
         <div class="stat"><div class="k">Realized P/L</div><div class="v" id="manualRealized">-</div></div>
       </div>
+      <div class="meta" style="margin-top:10px;">Weather Manual Positions</div>
       <div class="table-wrap" style="margin-top:8px;">
         <table>
           <thead><tr><th>Date</th><th>City</th><th>Side</th><th>Bet</th><th>Line</th><th>Ticker</th><th>Price</th><th>Count</th><th>Stake</th><th>Status</th><th>Realized</th><th>Source</th></tr></thead>
           <tbody id="manualRows"><tr><td colspan="12">Loading...</td></tr></tbody>
+        </table>
+      </div>
+      <div class="meta" style="margin-top:12px;">BTC Up/Down Manual Positions</div>
+      <div class="row">
+        <div class="stat"><div class="k">BTC Positions</div><div class="v" id="manualBtcPositions">-</div></div>
+        <div class="stat"><div class="k">BTC Stake</div><div class="v" id="manualBtcStake">-</div></div>
+        <div class="stat"><div class="k">BTC Resolved</div><div class="v" id="manualBtcResolved">-</div></div>
+        <div class="stat"><div class="k">BTC Open</div><div class="v" id="manualBtcOpen">-</div></div>
+        <div class="stat"><div class="k">BTC Realized P/L</div><div class="v" id="manualBtcRealized">-</div></div>
+      </div>
+      <div class="table-wrap" style="margin-top:8px;">
+        <table>
+          <thead><tr><th>Date</th><th>Market</th><th>Bet</th><th>Outcome</th><th>Cost</th><th>Fees</th><th>Payout</th><th>Realized</th><th>Source</th><th>Note</th></tr></thead>
+          <tbody id="manualBtcRows"><tr><td colspan="10">Loading...</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -5689,14 +5762,19 @@ def home():
       renderMonthlyRows();
 
       const ms = (dataManual && dataManual.summary) || {};
+      const ws = (dataManual && dataManual.weather_summary) || {};
+      const bs = (dataManual && dataManual.btc_summary) || {};
       $("manualPath").textContent = String((dataManual && dataManual.path) || "manual_positions.csv");
+      $("manualBtcPath").textContent = String((dataManual && dataManual.btc_path) || "manual_positions_btc.csv");
       $("manualPositions").textContent = ms.positions ?? "-";
       $("manualContracts").textContent = ms.contracts ?? "-";
       $("manualStake").textContent = money(ms.stake_dollars);
       $("manualResolved").textContent = ms.resolved_positions ?? "-";
       $("manualOpen").textContent = ms.open_positions ?? "-";
       $("manualRealized").textContent = money(ms.realized_pnl_dollars);
-      const manualRows = Array.isArray(dataManual.rows) ? dataManual.rows : [];
+      const manualRows = Array.isArray(dataManual.weather_rows) ? dataManual.weather_rows : (
+        Array.isArray(dataManual.rows) ? dataManual.rows : []
+      );
       $("manualRows").innerHTML = manualRows.length ? manualRows.map(r => `
         <tr>
           <td>${esc(r.date)}</td>
@@ -5712,7 +5790,28 @@ def home():
           <td>${money(r.realized_pnl_dollars)}</td>
           <td>${esc(r.source || "")}</td>
         </tr>
-      `).join("") : "<tr><td colspan='12'>No manual positions in this window.</td></tr>";
+      `).join("") : "<tr><td colspan='12'>No weather manual positions in this window.</td></tr>";
+      $("manualBtcPositions").textContent = bs.positions ?? 0;
+      $("manualBtcStake").textContent = money(bs.stake_dollars);
+      $("manualBtcResolved").textContent = bs.resolved_positions ?? 0;
+      $("manualBtcOpen").textContent = bs.open_positions ?? 0;
+      $("manualBtcRealized").textContent = money(bs.realized_pnl_dollars);
+      toneValue("manualBtcRealized", bs.realized_pnl_dollars);
+      const btcRows = Array.isArray(dataManual.btc_rows) ? dataManual.btc_rows : [];
+      $("manualBtcRows").innerHTML = btcRows.length ? btcRows.map(r => `
+        <tr>
+          <td>${esc(r.date)}</td>
+          <td>${esc(r.market_name || r.ticker || "BTC Up/Down")}</td>
+          <td>${esc(r.bet)}</td>
+          <td>${statusPill(r.settled ? (r.is_win ? "resolved_win" : "resolved_loss") : "open")}</td>
+          <td>${money(r.stake_dollars)}</td>
+          <td>${money(r.fees_dollars)}</td>
+          <td>${money(r.total_payout_dollars)}</td>
+          <td>${money(r.realized_pnl_dollars)}</td>
+          <td>${esc(r.source || "")}</td>
+          <td>${esc(r.note || "")}</td>
+        </tr>
+      `).join("") : "<tr><td colspan='10'>No BTC manual positions in this window.</td></tr>";
 
       const dataEv = await fetch(`/analytics/live-scorecard?${qEv.toString()}`).then(r => r.json());
       const perAll = Array.isArray(dataEv.per_day) ? dataEv.per_day.filter(x => x.ok) : [];
@@ -5912,6 +6011,8 @@ def health():
         "manual_market_block_enabled": MANUAL_MARKET_BLOCK_ENABLED,
         "manual_positions_path": manual_positions_path(),
         "manual_positions_count": len(load_manual_positions_rows()),
+        "manual_btc_positions_path": manual_btc_positions_path(),
+        "manual_btc_positions_count": len(load_manual_btc_positions_rows()),
         "account_deposits_dollars": ACCOUNT_DEPOSITS_DOLLARS,
         "live_max_orders_per_scan": LIVE_MAX_ORDERS_PER_SCAN,
         "live_max_orders_per_day": LIVE_MAX_ORDERS_PER_DAY,
@@ -7753,7 +7854,11 @@ def analytics_manual_positions(
     start: Optional[str] = None,
     end: Optional[str] = None,
 ):
-    rows = load_manual_positions_rows()
+    weather_src_rows = load_manual_positions_rows()
+    btc_src_rows = load_manual_btc_positions_rows()
+    rows = list(weather_src_rows)
+    if btc_src_rows:
+        rows.extend(btc_src_rows)
     d0 = None
     d1 = None
     try:
@@ -7768,10 +7873,20 @@ def analytics_manual_positions(
         d1 = None
 
     out = []
+    weather_rows = []
+    btc_rows = []
     cost_total = 0.0
     contracts_total = 0
     resolved_count = 0
     realized_total = 0.0
+    weather_cost_total = 0.0
+    weather_contracts_total = 0
+    weather_resolved_count = 0
+    weather_realized_total = 0.0
+    btc_cost_total = 0.0
+    btc_contracts_total = 0
+    btc_resolved_count = 0
+    btc_realized_total = 0.0
 
     for r in rows:
         date_iso = str(r.get("date", "")).strip()
@@ -7784,6 +7899,10 @@ def analytics_manual_positions(
         if d1 and dd and dd > d1:
             continue
 
+        market_type = _manual_market_type(r)
+        market_name = str(r.get("market_name", "")).strip()
+        is_weather = _manual_is_weather_row(r)
+        is_btc = _manual_is_btc_row(r)
         city = str(r.get("city", "")).strip()
         side = normalize_temp_side(str(r.get("temp_side", "high")))
         bet = str(r.get("bet", "")).strip().upper()
@@ -7792,27 +7911,51 @@ def analytics_manual_positions(
         price_cents = float(_to_float(r.get("price_cents")) or 0.0)
         count = int(float(_to_float(r.get("count")) or 0))
         price_dollars = max(0.0, price_cents / 100.0)
-        stake_dollars = max(0.0, price_dollars * max(0, count))
-        contracts_total += max(0, count)
-        cost_total += stake_dollars
+        total_cost_dollars = _to_float(r.get("total_cost_dollars"))
+        fees_dollars = _to_float(r.get("fees_dollars"))
+        total_payout_dollars = _to_float(r.get("total_payout_dollars"))
+        total_return_dollars = _to_float(r.get("total_return_dollars"))
+        outcome_text = str(r.get("outcome", "")).strip()
 
-        outcome_f = get_final_outcome_f(date_iso, city, side) if date_iso and city else None
-        bucket = parse_bucket_from_line(line)
-        settled = (outcome_f is not None and bucket is not None and count > 0)
+        if total_cost_dollars is not None:
+            stake_dollars = max(0.0, float(total_cost_dollars))
+        else:
+            stake_dollars = max(0.0, price_dollars * max(0, count))
+
+        outcome_f = get_final_outcome_f(date_iso, city, side) if (is_weather and date_iso and city) else None
+        bucket = parse_bucket_from_line(line) if is_weather else None
+        settled = (outcome_f is not None and bucket is not None and count > 0) if is_weather else bool(
+            (total_return_dollars is not None) or (total_payout_dollars is not None) or outcome_text
+        )
         is_win = None
         realized_pnl = None
-        if settled and bucket is not None:
+        if settled and bucket is not None and is_weather:
             yes_outcome = _bucket_yes_from_outcome(float(outcome_f), float(bucket[0]), float(bucket[1]))
             is_buy_yes = "YES" in bet
             is_win = bool(yes_outcome) if is_buy_yes else (not bool(yes_outcome))
             payout = float(count) if bool(is_win) else 0.0
             realized_pnl = payout - stake_dollars
+        elif settled:
+            if total_return_dollars is not None:
+                realized_pnl = float(total_return_dollars)
+            elif total_payout_dollars is not None:
+                realized_pnl = float(total_payout_dollars) - stake_dollars
+            out_l = outcome_text.lower()
+            if out_l:
+                is_win = ("yes" in out_l) or ("win" in out_l) or ("up" in out_l)
+
+        contracts_total += max(0, count)
+        cost_total += stake_dollars
+        if settled:
             resolved_count += 1
+        if realized_pnl is not None:
             realized_total += float(realized_pnl)
 
-        out.append({
+        row_out = {
             "opened_ts_est": r.get("opened_ts_est"),
             "date": date_iso,
+            "market_type": market_type,
+            "market_name": market_name,
             "city": city,
             "temp_side": side,
             "ticker": ticker,
@@ -7821,18 +7964,42 @@ def analytics_manual_positions(
             "price_cents": price_cents,
             "count": count,
             "stake_dollars": stake_dollars,
+            "outcome": outcome_text,
+            "fees_dollars": fees_dollars,
+            "total_payout_dollars": total_payout_dollars,
+            "total_return_dollars": total_return_dollars,
             "source": r.get("source"),
             "note": r.get("note"),
             "settled": bool(settled),
             "outcome_f": outcome_f,
             "realized_pnl_dollars": realized_pnl,
             "is_win": is_win,
-        })
+        }
+        out.append(row_out)
+        if is_weather:
+            weather_rows.append(row_out)
+            weather_contracts_total += max(0, count)
+            weather_cost_total += stake_dollars
+            if settled:
+                weather_resolved_count += 1
+            if realized_pnl is not None:
+                weather_realized_total += float(realized_pnl)
+        if is_btc:
+            btc_rows.append(row_out)
+            btc_contracts_total += max(0, count)
+            btc_cost_total += stake_dollars
+            if settled:
+                btc_resolved_count += 1
+            if realized_pnl is not None:
+                btc_realized_total += float(realized_pnl)
 
     out.sort(key=lambda x: (str(x.get("date", "")), str(x.get("opened_ts_est", ""))), reverse=True)
+    weather_rows.sort(key=lambda x: (str(x.get("date", "")), str(x.get("opened_ts_est", ""))), reverse=True)
+    btc_rows.sort(key=lambda x: (str(x.get("date", "")), str(x.get("opened_ts_est", ""))), reverse=True)
     return {
         "ok": True,
         "path": manual_positions_path(),
+        "btc_path": manual_btc_positions_path(),
         "count": len(out),
         "summary": {
             "positions": len(out),
@@ -7842,7 +8009,25 @@ def analytics_manual_positions(
             "open_positions": max(0, len(out) - resolved_count),
             "realized_pnl_dollars": realized_total,
         },
+        "weather_summary": {
+            "positions": len(weather_rows),
+            "contracts": weather_contracts_total,
+            "stake_dollars": weather_cost_total,
+            "resolved_positions": weather_resolved_count,
+            "open_positions": max(0, len(weather_rows) - weather_resolved_count),
+            "realized_pnl_dollars": weather_realized_total,
+        },
+        "btc_summary": {
+            "positions": len(btc_rows),
+            "contracts": btc_contracts_total,
+            "stake_dollars": btc_cost_total,
+            "resolved_positions": btc_resolved_count,
+            "open_positions": max(0, len(btc_rows) - btc_resolved_count),
+            "realized_pnl_dollars": btc_realized_total,
+        },
         "rows": out,
+        "weather_rows": weather_rows,
+        "btc_rows": btc_rows,
     }
 
 @app.get("/analytics/account-reconciliation")

@@ -7933,8 +7933,12 @@ def analytics_manual_positions(
             yes_outcome = _bucket_yes_from_outcome(float(outcome_f), float(bucket[0]), float(bucket[1]))
             is_buy_yes = "YES" in bet
             is_win = bool(yes_outcome) if is_buy_yes else (not bool(yes_outcome))
-            payout = float(count) if bool(is_win) else 0.0
-            realized_pnl = payout - stake_dollars
+            if total_return_dollars is not None:
+                realized_pnl = float(total_return_dollars)
+            else:
+                payout = float(count) if bool(is_win) else 0.0
+                fee_amt = max(0.0, float(fees_dollars or 0.0))
+                realized_pnl = payout - stake_dollars - fee_amt
         elif settled:
             if total_return_dollars is not None:
                 realized_pnl = float(total_return_dollars)

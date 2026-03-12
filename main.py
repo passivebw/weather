@@ -2564,6 +2564,9 @@ def live_trade_log_path() -> str:
 def manual_positions_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "manual_positions.csv")
 
+def manual_auto_weather_positions_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "manual_positions_auto_weather.csv")
+
 def manual_btc_positions_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "manual_positions_btc.csv")
 
@@ -2624,6 +2627,16 @@ def ensure_manual_btc_positions_header() -> None:
         "source", "note",
     ])
 
+def ensure_manual_auto_weather_positions_header() -> None:
+    path = manual_auto_weather_positions_path()
+    _ensure_csv_header_contains(path, [
+        "market_type", "market_name",
+        "opened_ts_est", "date", "city", "temp_side", "ticker", "bet",
+        "line", "price_cents", "count",
+        "outcome", "total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars",
+        "source", "note",
+    ])
+
 def load_manual_positions_rows() -> List[dict]:
     ensure_manual_positions_header()
     path = manual_positions_path()
@@ -2639,6 +2652,18 @@ def load_manual_positions_rows() -> List[dict]:
 def load_manual_btc_positions_rows() -> List[dict]:
     ensure_manual_btc_positions_header()
     path = manual_btc_positions_path()
+    rows: List[dict] = []
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                rows.append(dict(r))
+    except Exception:
+        return []
+    return rows
+
+def load_manual_auto_weather_positions_rows() -> List[dict]:
+    ensure_manual_auto_weather_positions_header()
+    path = manual_auto_weather_positions_path()
     rows: List[dict] = []
     try:
         with open(path, "r", newline="", encoding="utf-8") as f:
@@ -2745,24 +2770,33 @@ def _to_money_2(v: Optional[float]) -> Optional[float]:
 
 def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int = 200, force_update: bool = False, dry_run: bool = False) -> dict:
     ensure_manual_positions_header()
+    ensure_manual_auto_weather_positions_header()
     ensure_manual_btc_positions_header()
     if not kalshi_has_auth_config():
         return {"ok": False, "error": "kalshi auth not configured"}
 
-    weather_path = manual_positions_path()
+    user_weather_path = manual_positions_path()
+    auto_weather_path = manual_auto_weather_positions_path()
     btc_path = manual_btc_positions_path()
-    w_header, w_rows = _read_csv_rows_with_header(weather_path)
+    uw_header, uw_rows = _read_csv_rows_with_header(user_weather_path)
+    aw_header, aw_rows = _read_csv_rows_with_header(auto_weather_path)
     b_header, b_rows = _read_csv_rows_with_header(btc_path)
-    if not w_header:
+    if not uw_header:
         ensure_manual_positions_header()
-        w_header, w_rows = _read_csv_rows_with_header(weather_path)
+        uw_header, uw_rows = _read_csv_rows_with_header(user_weather_path)
+    if not aw_header:
+        ensure_manual_auto_weather_positions_header()
+        aw_header, aw_rows = _read_csv_rows_with_header(auto_weather_path)
     if not b_header:
         ensure_manual_btc_positions_header()
         b_header, b_rows = _read_csv_rows_with_header(btc_path)
 
-    idx_w: Dict[Tuple[str, str], int] = {}
-    for i, r in enumerate(w_rows):
-        idx_w[(str(r.get("ticker", "")).strip().upper(), str(r.get("date", "")).strip())] = i
+    idx_user_weather: Dict[Tuple[str, str], int] = {}
+    for i, r in enumerate(uw_rows):
+        idx_user_weather[(str(r.get("ticker", "")).strip().upper(), str(r.get("date", "")).strip())] = i
+    idx_auto_weather: Dict[Tuple[str, str], int] = {}
+    for i, r in enumerate(aw_rows):
+        idx_auto_weather[(str(r.get("ticker", "")).strip().upper(), str(r.get("date", "")).strip())] = i
     idx_b: Dict[Tuple[str, str], int] = {}
     for i, r in enumerate(b_rows):
         idx_b[(str(r.get("ticker", "")).strip().upper(), str(r.get("date", "")).strip())] = i
@@ -2770,8 +2804,11 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
     bot_weather_tickers = _bot_logged_weather_tickers()
     settlements = _fetch_kalshi_settlements(max_pages=max(1, int(max_pages)), per_page_limit=max(1, int(per_page_limit)))
     inserted_weather = 0
+    inserted_auto_weather = 0
     inserted_btc = 0
     updated_weather = 0
+    updated_auto_weather = 0
+    updated_user_weather = 0
     updated_btc = 0
     skipped_bot_weather = 0
     skipped_unclassified = 0
@@ -2815,9 +2852,6 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
 
         is_weather = ticker.startswith("KXHIGH") or ticker.startswith("KXLOW")
         is_btc = ("BTC" in ticker) or ("BTC" in market_title.upper())
-        if is_weather and ticker in bot_weather_tickers:
-            skipped_bot_weather += 1
-            continue
         if not is_weather and not is_btc:
             skipped_unclassified += 1
             continue
@@ -2859,8 +2893,26 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
                 "count": "",
             })
             key = (ticker, date_iso)
-            if key in idx_w:
-                rr = w_rows[idx_w[key]]
+            # User-manual rows always win: apply settlement onto that row if present.
+            if key in idx_user_weather:
+                rr = uw_rows[idx_user_weather[key]]
+                changed = False
+                for k in ("outcome", "total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars"):
+                    v = row.get(k, "")
+                    if force_update or not str(rr.get(k, "")).strip():
+                        if str(rr.get(k, "")) != str(v):
+                            rr[k] = v
+                            changed = True
+                if not str(rr.get("market_type", "")).strip():
+                    rr["market_type"] = "weather"
+                    changed = True
+                if changed:
+                    updated_weather += 1
+                    updated_user_weather += 1
+            elif ticker in bot_weather_tickers:
+                skipped_bot_weather += 1
+            elif key in idx_auto_weather:
+                rr = aw_rows[idx_auto_weather[key]]
                 changed = False
                 for k, v in row.items():
                     if force_update or not str(rr.get(k, "")).strip():
@@ -2869,10 +2921,12 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
                             changed = True
                 if changed:
                     updated_weather += 1
+                    updated_auto_weather += 1
             else:
-                w_rows.append(row)
-                idx_w[key] = len(w_rows) - 1
+                aw_rows.append(row)
+                idx_auto_weather[key] = len(aw_rows) - 1
                 inserted_weather += 1
+                inserted_auto_weather += 1
             continue
 
         if is_btc:
@@ -2899,7 +2953,8 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
             continue
 
     if not dry_run:
-        _rewrite_csv_with_header(weather_path, w_header, w_rows)
+        _rewrite_csv_with_header(user_weather_path, uw_header, uw_rows)
+        _rewrite_csv_with_header(auto_weather_path, aw_header, aw_rows)
         _rewrite_csv_with_header(btc_path, b_header, b_rows)
 
     return {
@@ -2909,13 +2964,18 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
         "settlements_scanned": len(settlements),
         "inserted_weather": inserted_weather,
         "updated_weather": updated_weather,
+        "inserted_user_weather": 0,
+        "updated_user_weather": updated_user_weather,
+        "inserted_auto_weather": inserted_auto_weather,
+        "updated_auto_weather": updated_auto_weather,
         "inserted_btc": inserted_btc,
         "updated_btc": updated_btc,
         "skipped_bot_weather": skipped_bot_weather,
         "skipped_unclassified": skipped_unclassified,
         "skipped_missing_ticker": skipped_missing_ticker,
         "skipped_zero_economic": skipped_zero_economic,
-        "weather_path": weather_path,
+        "weather_path": user_weather_path,
+        "auto_weather_path": auto_weather_path,
         "btc_path": btc_path,
     }
 
@@ -5513,7 +5573,7 @@ def home():
     <section id="manualTab" class="tab-content">
     <section class="card" id="manualPos">
       <h2>Manual Positions</h2>
-      <div class="meta">Weather file: <span class="mono" id="manualPath">manual_positions.csv</span> | BTC file: <span class="mono" id="manualBtcPath">manual_positions_btc.csv</span>.</div>
+      <div class="meta">Weather (user): <span class="mono" id="manualPath">manual_positions.csv</span> | Weather (auto): <span class="mono" id="manualAutoWeatherPath">manual_positions_auto_weather.csv</span> | BTC file: <span class="mono" id="manualBtcPath">manual_positions_btc.csv</span>.</div>
       <div class="toolbar">
         <button class="btn" data-manual-days="7">Manual 7D</button>
         <button class="btn active" data-manual-days="30">Manual 30D</button>
@@ -6043,6 +6103,7 @@ def home():
       const ws = (dataManual && dataManual.weather_summary) || {};
       const bs = (dataManual && dataManual.btc_summary) || {};
       $("manualPath").textContent = String((dataManual && dataManual.path) || "manual_positions.csv");
+      $("manualAutoWeatherPath").textContent = String((dataManual && dataManual.auto_weather_path) || "manual_positions_auto_weather.csv");
       $("manualBtcPath").textContent = String((dataManual && dataManual.btc_path) || "manual_positions_btc.csv");
       $("manualPositions").textContent = ms.positions ?? "-";
       $("manualContracts").textContent = ms.contracts ?? "-";
@@ -6291,6 +6352,8 @@ def health():
         "manual_auto_sync_interval_minutes": MANUAL_AUTO_SYNC_INTERVAL_MINUTES,
         "manual_positions_path": manual_positions_path(),
         "manual_positions_count": len(load_manual_positions_rows()),
+        "manual_auto_weather_positions_path": manual_auto_weather_positions_path(),
+        "manual_auto_weather_positions_count": len(load_manual_auto_weather_positions_rows()),
         "manual_btc_positions_path": manual_btc_positions_path(),
         "manual_btc_positions_count": len(load_manual_btc_positions_rows()),
         "account_deposits_dollars": ACCOUNT_DEPOSITS_DOLLARS,
@@ -8135,8 +8198,11 @@ def analytics_manual_positions(
     end: Optional[str] = None,
 ):
     weather_src_rows = load_manual_positions_rows()
+    auto_weather_src_rows = load_manual_auto_weather_positions_rows()
     btc_src_rows = load_manual_btc_positions_rows()
     rows = list(weather_src_rows)
+    if auto_weather_src_rows:
+        rows.extend(auto_weather_src_rows)
     if btc_src_rows:
         rows.extend(btc_src_rows)
     d0 = None
@@ -8299,6 +8365,7 @@ def analytics_manual_positions(
     return {
         "ok": True,
         "path": manual_positions_path(),
+        "auto_weather_path": manual_auto_weather_positions_path(),
         "btc_path": manual_btc_positions_path(),
         "count": len(out),
         "summary": {

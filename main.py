@@ -63,11 +63,18 @@ def normalize_time_in_force(tif: str, *, default: str = "fill_or_kill") -> str:
     }
     return aliases.get(raw, default)
 
-def sanitize_time_in_force_for_order(tif: str, *, default: str = "fill_or_kill") -> str:
+def sanitize_time_in_force_for_order(
+    tif: str,
+    *,
+    default: str = "fill_or_kill",
+    allow_resting: bool = False,
+) -> str:
     """
     Weather order flow currently accepts FOK/IOC reliably; sanitize unsupported TIFs.
     """
     allowed = {"fill_or_kill", "immediate_or_cancel"}
+    if allow_resting:
+        allowed.update({"good_til_cancelled", "good_til_date"})
     safe_default = normalize_time_in_force(default, default="fill_or_kill")
     if safe_default not in allowed:
         safe_default = "fill_or_kill"
@@ -175,9 +182,11 @@ LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT = float(os.getenv("LIVE_EDGE_IMMEDIATE_AGGRES
 LIVE_EDGE_PASSIVE_THEN_AGGR_PCT = float(os.getenv("LIVE_EDGE_PASSIVE_THEN_AGGR_PCT", "12.0"))
 LIVE_PASSIVE_WAIT_SECONDS_MID = int(os.getenv("LIVE_PASSIVE_WAIT_SECONDS_MID", "20"))
 LIVE_PASSIVE_WAIT_SECONDS_LOW = int(os.getenv("LIVE_PASSIVE_WAIT_SECONDS_LOW", "45"))
+LIVE_PASSIVE_ALLOW_RESTING_LIMITS = env_bool("LIVE_PASSIVE_ALLOW_RESTING_LIMITS", default=False)
 LIVE_PASSIVE_TIME_IN_FORCE = sanitize_time_in_force_for_order(
     os.getenv("LIVE_PASSIVE_TIME_IN_FORCE", "fill_or_kill"),
-    default=LIVE_ORDER_TIME_IN_FORCE,
+    default=("good_til_cancelled" if LIVE_PASSIVE_ALLOW_RESTING_LIMITS else LIVE_ORDER_TIME_IN_FORCE),
+    allow_resting=LIVE_PASSIVE_ALLOW_RESTING_LIMITS,
 )
 LIVE_PASSIVE_REPRICE_STEP_CENTS = int(os.getenv("LIVE_PASSIVE_REPRICE_STEP_CENTS", "1"))
 LIVE_PASSIVE_REPRICE_STEPS_MID = int(os.getenv("LIVE_PASSIVE_REPRICE_STEPS_MID", "2"))
@@ -6432,6 +6441,7 @@ def health():
         "live_edge_passive_then_aggr_pct": LIVE_EDGE_PASSIVE_THEN_AGGR_PCT,
         "live_passive_wait_seconds_mid": LIVE_PASSIVE_WAIT_SECONDS_MID,
         "live_passive_wait_seconds_low": LIVE_PASSIVE_WAIT_SECONDS_LOW,
+        "live_passive_allow_resting_limits": LIVE_PASSIVE_ALLOW_RESTING_LIMITS,
         "live_passive_time_in_force": LIVE_PASSIVE_TIME_IN_FORCE,
         "live_always_passive_first": LIVE_ALWAYS_PASSIVE_FIRST,
         "live_passive_reprice_step_cents": LIVE_PASSIVE_REPRICE_STEP_CENTS,

@@ -2697,6 +2697,7 @@ def _manual_weather_city_by_code() -> Dict[str, str]:
         "SAT": "San Antonio",
         "NY": "New York City",
         "NYC": "New York City",
+        "DC": "Washington DC",
     }
 
 def _decode_weather_ticker_fields(ticker: str) -> Optional[dict]:
@@ -2775,6 +2776,7 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
     skipped_bot_weather = 0
     skipped_unclassified = 0
     skipped_missing_ticker = 0
+    skipped_zero_economic = 0
 
     for s in settlements:
         ticker = str(s.get("ticker") or s.get("market_ticker") or "").strip().upper()
@@ -2805,6 +2807,11 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
         total_return_d = (revenue_c - yes_cost_c - no_cost_c) / 100.0 - fee_d
         market_result = str(s.get("market_result", "")).strip().upper()
         market_title = str(s.get("market_title") or s.get("title") or "").strip()
+
+        # Ignore no-economics settlements (no stake, no payout, no pnl) that add noisy rows.
+        if total_cost_d <= 1e-9 and total_payout_d <= 1e-9 and abs(total_return_d) <= 1e-9:
+            skipped_zero_economic += 1
+            continue
 
         is_weather = ticker.startswith("KXHIGH") or ticker.startswith("KXLOW")
         is_btc = ("BTC" in ticker) or ("BTC" in market_title.upper())
@@ -2907,6 +2914,7 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
         "skipped_bot_weather": skipped_bot_weather,
         "skipped_unclassified": skipped_unclassified,
         "skipped_missing_ticker": skipped_missing_ticker,
+        "skipped_zero_economic": skipped_zero_economic,
         "weather_path": weather_path,
         "btc_path": btc_path,
     }

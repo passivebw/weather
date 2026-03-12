@@ -8207,7 +8207,7 @@ def analytics_manual_positions(
             settled = bool((total_return_dollars is not None) or (total_payout_dollars is not None) or outcome_text)
         is_win = None
         realized_pnl = None
-        if settled and bucket is not None and is_weather:
+        if settled and is_weather and (outcome_f is not None) and (bucket is not None):
             yes_outcome = _bucket_yes_from_outcome(float(outcome_f), float(bucket[0]), float(bucket[1]))
             is_buy_yes = "YES" in bet
             is_win = bool(yes_outcome) if is_buy_yes else (not bool(yes_outcome))

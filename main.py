@@ -8197,6 +8197,16 @@ def analytics_manual_positions(
         total_return_dollars = _to_float(r.get("total_return_dollars"))
         outcome_text = str(r.get("outcome", "")).strip()
 
+        # Hide legacy auto-sync rows that have no economic signal.
+        src_l = str(r.get("source", "")).strip().lower()
+        if (
+            src_l == "auto_kalshi_settlement"
+            and (float(total_cost_dollars or 0.0) <= 1e-9)
+            and (float(total_payout_dollars or 0.0) <= 1e-9)
+            and (abs(float(total_return_dollars or 0.0)) <= 1e-9)
+        ):
+            continue
+
         if total_cost_dollars is not None:
             stake_dollars = max(0.0, float(total_cost_dollars))
         else:

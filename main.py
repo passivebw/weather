@@ -2897,12 +2897,23 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
             if key in idx_user_weather:
                 rr = uw_rows[idx_user_weather[key]]
                 changed = False
-                for k in ("outcome", "total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars"):
-                    v = row.get(k, "")
-                    if force_update or not str(rr.get(k, "")).strip():
-                        if str(rr.get(k, "")) != str(v):
-                            rr[k] = v
-                            changed = True
+                src_user = str(rr.get("source", "")).strip().lower()
+                cnt_user = float(_to_float(rr.get("count")) or 0.0)
+                px_user = float(_to_float(rr.get("price_cents")) or 0.0)
+                has_manual_fill = (cnt_user > 0.0 and px_user > 0.0)
+                # User-manual rows keep their own economics; auto-sync should only close them.
+                if force_update or not str(rr.get("outcome", "")).strip():
+                    if str(rr.get("outcome", "")) != str(row.get("outcome", "")):
+                        rr["outcome"] = row.get("outcome", "")
+                        changed = True
+                can_update_econ = (src_user == "auto_kalshi_settlement") or (not has_manual_fill)
+                if can_update_econ:
+                    for k in ("total_cost_dollars", "fees_dollars", "total_payout_dollars", "total_return_dollars"):
+                        v = row.get(k, "")
+                        if force_update or not str(rr.get(k, "")).strip():
+                            if str(rr.get(k, "")) != str(v):
+                                rr[k] = v
+                                changed = True
                 if not str(rr.get("market_type", "")).strip():
                     rr["market_type"] = "weather"
                     changed = True

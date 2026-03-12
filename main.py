@@ -180,9 +180,13 @@ LIVE_MAX_CONTRACTS_PER_ORDER = int(os.getenv("LIVE_MAX_CONTRACTS_PER_ORDER", "10
 LIVE_MIN_STAKE_DOLLARS = float(os.getenv("LIVE_MIN_STAKE_DOLLARS", "0.5"))
 LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT = float(os.getenv("LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT", "30.0"))
 LIVE_EDGE_PASSIVE_THEN_AGGR_PCT = float(os.getenv("LIVE_EDGE_PASSIVE_THEN_AGGR_PCT", "12.0"))
+LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT = float(os.getenv("LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT", "50.0"))
 LIVE_PASSIVE_WAIT_SECONDS_MID = int(os.getenv("LIVE_PASSIVE_WAIT_SECONDS_MID", "20"))
 LIVE_PASSIVE_WAIT_SECONDS_LOW = int(os.getenv("LIVE_PASSIVE_WAIT_SECONDS_LOW", "45"))
 LIVE_PASSIVE_ALLOW_RESTING_LIMITS = env_bool("LIVE_PASSIVE_ALLOW_RESTING_LIMITS", default=False)
+LIVE_PASSIVE_RESCAN_MODE_ENABLED = env_bool("LIVE_PASSIVE_RESCAN_MODE_ENABLED", default=True)
+LIVE_PASSIVE_RESCAN_SECONDS = int(os.getenv("LIVE_PASSIVE_RESCAN_SECONDS", "60"))
+LIVE_PASSIVE_ONE_TICK_FROM_ASK = env_bool("LIVE_PASSIVE_ONE_TICK_FROM_ASK", default=True)
 LIVE_PASSIVE_TIME_IN_FORCE = sanitize_time_in_force_for_order(
     os.getenv("LIVE_PASSIVE_TIME_IN_FORCE", "fill_or_kill"),
     default=("good_til_cancelled" if LIVE_PASSIVE_ALLOW_RESTING_LIMITS else LIVE_ORDER_TIME_IN_FORCE),
@@ -3509,6 +3513,32 @@ def _compute_repriced_passive_limit_price_cents(
         return target
     return min(target, int(cap))
 
+def _compute_maker_one_tick_limit_price_cents(
+    quotes: Dict[str, Optional[int]],
+    bet_side: str,
+    fill_mode: str,
+) -> Optional[int]:
+    yes_bid = quotes.get("yes_bid")
+    yes_ask = quotes.get("yes_ask")
+    no_bid = quotes.get("no_bid")
+    no_ask = quotes.get("no_ask")
+    side = str(bet_side).upper().strip()
+    if side == "BUY YES":
+        if yes_ask is None:
+            return None
+        target = int(yes_ask) - 1
+        if yes_bid is not None:
+            target = max(int(yes_bid), target)
+        return int(clamp(target, 1, 99))
+    if side == "BUY NO":
+        if no_ask is None:
+            return None
+        target = int(no_ask) - 1
+        if no_bid is not None:
+            target = max(int(no_bid), target)
+        return int(clamp(target, 1, 99))
+    return _compute_repriced_passive_limit_price_cents(quotes, side, 0, fill_mode)
+
 def _compute_sell_aggressive_price_cents(quotes: Dict[str, Optional[int]], order_side: str, fill_mode: str) -> Optional[int]:
     yes_bid = quotes.get("yes_bid")
     yes_ask = quotes.get("yes_ask")
@@ -4110,10 +4140,20 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
 
             is_high = edge_pct >= LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT
             is_mid = edge_pct >= LIVE_EDGE_PASSIVE_THEN_AGGR_PCT
+            is_aggressive_override = edge_pct >= LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT
             passive_wait_s = LIVE_PASSIVE_WAIT_SECONDS_MID if (is_high or is_mid) else LIVE_PASSIVE_WAIT_SECONDS_LOW
             passive_steps = LIVE_PASSIVE_REPRICE_STEPS_MID if (is_high or is_mid) else LIVE_PASSIVE_REPRICE_STEPS_LOW
 
-            if LIVE_ALWAYS_PASSIVE_FIRST or is_mid or (not is_high):
+            if LIVE_PASSIVE_RESCAN_MODE_ENABLED:
+                if LIVE_PASSIVE_ONE_TICK_FROM_ASK:
+                    p0 = _compute_maker_one_tick_limit_price_cents(quotes, bet_side, LIVE_ORDER_FILL_MODE)
+                else:
+                    p0 = _compute_repriced_passive_limit_price_cents(quotes, bet_side, 0, LIVE_ORDER_FILL_MODE)
+                if p0 is None:
+                    continue
+                rescan_wait_s = max(1, int(LIVE_PASSIVE_RESCAN_SECONDS))
+                _append_attempt("passive", int(p0), LIVE_PASSIVE_TIME_IN_FORCE, rescan_wait_s, 0)
+            elif LIVE_ALWAYS_PASSIVE_FIRST or is_mid or (not is_high):
                 p0 = _compute_repriced_passive_limit_price_cents(quotes, bet_side, 0, LIVE_ORDER_FILL_MODE)
                 if p0 is None:
                     continue
@@ -4131,12 +4171,14 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             # - mid edge: only if spread is acceptable
             # - low edge: no aggressive fallback
             allow_aggressive = False
-            if is_high:
+            if is_aggressive_override:
+                allow_aggressive = True
+            elif is_high:
                 allow_aggressive = True
             elif is_mid and (spread_cents is None or spread_cents <= LIVE_AGGRESSIVE_MAX_SPREAD_CENTS):
                 allow_aggressive = True
 
-            if is_mid and (not is_high) and LIVE_MID_EDGE_MAKER_ONLY:
+            if is_mid and (not is_high) and (not is_aggressive_override) and LIVE_MID_EDGE_MAKER_ONLY:
                 allow_aggressive = False
 
             if allow_aggressive:
@@ -6439,9 +6481,13 @@ def health():
         "live_min_stake_dollars": LIVE_MIN_STAKE_DOLLARS,
         "live_edge_immediate_aggressive_pct": LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT,
         "live_edge_passive_then_aggr_pct": LIVE_EDGE_PASSIVE_THEN_AGGR_PCT,
+        "live_aggressive_override_edge_pct": LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT,
         "live_passive_wait_seconds_mid": LIVE_PASSIVE_WAIT_SECONDS_MID,
         "live_passive_wait_seconds_low": LIVE_PASSIVE_WAIT_SECONDS_LOW,
         "live_passive_allow_resting_limits": LIVE_PASSIVE_ALLOW_RESTING_LIMITS,
+        "live_passive_rescan_mode_enabled": LIVE_PASSIVE_RESCAN_MODE_ENABLED,
+        "live_passive_rescan_seconds": LIVE_PASSIVE_RESCAN_SECONDS,
+        "live_passive_one_tick_from_ask": LIVE_PASSIVE_ONE_TICK_FROM_ASK,
         "live_passive_time_in_force": LIVE_PASSIVE_TIME_IN_FORCE,
         "live_always_passive_first": LIVE_ALWAYS_PASSIVE_FIRST,
         "live_passive_reprice_step_cents": LIVE_PASSIVE_REPRICE_STEP_CENTS,

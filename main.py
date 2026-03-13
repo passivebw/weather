@@ -9753,6 +9753,10 @@ def analytics_manual_positions(
             out_l = outcome_text.lower()
             if out_l:
                 is_win = ("yes" in out_l) or ("win" in out_l) or ("up" in out_l)
+                if realized_pnl is None:
+                    payout = float(count) if bool(is_win) else 0.0
+                    fee_amt = max(0.0, float(fees_dollars or 0.0))
+                    realized_pnl = payout - stake_dollars - fee_amt
 
         contracts_total += max(0, count)
         cost_total += stake_dollars

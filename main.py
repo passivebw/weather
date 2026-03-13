@@ -4634,6 +4634,12 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             "final_order_status_raw": snapshot.get("status", ""),
         }
         _append_live_trade_log(done_item)
+        if DISCORD_TRADE_ALERTS_ENABLED:
+            try:
+                discord_send(_live_trade_text(now_local, [done_item]))
+                done_item["discord_sent"] = True
+            except Exception:
+                done_item["discord_sent"] = False
         done.append(done_item)
         state[sig_key] = row_local
         return int(delta)
@@ -5250,6 +5256,8 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
     if done:
         executed_for_discord: List[dict] = []
         for r in done:
+            if bool(r.get("discord_sent", False)):
+                continue
             st = str(r.get("status", "")).strip().lower()
             try:
                 c = int(r.get("count", 0))

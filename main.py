@@ -4038,6 +4038,21 @@ def _open_live_position_contract_signatures(now_local: datetime) -> set:
             out.add(str(sig))
     return out
 
+def _entered_contract_signatures_for_day(date_key: str) -> set:
+    out = set()
+    for r in load_live_trade_log_rows():
+        if str(r.get("date", "")).strip() != str(date_key).strip():
+            continue
+        st = str(r.get("status", "")).strip().lower()
+        if st not in ("submitted", "partial", "partial_filled", "resting"):
+            continue
+        if str(r.get("order_action", "buy")).strip().lower() != "buy":
+            continue
+        sig = f"{r.get('date','')}|{r.get('ticker','')}"
+        if str(sig).strip():
+            out.add(str(sig))
+    return out
+
 def _is_open_position_currently_losing(pos: dict, quotes: Dict[str, Optional[int]]) -> Optional[bool]:
     bet_side = str(pos.get("bet", "")).strip().upper()
     entry_px = _to_float(pos.get("avg_entry_price_cents"))
@@ -4493,6 +4508,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
     current_bot_exposure_dollars = _current_live_bot_exposure_dollars(now_local, state)
     open_position_sigs = _open_live_position_signatures(now_local)
     open_position_contract_sigs = _open_live_position_contract_signatures(now_local)
+    entered_contract_sigs = _entered_contract_signatures_for_day(today_key)
     per_city_side: Dict[Tuple[str, str], int] = {}
     total_orders = 0
     for _, row in state.items():
@@ -4622,9 +4638,44 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
         state[sig_key] = row_local
         return int(delta)
 
-    def _cancel_pending_passive_if_possible(sig_key: str, order_id: str) -> bool:
+    def _log_pending_passive_cancel(sig_key: str, row_local: dict, order_id: str, reason: str) -> None:
+        done_item = {
+            "ts_est": fmt_est(now_local),
+            "date": row_local.get("pending_passive_date", row_local.get("date", "")),
+            "city": row_local.get("pending_passive_city", row_local.get("city", "")),
+            "temp_type": row_local.get("pending_passive_temp_side", row_local.get("temp_side", "")),
+            "ticker": row_local.get("pending_passive_ticker", ""),
+            "bet": row_local.get("pending_passive_bet", ""),
+            "line": row_local.get("pending_passive_line", ""),
+            "edge_pct": "",
+            "units": row_local.get("pending_passive_units", ""),
+            "stake_dollars": row_local.get("pending_passive_stake_dollars", ""),
+            "side": row_local.get("pending_passive_order_action", "buy"),
+            "limit_price_cents": row_local.get("pending_passive_price_cents", ""),
+            "count": 0,
+            "time_in_force": LIVE_PASSIVE_TIME_IN_FORCE,
+            "order_action": str(row_local.get("pending_passive_order_action", "buy")).lower(),
+            "status": "canceled",
+            "error": reason,
+            "fee_dollars": "",
+            "order_id": order_id,
+            "client_order_id": row_local.get("pending_passive_client_order_id", ""),
+            "execution_mode": "passive_cancel",
+            "attempt_count": 1,
+            "passive_attempted": True,
+            "aggressive_attempted": False,
+            "aggressive_used": False,
+            "initial_limit_price_cents": row_local.get("pending_passive_price_cents", ""),
+            "final_order_status_raw": "canceled",
+        }
+        _append_live_trade_log(done_item)
+        done.append(done_item)
+
+    def _cancel_pending_passive_if_possible(sig_key: str, order_id: str, reason: str = "manual_cancel") -> bool:
         canceled, cancel_err = kalshi_cancel_order(order_id)
         if canceled:
+            row_local = state.get(sig_key, {}) or {}
+            _log_pending_passive_cancel(sig_key, row_local, order_id, reason)
             _clear_pending_passive(sig_key)
             return True
         row_local = state.get(sig_key, {}) or {}
@@ -4689,7 +4740,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             if _is_order_closed_status(str(snapshot.get("status", ""))):
                 _clear_pending_passive(sig_key)
             else:
-                _cancel_pending_passive_if_possible(sig_key, pending_order_id)
+                _cancel_pending_passive_if_possible(sig_key, pending_order_id, reason="signal_dropped")
 
     for b in bets:
         if placed >= max(1, LIVE_MAX_ORDERS_PER_SCAN):
@@ -4700,6 +4751,8 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
         sig = _live_order_signature(b)
         contract_sig = _live_contract_signature(b)
         if sig in open_position_sigs or contract_sig in open_position_contract_sigs:
+            continue
+        if contract_sig in entered_contract_sigs:
             continue
         if contract_sig in pending_contract_rows and not any(sig == pending_sig for pending_sig, _ in pending_contract_rows.get(contract_sig, [])):
             continue
@@ -4929,7 +4982,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                         row = state.get(sig, {})
                     else:
                         if edge_pct < POLICY_MIN_NET_EDGE_PCT:
-                            _cancel_pending_passive_if_possible(sig, pending_order_id)
+                            _cancel_pending_passive_if_possible(sig, pending_order_id, reason="edge_below_min")
                             continue
                         current_ask_cents = _quote_ask_for_bet_side(quotes, bet_side)
                         pending_price_cents = int(row.get("pending_passive_price_cents", 0) or 0)
@@ -4938,11 +4991,11 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                             and pending_price_cents > 0
                             and int(current_ask_cents) > int(pending_price_cents) + int(LIVE_PASSIVE_CANCEL_IF_ASK_AWAY_CENTS)
                         ):
-                            _cancel_pending_passive_if_possible(sig, pending_order_id)
+                            _cancel_pending_passive_if_possible(sig, pending_order_id, reason="ask_drift_exceeded")
                             continue
                         requested_count = int(row.get("pending_passive_requested_count", 0) or 0)
                         if desired_passive_count > 0 and requested_count > 0 and int(desired_passive_count) != int(requested_count):
-                            _cancel_pending_passive_if_possible(sig, pending_order_id)
+                            _cancel_pending_passive_if_possible(sig, pending_order_id, reason="desired_size_changed")
                             continue
                         # Conservative resting-order mode: keep exactly one live resting
                         # order on the book while the edge still qualifies. We do not
@@ -8065,6 +8118,7 @@ def debug_live_candidate_funnel_snapshot(
     current_bot_exposure_dollars = _current_live_bot_exposure_dollars(now_local, state)
     open_position_sigs = _open_live_position_signatures(now_local)
     open_position_contract_sigs = _open_live_position_contract_signatures(now_local)
+    entered_contract_sigs = _entered_contract_signatures_for_day(today_key)
     blocked_tickers = _manual_blocked_tickers()
     now_et = now_local.astimezone(LOCAL_TZ)
     hour_et = int(now_et.hour)
@@ -8100,6 +8154,16 @@ def debug_live_candidate_funnel_snapshot(
         contract_sig = _live_contract_signature(b)
         if sig in open_position_sigs or contract_sig in open_position_contract_sigs:
             _add_reason(execution_reason_counts, execution_examples, "open_position_already_held", {
+                "date": b.get("date"),
+                "city": b.get("city"),
+                "temp_type": b.get("temp_type"),
+                "bet": b.get("bet"),
+                "line": b.get("line"),
+                "ticker": b.get("ticker"),
+            })
+            continue
+        if contract_sig in entered_contract_sigs:
+            _add_reason(execution_reason_counts, execution_examples, "contract_already_entered_today", {
                 "date": b.get("date"),
                 "city": b.get("city"),
                 "temp_type": b.get("temp_type"),

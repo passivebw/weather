@@ -4355,9 +4355,11 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             def _submit_limit(limit_price: int, tif: str, mode: str, spread_cents: Optional[int], desired_count: Optional[int] = None) -> dict:
                 count_local = int(desired_count) if desired_count is not None else _compute_contract_count(stake_dollars, int(limit_price))
                 count_local = max(1, min(LIVE_MAX_CONTRACTS_PER_ORDER, int(count_local)))
+                mode_norm = str(mode).strip().lower()
                 tif_norm = sanitize_time_in_force_for_order(
                     tif,
-                    default=("fill_or_kill" if str(mode).strip().lower() == "aggressive" else "good_til_cancelled"),
+                    default=("fill_or_kill" if mode_norm == "aggressive" else "good_til_cancelled"),
+                    allow_resting=(mode_norm == "passive" and LIVE_PASSIVE_ALLOW_RESTING_LIMITS),
                 )
                 payload = {
                     "ticker": ticker,

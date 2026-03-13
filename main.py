@@ -178,6 +178,7 @@ LIVE_ORDER_TIME_IN_FORCE = sanitize_time_in_force_for_order(
 LIVE_ORDER_EXPIRATION_SECONDS = int(os.getenv("LIVE_ORDER_EXPIRATION_SECONDS", "30"))
 LIVE_MAX_CONTRACTS_PER_ORDER = int(os.getenv("LIVE_MAX_CONTRACTS_PER_ORDER", "10"))
 LIVE_MIN_STAKE_DOLLARS = float(os.getenv("LIVE_MIN_STAKE_DOLLARS", "0.5"))
+LIVE_MAX_OPEN_BOT_EXPOSURE_DOLLARS = float(os.getenv("LIVE_MAX_OPEN_BOT_EXPOSURE_DOLLARS", "100.0"))
 LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT = float(os.getenv("LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT", "30.0"))
 LIVE_EDGE_PASSIVE_THEN_AGGR_PCT = float(os.getenv("LIVE_EDGE_PASSIVE_THEN_AGGR_PCT", "12.0"))
 LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT = float(os.getenv("LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT", "50.0"))
@@ -3871,6 +3872,27 @@ def _aggregate_open_live_positions(now_local: datetime) -> List[dict]:
         out.append(p)
     return out
 
+def _current_live_bot_exposure_dollars(now_local: datetime, state: Optional[Dict[str, dict]] = None) -> float:
+    total = 0.0
+    try:
+        open_positions = _aggregate_open_live_positions(now_local)
+    except Exception:
+        open_positions = []
+    for pos in open_positions:
+        avg_entry_cents = float(_to_float(pos.get("avg_entry_price_cents")) or 0.0)
+        open_count = max(0, int(pos.get("open_count", 0) or 0))
+        if avg_entry_cents > 0.0 and open_count > 0:
+            total += (avg_entry_cents * float(open_count)) / 100.0
+    if isinstance(state, dict):
+        for row in state.values():
+            if not isinstance(row, dict):
+                continue
+            pending_order_id = str(row.get("pending_passive_order_id", "") or "").strip()
+            if not pending_order_id:
+                continue
+            total += max(0.0, float(_to_float(row.get("pending_passive_stake_dollars")) or 0.0))
+    return round(float(total), 6)
+
 def _is_open_position_currently_losing(pos: dict, quotes: Dict[str, Optional[int]]) -> Optional[bool]:
     bet_side = str(pos.get("bet", "")).strip().upper()
     entry_px = _to_float(pos.get("avg_entry_price_cents"))
@@ -4301,6 +4323,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
     state = _load_live_trade_state(today_key)
     edge_state = _load_edge_lifecycle_state(today_key)
     edge_entries = edge_state.get("entries", {}) if isinstance(edge_state, dict) else {}
+    current_bot_exposure_dollars = _current_live_bot_exposure_dollars(now_local, state)
     per_city_side: Dict[Tuple[str, str], int] = {}
     total_orders = 0
     for _, row in state.items():
@@ -4543,6 +4566,10 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                 size_mult = clamp(float(LIVE_EARLY_SESSION_SIZE_MULT), 0.05, 1.0)
                 stake_dollars = max(0.0, stake_dollars * size_mult)
                 units = max(0.0, units * size_mult)
+            if (stake_dollars > 0.0) and (
+                float(current_bot_exposure_dollars) + float(stake_dollars) > float(LIVE_MAX_OPEN_BOT_EXPOSURE_DOLLARS)
+            ):
+                continue
 
             def _submit_limit(limit_price: int, tif: str, mode: str, spread_cents: Optional[int], desired_count: Optional[int] = None) -> dict:
                 count_local = int(desired_count) if desired_count is not None else _compute_contract_count(stake_dollars, int(limit_price))
@@ -4844,6 +4871,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                     row["city"] = city_k
                     row["temp_side"] = side_k
                     state[sig] = row
+                    current_bot_exposure_dollars = _current_live_bot_exposure_dollars(now_local, state)
                     final_exec = {
                         **result,
                         "status": "resting",
@@ -4919,6 +4947,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                     "city": city_k,
                     "temp_side": side_k,
                 }
+                current_bot_exposure_dollars = _current_live_bot_exposure_dollars(now_local, state)
                 per_city_side[(city_k, side_k)] = per_city_side.get((city_k, side_k), 0) + 1
                 total_orders += 1
                 placed += 1
@@ -7082,6 +7111,7 @@ def health():
         "live_order_expiration_seconds": LIVE_ORDER_EXPIRATION_SECONDS,
         "live_max_contracts_per_order": LIVE_MAX_CONTRACTS_PER_ORDER,
         "live_min_stake_dollars": LIVE_MIN_STAKE_DOLLARS,
+        "live_max_open_bot_exposure_dollars": LIVE_MAX_OPEN_BOT_EXPOSURE_DOLLARS,
         "live_edge_immediate_aggressive_pct": LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT,
         "live_edge_passive_then_aggr_pct": LIVE_EDGE_PASSIVE_THEN_AGGR_PCT,
         "live_aggressive_override_edge_pct": LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT,
@@ -7806,6 +7836,7 @@ def debug_live_candidate_funnel_snapshot(
     state = _load_live_trade_state(today_key)
     edge_state = _load_edge_lifecycle_state(today_key)
     edge_entries = edge_state.get("entries", {}) if isinstance(edge_state, dict) else {}
+    current_bot_exposure_dollars = _current_live_bot_exposure_dollars(now_local, state)
     blocked_tickers = _manual_blocked_tickers()
     now_et = now_local.astimezone(LOCAL_TZ)
     hour_et = int(now_et.hour)
@@ -7898,6 +7929,19 @@ def debug_live_candidate_funnel_snapshot(
             if LIVE_STABILITY_REQUIRE_CHANGE_MID and (not bool(sig_entry.get("fresh_trigger", False))):
                 _add_reason(execution_reason_counts, execution_examples, "stability_gate_requires_fresh_trigger", base_payload)
                 continue
+        stake_dollars, _kelly_units = _compute_stake_dollars_for_bet(b)
+        if early_session and ((not LIVE_EARLY_SESSION_APPLY_TO_HIGH_ONLY) or (side_k == "high")):
+            size_mult = clamp(float(LIVE_EARLY_SESSION_SIZE_MULT), 0.05, 1.0)
+            stake_dollars = max(0.0, stake_dollars * size_mult)
+        if (stake_dollars > 0.0) and (
+            float(current_bot_exposure_dollars) + float(stake_dollars) > float(LIVE_MAX_OPEN_BOT_EXPOSURE_DOLLARS)
+        ):
+            _add_reason(execution_reason_counts, execution_examples, "max_open_bot_exposure_reached", {
+                **base_payload,
+                "stake_dollars": round(stake_dollars, 2),
+                "current_bot_exposure_dollars": round(current_bot_exposure_dollars, 2),
+            })
+            continue
         eligible_now.append(base_payload)
 
     top_board_preview = []
@@ -7927,6 +7971,8 @@ def debug_live_candidate_funnel_snapshot(
             "policy_min_net_edge_pct": POLICY_MIN_NET_EDGE_PCT,
             "scan_capacity_remaining": scan_capacity_remaining,
             "orders_placed_today": total_orders,
+            "current_bot_exposure_dollars": round(current_bot_exposure_dollars, 2),
+            "live_max_open_bot_exposure_dollars": float(LIVE_MAX_OPEN_BOT_EXPOSURE_DOLLARS),
         },
         "counts": {
             "board_rows": len(board_rows),

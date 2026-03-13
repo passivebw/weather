@@ -5202,6 +5202,9 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                 c = int(r.get("count", 0))
             except Exception:
                 c = 0
+            if st == "resting":
+                executed_for_discord.append(r)
+                continue
             if st in ("submitted", "partial", "partial_filled") and c > 0:
                 executed_for_discord.append(r)
         if executed_for_discord:

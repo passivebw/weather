@@ -1981,6 +1981,100 @@ def build_city_bucket_comparison(
         "buckets": rows,
     }
 
+def debug_city_bucket_comparison(
+    city: str,
+    now_local: datetime,
+    temp_side: str = "high",
+    market_day: str = "auto",
+    force_refresh: bool = False,
+) -> dict:
+    resolved_city = resolve_city_name(city)
+    if resolved_city is None:
+        return {"ok": False, "error": f"unknown city: {city}"}
+
+    side = normalize_temp_side(temp_side)
+    grouped = refresh_markets_cache(force=force_refresh)
+    city_markets = [m for m in grouped.get(resolved_city, []) if normalize_temp_side(getattr(m, "temp_side", "high")) == side]
+    selected_markets, selected_date, available_dates = select_markets_for_day(
+        city_markets,
+        now_local,
+        market_day,
+        city=resolved_city,
+    )
+    consensus = build_expert_consensus(resolved_city, now_local, temp_side=side)
+    comparison = None
+    if consensus is not None and selected_markets:
+        comparison = build_city_bucket_comparison(
+            resolved_city,
+            selected_markets,
+            now_local,
+            temp_side=side,
+            consensus_override=consensus,
+        )
+
+    market_debug: List[dict] = []
+    parsed_bucket_count = 0
+    usable_quote_count = 0
+    for m in selected_markets[:50]:
+        bucket = parse_bucket_from_title(m.title)
+        bucket_ok = bucket is not None
+        if bucket_ok:
+            parsed_bucket_count += 1
+        ob = kalshi_get_orderbook(m.ticker)
+        yes_bid, yes_ask, top_size = best_bid_and_ask_from_orderbook(ob)
+        quote_ok = (yes_bid is not None and yes_ask is not None and yes_ask >= yes_bid)
+        if quote_ok:
+            usable_quote_count += 1
+        market_debug.append({
+            "ticker": m.ticker,
+            "title": m.title,
+            "market_date_iso": getattr(m, "market_date_iso", "") or parse_market_date_iso_from_ticker(m.ticker) or "",
+            "bucket_ok": bucket_ok,
+            "bucket": None if bucket is None else {"lo": bucket[0], "hi": bucket[1]},
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "top_size": top_size,
+            "quote_ok": quote_ok,
+        })
+
+    failure_reason = ""
+    if consensus is None:
+        failure_reason = "consensus_unavailable"
+    elif not city_markets:
+        failure_reason = "no_city_markets"
+    elif not selected_markets:
+        failure_reason = "no_markets_for_requested_day"
+    elif parsed_bucket_count == 0:
+        failure_reason = "no_parsed_buckets"
+    elif usable_quote_count == 0:
+        failure_reason = "no_usable_two_sided_quotes"
+    elif comparison is None or not comparison.get("buckets"):
+        failure_reason = "comparison_builder_returned_empty"
+
+    return {
+        "ok": True,
+        "as_of_est": fmt_est(now_local),
+        "city": resolved_city,
+        "temp_side": side,
+        "market_day_requested": normalize_market_day(market_day),
+        "selected_market_date": selected_date,
+        "available_market_dates": available_dates,
+        "counts": {
+            "city_markets": len(city_markets),
+            "selected_markets": len(selected_markets),
+            "parsed_bucket_count": parsed_bucket_count,
+            "usable_quote_count": usable_quote_count,
+            "comparison_bucket_count": int((comparison or {}).get("bucket_count", 0) or 0),
+        },
+        "failure_reason": failure_reason,
+        "consensus": None if consensus is None else {
+            "mu": consensus.get("mu"),
+            "sigma": consensus.get("sigma"),
+            "sources": consensus.get("sources", []),
+        },
+        "market_debug": market_debug,
+    }
+
 def build_city_odds_discrepancy(city: str, markets: List[Market], now_local: datetime, temp_side: str = "high") -> Optional[dict]:
     side = normalize_temp_side(temp_side)
     comparison = build_city_bucket_comparison(city, markets, now_local, temp_side=side)
@@ -7241,6 +7335,22 @@ def debug_live_candidate_funnel(market_day: str = "auto", force_refresh: bool = 
     now_local = datetime.now(tz=LOCAL_TZ)
     return debug_live_candidate_funnel_snapshot(
         now_local,
+        market_day=market_day,
+        force_refresh=force_refresh,
+    )
+
+@app.get("/debug/city-comparison")
+def debug_city_comparison(
+    city: str,
+    temp_side: str = "high",
+    market_day: str = "auto",
+    force_refresh: bool = False,
+):
+    now_local = datetime.now(tz=LOCAL_TZ)
+    return debug_city_bucket_comparison(
+        city=city,
+        now_local=now_local,
+        temp_side=temp_side,
         market_day=market_day,
         force_refresh=force_refresh,
     )

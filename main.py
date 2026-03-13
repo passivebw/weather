@@ -188,6 +188,7 @@ LIVE_PASSIVE_ALLOW_RESTING_LIMITS = env_bool("LIVE_PASSIVE_ALLOW_RESTING_LIMITS"
 LIVE_PASSIVE_RESCAN_MODE_ENABLED = env_bool("LIVE_PASSIVE_RESCAN_MODE_ENABLED", default=True)
 LIVE_PASSIVE_RESCAN_SECONDS = int(os.getenv("LIVE_PASSIVE_RESCAN_SECONDS", "60"))
 LIVE_PASSIVE_ONE_TICK_FROM_ASK = env_bool("LIVE_PASSIVE_ONE_TICK_FROM_ASK", default=True)
+LIVE_PASSIVE_CANCEL_IF_ASK_AWAY_CENTS = int(os.getenv("LIVE_PASSIVE_CANCEL_IF_ASK_AWAY_CENTS", "10"))
 LIVE_PASSIVE_TIME_IN_FORCE = sanitize_time_in_force_for_order(
     os.getenv("LIVE_PASSIVE_TIME_IN_FORCE", "fill_or_kill"),
     default=("good_till_canceled" if LIVE_PASSIVE_ALLOW_RESTING_LIMITS else LIVE_ORDER_TIME_IN_FORCE),
@@ -3659,6 +3660,14 @@ def track_edge_lifecycles(now_local: datetime, board_payload: dict) -> dict:
 def _live_order_signature(bet: dict) -> str:
     return f"{bet.get('date','')}|{bet.get('ticker','')}|{bet.get('bet','')}"
 
+def _live_contract_signature(bet: dict) -> str:
+    return f"{bet.get('date','')}|{bet.get('ticker','')}"
+
+def _state_row_contract_signature(row: dict) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return f"{row.get('pending_passive_date', row.get('date', ''))}|{row.get('pending_passive_ticker', row.get('ticker', ''))}"
+
 def _bet_side_and_price_field(bet_side: str) -> Tuple[Optional[str], Optional[str]]:
     s = str(bet_side or "").strip().upper()
     if s == "BUY YES":
@@ -3694,6 +3703,14 @@ def _compute_limit_price_cents(quotes: Dict[str, Optional[int]], bet_side: str, 
         if no_ask is None:
             return None
         return int(clamp(int(no_ask) + pen, 1, 99))
+    return None
+
+def _quote_ask_for_bet_side(quotes: Dict[str, Optional[int]], bet_side: str) -> Optional[int]:
+    side_norm = str(bet_side or "").strip().upper()
+    if side_norm == "BUY YES":
+        return quotes.get("yes_ask")
+    if side_norm == "BUY NO":
+        return quotes.get("no_ask")
     return None
 
 def _compute_passive_limit_price_cents(quotes: Dict[str, Optional[int]], bet_side: str) -> Optional[int]:
@@ -3921,6 +3938,37 @@ def _open_live_position_signatures(now_local: datetime) -> set:
         market_date = parse_market_date_iso_from_ticker(ticker) or ""
         bet = "BUY YES" if qty > 0 else "BUY NO"
         sig = f"{market_date}|{ticker}|{bet}"
+        if str(sig).strip():
+            out.add(str(sig))
+    return out
+
+def _open_live_position_contract_signatures(now_local: datetime) -> set:
+    out = set()
+    try:
+        open_positions = _aggregate_open_live_positions(now_local)
+    except Exception:
+        open_positions = []
+    for pos in open_positions:
+        sig = f"{pos.get('date','')}|{pos.get('ticker','')}"
+        if str(sig).strip():
+            out.add(str(sig))
+    try:
+        exchange_positions = kalshi_get_market_positions(limit=500, max_pages=5)
+    except Exception:
+        exchange_positions = []
+    for pos in exchange_positions:
+        ticker = str(pos.get("ticker", "") or "").strip()
+        if not ticker:
+            continue
+        qty = _kalshi_int_from_fp(
+            pos.get("position")
+            if pos.get("position") is not None else
+            pos.get("position_fp")
+        )
+        if qty == 0:
+            continue
+        market_date = parse_market_date_iso_from_ticker(ticker) or ""
+        sig = f"{market_date}|{ticker}"
         if str(sig).strip():
             out.add(str(sig))
     return out
@@ -4379,6 +4427,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
     edge_entries = edge_state.get("entries", {}) if isinstance(edge_state, dict) else {}
     current_bot_exposure_dollars = _current_live_bot_exposure_dollars(now_local, state)
     open_position_sigs = _open_live_position_signatures(now_local)
+    open_position_contract_sigs = _open_live_position_contract_signatures(now_local)
     per_city_side: Dict[Tuple[str, str], int] = {}
     total_orders = 0
     for _, row in state.items():
@@ -4399,6 +4448,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
         and (hour_et < LIVE_EARLY_SESSION_END_HOUR_ET)
     )
     active_sigs = {_live_order_signature(b) for b in bets if _live_order_signature(b)}
+    active_contract_sigs = {_live_contract_signature(b) for b in bets if _live_contract_signature(b)}
     active_order_keys: set = set()
     if LIVE_PASSIVE_ALLOW_RESTING_LIMITS and LIVE_PASSIVE_RESCAN_MODE_ENABLED:
         for b in bets:
@@ -4406,8 +4456,8 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             bet_side_k = str(b.get("bet", "")).strip().upper()
             order_side_k, _ = _bet_side_and_price_field(bet_side_k)
             if ticker_k and order_side_k:
-                active_order_keys.add((ticker_k, str(order_side_k).lower(), "buy"))
-    exchange_resting_by_key: Dict[Tuple[str, str, str], List[dict]] = {}
+                active_order_keys.add((ticker_k, "buy"))
+    exchange_resting_by_key: Dict[Tuple[str, str], List[dict]] = {}
     if LIVE_PASSIVE_ALLOW_RESTING_LIMITS and LIVE_PASSIVE_RESCAN_MODE_ENABLED:
         try:
             for order in kalshi_get_orders(status="resting", limit=200, max_pages=5):
@@ -4419,9 +4469,16 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                     continue
                 if not client_oid.startswith("bot-"):
                     continue
-                exchange_resting_by_key.setdefault((ticker_k, side_k, action_k), []).append(order)
+                exchange_resting_by_key.setdefault((ticker_k, action_k), []).append(order)
         except Exception:
             exchange_resting_by_key = {}
+
+    pending_contract_rows: Dict[str, List[Tuple[str, dict]]] = {}
+    for sig_key, row_local in list(state.items()):
+        contract_sig = _state_row_contract_signature(row_local)
+        pending_order_id = str((row_local or {}).get("pending_passive_order_id", "")).strip()
+        if contract_sig and pending_order_id:
+            pending_contract_rows.setdefault(contract_sig, []).append((sig_key, row_local))
 
     def _clear_pending_passive(sig_key: str) -> None:
         if sig_key not in state:
@@ -4559,7 +4616,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
         pending_order_id = str((row_local or {}).get("pending_passive_order_id", "")).strip()
         if not pending_order_id:
             continue
-        if sig_key in active_sigs:
+        if _state_row_contract_signature(row_local) in active_contract_sigs:
             continue
         snapshot = kalshi_get_order_snapshot(pending_order_id)
         if bool(snapshot.get("ok")):
@@ -4576,7 +4633,10 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             break
 
         sig = _live_order_signature(b)
-        if sig in open_position_sigs:
+        contract_sig = _live_contract_signature(b)
+        if sig in open_position_sigs or contract_sig in open_position_contract_sigs:
+            continue
+        if contract_sig in pending_contract_rows and not any(sig == pending_sig for pending_sig, _ in pending_contract_rows.get(contract_sig, [])):
             continue
         row = state.get(sig, {})
         already = int(row.get("count", 0))
@@ -4722,10 +4782,31 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                 if desired_passive_price is not None:
                     desired_passive_count = _compute_contract_count(stake_dollars, int(desired_passive_price))
 
-            exchange_key = (ticker, str(order_side).lower(), "buy")
+            exchange_key = (ticker, "buy")
             exchange_resting = list(exchange_resting_by_key.get(exchange_key, []) or [])
             pending_order_id = str(row.get("pending_passive_order_id", "")).strip()
             if exchange_resting:
+                conflicting_orders: List[dict] = []
+                same_side_orders: List[dict] = []
+                for order in exchange_resting:
+                    if str(order.get("side", "") or "").strip().lower() == str(order_side).lower():
+                        same_side_orders.append(order)
+                    else:
+                        conflicting_orders.append(order)
+                cancel_failed = False
+                for extra in conflicting_orders:
+                    extra_id = str(extra.get("order_id", "") or "").strip()
+                    if not extra_id:
+                        continue
+                    canceled, cancel_err = kalshi_cancel_order(extra_id)
+                    if not canceled:
+                        row["pending_passive_cancel_error"] = str(cancel_err or "cancel conflicting contract order failed")
+                        state[sig] = row
+                        cancel_failed = True
+                        break
+                if cancel_failed:
+                    continue
+
                 def _resting_rank(order_obj: dict) -> Tuple[int, int, str]:
                     order_id_local = str(order_obj.get("order_id", "") or "").strip()
                     price_local = _kalshi_price_cents_from_order(order_obj, order_side)
@@ -4734,9 +4815,9 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                     created_local = str(order_obj.get("created_time", "") or order_obj.get("created_ts", "") or "")
                     return (local_match, exact_price, created_local)
 
-                exchange_resting.sort(key=_resting_rank, reverse=True)
-                survivor = exchange_resting[0]
-                extras = exchange_resting[1:]
+                same_side_orders.sort(key=_resting_rank, reverse=True)
+                survivor = same_side_orders[0] if same_side_orders else None
+                extras = same_side_orders[1:] if same_side_orders else []
                 cancel_failed = False
                 for extra in extras:
                     extra_id = str(extra.get("order_id", "") or "").strip()
@@ -4750,21 +4831,24 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                         break
                 if cancel_failed:
                     continue
-                exchange_resting_by_key[exchange_key] = [survivor]
-                _adopt_exchange_resting(
-                    sig,
-                    row,
-                    survivor,
-                    city_k,
-                    side_k,
-                    bet_side,
-                    str(b.get("line", "") or ""),
-                    str(b.get("date", "") or ""),
-                    units,
-                    stake_dollars,
-                )
-                row = state.get(sig, row) or {}
-                pending_order_id = str(row.get("pending_passive_order_id", "")).strip()
+                if survivor is not None:
+                    exchange_resting_by_key[exchange_key] = [survivor]
+                    _adopt_exchange_resting(
+                        sig,
+                        row,
+                        survivor,
+                        city_k,
+                        side_k,
+                        bet_side,
+                        str(b.get("line", "") or ""),
+                        str(b.get("date", "") or ""),
+                        units,
+                        stake_dollars,
+                    )
+                    row = state.get(sig, row) or {}
+                    pending_order_id = str(row.get("pending_passive_order_id", "")).strip()
+                else:
+                    exchange_resting_by_key.pop(exchange_key, None)
 
             if pending_order_id:
                 snapshot = kalshi_get_order_snapshot(pending_order_id)
@@ -4780,6 +4864,19 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                         row = state.get(sig, {})
                     else:
                         if edge_pct < POLICY_MIN_NET_EDGE_PCT:
+                            _cancel_pending_passive_if_possible(sig, pending_order_id)
+                            continue
+                        current_ask_cents = _quote_ask_for_bet_side(quotes, bet_side)
+                        pending_price_cents = int(row.get("pending_passive_price_cents", 0) or 0)
+                        if (
+                            current_ask_cents is not None
+                            and pending_price_cents > 0
+                            and int(current_ask_cents) > int(pending_price_cents) + int(LIVE_PASSIVE_CANCEL_IF_ASK_AWAY_CENTS)
+                        ):
+                            _cancel_pending_passive_if_possible(sig, pending_order_id)
+                            continue
+                        requested_count = int(row.get("pending_passive_requested_count", 0) or 0)
+                        if desired_passive_count > 0 and requested_count > 0 and int(desired_passive_count) != int(requested_count):
                             _cancel_pending_passive_if_possible(sig, pending_order_id)
                             continue
                         # Conservative resting-order mode: keep exactly one live resting
@@ -7176,6 +7273,7 @@ def health():
         "live_passive_rescan_mode_enabled": LIVE_PASSIVE_RESCAN_MODE_ENABLED,
         "live_passive_rescan_seconds": LIVE_PASSIVE_RESCAN_SECONDS,
         "live_passive_one_tick_from_ask": LIVE_PASSIVE_ONE_TICK_FROM_ASK,
+        "live_passive_cancel_if_ask_away_cents": LIVE_PASSIVE_CANCEL_IF_ASK_AWAY_CENTS,
         "live_passive_time_in_force": LIVE_PASSIVE_TIME_IN_FORCE,
         "live_always_passive_first": LIVE_ALWAYS_PASSIVE_FIRST,
         "live_passive_reprice_step_cents": LIVE_PASSIVE_REPRICE_STEP_CENTS,
@@ -7893,6 +7991,7 @@ def debug_live_candidate_funnel_snapshot(
     edge_entries = edge_state.get("entries", {}) if isinstance(edge_state, dict) else {}
     current_bot_exposure_dollars = _current_live_bot_exposure_dollars(now_local, state)
     open_position_sigs = _open_live_position_signatures(now_local)
+    open_position_contract_sigs = _open_live_position_contract_signatures(now_local)
     blocked_tickers = _manual_blocked_tickers()
     now_et = now_local.astimezone(LOCAL_TZ)
     hour_et = int(now_et.hour)
@@ -7916,10 +8015,17 @@ def debug_live_candidate_funnel_snapshot(
     eligible_now: List[dict] = []
     pending_resting: List[dict] = []
     scan_capacity_remaining = max(0, max(1, LIVE_MAX_ORDERS_PER_SCAN) - min(total_orders, max(1, LIVE_MAX_ORDERS_PER_SCAN)))
+    pending_contract_sigs = set()
+    for _, row in state.items():
+        contract_sig = _state_row_contract_signature(row)
+        pending_order_id = str((row or {}).get("pending_passive_order_id", "")).strip()
+        if contract_sig and pending_order_id:
+            pending_contract_sigs.add(contract_sig)
 
     for b in policy_bets:
         sig = _live_order_signature(b)
-        if sig in open_position_sigs:
+        contract_sig = _live_contract_signature(b)
+        if sig in open_position_sigs or contract_sig in open_position_contract_sigs:
             _add_reason(execution_reason_counts, execution_examples, "open_position_already_held", {
                 "date": b.get("date"),
                 "city": b.get("city"),
@@ -7952,16 +8058,17 @@ def debug_live_candidate_funnel_snapshot(
             "scan_count": sig_scans,
         }
 
-        pending_order_id = str(row.get("pending_passive_order_id", "")).strip()
-        if pending_order_id:
-            pending_resting.append({
-                **base_payload,
-                "pending_passive_order_id": pending_order_id,
-                "pending_passive_price_cents": row.get("pending_passive_price_cents"),
-                "pending_passive_requested_count": row.get("pending_passive_requested_count"),
-            })
+        if contract_sig in pending_contract_sigs:
+            if pending_order_id := str(row.get("pending_passive_order_id", "")).strip():
+                pending_resting.append({
+                    **base_payload,
+                    "pending_passive_order_id": pending_order_id,
+                    "pending_passive_price_cents": row.get("pending_passive_price_cents"),
+                    "pending_passive_requested_count": row.get("pending_passive_requested_count"),
+                })
             _add_reason(execution_reason_counts, execution_examples, "existing_resting_passive_order", base_payload)
             continue
+
         if total_orders >= max(1, LIVE_MAX_ORDERS_PER_DAY):
             _add_reason(execution_reason_counts, execution_examples, "max_orders_per_day_reached", base_payload)
             continue

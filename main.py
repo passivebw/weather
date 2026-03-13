@@ -3891,6 +3891,42 @@ def kalshi_get_order_fee_dollars(order_id: str) -> float:
         pass
     return 0.0
 
+def kalshi_get_order_snapshot(order_id: str) -> dict:
+    oid = str(order_id or "").strip()
+    if not oid:
+        return {
+            "ok": False,
+            "order_id": "",
+            "status": "",
+            "fill_count": 0,
+            "fee_dollars": 0.0,
+            "raw": {},
+            "error": "missing order_id",
+        }
+    try:
+        resp = kalshi_get(f"/portfolio/orders/{oid}", timeout=20, max_retries=2)
+        status, fill_count = _response_order_meta(resp)
+        fee_dollars = _extract_fee_dollars_from_any_payload(resp)
+        return {
+            "ok": True,
+            "order_id": oid,
+            "status": status,
+            "fill_count": int(max(0, fill_count)),
+            "fee_dollars": float(max(0.0, fee_dollars)),
+            "raw": resp,
+            "error": "",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "order_id": oid,
+            "status": "",
+            "fill_count": 0,
+            "fee_dollars": 0.0,
+            "raw": {},
+            "error": str(e),
+        }
+
 def _is_order_closed_status(status: str) -> bool:
     s = str(status or "").strip().lower()
     return s in ("executed", "filled", "canceled", "cancelled", "rejected", "expired")
@@ -4008,6 +4044,98 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
         and (hour_et >= LIVE_EARLY_SESSION_START_HOUR_ET)
         and (hour_et < LIVE_EARLY_SESSION_END_HOUR_ET)
     )
+    active_sigs = {_live_order_signature(b) for b in bets if _live_order_signature(b)}
+
+    def _clear_pending_passive(sig_key: str) -> None:
+        if sig_key not in state:
+            return
+        row_local = state.get(sig_key, {}) or {}
+        for k in (
+            "pending_passive_order_id",
+            "pending_passive_client_order_id",
+            "pending_passive_price_cents",
+            "pending_passive_requested_count",
+            "pending_passive_reported_fill_count",
+            "pending_passive_fee_dollars",
+            "pending_passive_created_ts_epoch",
+            "pending_passive_bet",
+            "pending_passive_line",
+            "pending_passive_ticker",
+            "pending_passive_date",
+            "pending_passive_city",
+            "pending_passive_temp_side",
+            "pending_passive_units",
+            "pending_passive_stake_dollars",
+            "pending_passive_order_action",
+        ):
+            row_local.pop(k, None)
+        state[sig_key] = row_local
+
+    def _record_pending_fill(sig_key: str, row_local: dict, snapshot: dict) -> int:
+        reported = int(row_local.get("pending_passive_reported_fill_count", 0) or 0)
+        fill_count = int(snapshot.get("fill_count", 0) or 0)
+        delta = max(0, fill_count - reported)
+        if delta <= 0:
+            return 0
+        fee_total = float(snapshot.get("fee_dollars", 0.0) or 0.0)
+        prior_fee = float(row_local.get("pending_passive_fee_dollars", 0.0) or 0.0)
+        fee_delta = max(0.0, fee_total - prior_fee)
+        row_local["pending_passive_reported_fill_count"] = int(fill_count)
+        row_local["pending_passive_fee_dollars"] = float(fee_total)
+        count_before = int(row_local.get("count", 0) or 0)
+        if fill_count > 0 and count_before < max(1, LIVE_MAX_ORDERS_PER_MARKET_PER_DAY):
+            row_local["count"] = count_before + 1
+        city_local = str(row_local.get("city", row_local.get("pending_passive_city", ""))).strip()
+        side_local = normalize_temp_side(str(row_local.get("temp_side", row_local.get("pending_passive_temp_side", "high"))))
+        if city_local:
+            per_city_side[(city_local, side_local)] = per_city_side.get((city_local, side_local), 0) + 1
+        done_item = {
+            "ts_est": fmt_est(now_local),
+            "date": row_local.get("pending_passive_date", ""),
+            "city": row_local.get("pending_passive_city", city_local),
+            "temp_type": row_local.get("pending_passive_temp_side", side_local),
+            "ticker": row_local.get("pending_passive_ticker", ""),
+            "bet": row_local.get("pending_passive_bet", ""),
+            "line": row_local.get("pending_passive_line", ""),
+            "edge_pct": "",
+            "units": row_local.get("pending_passive_units", ""),
+            "stake_dollars": row_local.get("pending_passive_stake_dollars", ""),
+            "side": row_local.get("pending_passive_order_action", "buy"),
+            "limit_price_cents": row_local.get("pending_passive_price_cents", ""),
+            "count": int(delta),
+            "time_in_force": LIVE_PASSIVE_TIME_IN_FORCE,
+            "order_action": str(row_local.get("pending_passive_order_action", "buy")).lower(),
+            "status": "submitted" if _is_order_closed_status(str(snapshot.get("status", ""))) else "partial_filled",
+            "error": "",
+            "fee_dollars": round(float(fee_delta), 6),
+            "order_id": snapshot.get("order_id", ""),
+            "client_order_id": row_local.get("pending_passive_client_order_id", ""),
+            "execution_mode": "passive_resting_fill",
+            "attempt_count": 1,
+            "passive_attempted": True,
+            "aggressive_attempted": False,
+            "aggressive_used": False,
+            "initial_limit_price_cents": row_local.get("pending_passive_price_cents", ""),
+            "final_order_status_raw": snapshot.get("status", ""),
+        }
+        _append_live_trade_log(done_item)
+        done.append(done_item)
+        state[sig_key] = row_local
+        return int(delta)
+
+    for sig_key, row_local in list(state.items()):
+        pending_order_id = str((row_local or {}).get("pending_passive_order_id", "")).strip()
+        if not pending_order_id:
+            continue
+        if sig_key in active_sigs:
+            continue
+        snapshot = kalshi_get_order_snapshot(pending_order_id)
+        if bool(snapshot.get("ok")):
+            _record_pending_fill(sig_key, row_local, snapshot)
+            if not _is_order_closed_status(str(snapshot.get("status", ""))):
+                kalshi_cancel_order(pending_order_id)
+        _clear_pending_passive(sig_key)
+
     for b in bets:
         if placed >= max(1, LIVE_MAX_ORDERS_PER_SCAN):
             break
@@ -4144,15 +4272,43 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             passive_wait_s = LIVE_PASSIVE_WAIT_SECONDS_MID if (is_high or is_mid) else LIVE_PASSIVE_WAIT_SECONDS_LOW
             passive_steps = LIVE_PASSIVE_REPRICE_STEPS_MID if (is_high or is_mid) else LIVE_PASSIVE_REPRICE_STEPS_LOW
 
-            if LIVE_PASSIVE_RESCAN_MODE_ENABLED:
+            pending_order_id = str(row.get("pending_passive_order_id", "")).strip()
+            if pending_order_id:
+                snapshot = kalshi_get_order_snapshot(pending_order_id)
+                if bool(snapshot.get("ok")):
+                    _record_pending_fill(sig, row, snapshot)
+                    row = state.get(sig, row)
+                    already = int(row.get("count", 0))
+                    if already >= max(1, LIVE_MAX_ORDERS_PER_MARKET_PER_DAY):
+                        _clear_pending_passive(sig)
+                        continue
+                    if _is_order_closed_status(str(snapshot.get("status", ""))):
+                        _clear_pending_passive(sig)
+                        row = state.get(sig, {})
+                    else:
+                        desired_passive_price = _compute_maker_one_tick_limit_price_cents(quotes, bet_side, LIVE_ORDER_FILL_MODE) if LIVE_PASSIVE_ONE_TICK_FROM_ASK else _compute_repriced_passive_limit_price_cents(quotes, bet_side, 0, LIVE_ORDER_FILL_MODE)
+                        desired_count = _compute_contract_count(stake_dollars, int(desired_passive_price)) if desired_passive_price is not None else 0
+                        current_price = int(row.get("pending_passive_price_cents", 0) or 0)
+                        current_count = int(row.get("pending_passive_requested_count", 0) or 0)
+                        if edge_pct < POLICY_MIN_NET_EDGE_PCT:
+                            kalshi_cancel_order(pending_order_id)
+                            _clear_pending_passive(sig)
+                            continue
+                        if desired_passive_price is not None and int(desired_passive_price) == current_price and int(desired_count) == current_count:
+                            continue
+                        kalshi_cancel_order(pending_order_id)
+                        _clear_pending_passive(sig)
+                else:
+                    _clear_pending_passive(sig)
+
+            if LIVE_PASSIVE_RESCAN_MODE_ENABLED and (not is_aggressive_override):
                 if LIVE_PASSIVE_ONE_TICK_FROM_ASK:
                     p0 = _compute_maker_one_tick_limit_price_cents(quotes, bet_side, LIVE_ORDER_FILL_MODE)
                 else:
                     p0 = _compute_repriced_passive_limit_price_cents(quotes, bet_side, 0, LIVE_ORDER_FILL_MODE)
                 if p0 is None:
                     continue
-                rescan_wait_s = max(1, int(LIVE_PASSIVE_RESCAN_SECONDS))
-                _append_attempt("passive", int(p0), LIVE_PASSIVE_TIME_IN_FORCE, rescan_wait_s, 0)
+                _append_attempt("passive", int(p0), LIVE_PASSIVE_TIME_IN_FORCE, 0, 0)
             elif LIVE_ALWAYS_PASSIVE_FIRST or is_mid or (not is_high):
                 p0 = _compute_repriced_passive_limit_price_cents(quotes, bet_side, 0, LIVE_ORDER_FILL_MODE)
                 if p0 is None:
@@ -4248,6 +4404,41 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                 got = int(result.get("fill_count", 0))
                 total_filled_count += got
                 remaining_count = max(0, int(target_count) - int(total_filled_count))
+                if (
+                    str(a.get("kind", "")).strip().lower() == "passive"
+                    and LIVE_PASSIVE_ALLOW_RESTING_LIMITS
+                    and LIVE_PASSIVE_RESCAN_MODE_ENABLED
+                    and bool(result.get("order_id"))
+                    and (not _is_order_closed_status(str(result.get("order_status_raw", ""))))
+                    and remaining_count > 0
+                ):
+                    row = state.get(sig, {}) or {}
+                    row["pending_passive_order_id"] = str(result.get("order_id", "") or "")
+                    row["pending_passive_client_order_id"] = str(result.get("client_order_id", "") or "")
+                    row["pending_passive_price_cents"] = int(result.get("limit_price_cents", 0) or 0)
+                    row["pending_passive_requested_count"] = int(result.get("count", 0) or 0)
+                    row["pending_passive_reported_fill_count"] = int(result.get("fill_count", 0) or 0)
+                    row["pending_passive_fee_dollars"] = float(result.get("fee_dollars", 0.0) or 0.0)
+                    row["pending_passive_created_ts_epoch"] = float(now_local.timestamp())
+                    row["pending_passive_bet"] = bet_side
+                    row["pending_passive_line"] = str(b.get("line", "") or "")
+                    row["pending_passive_ticker"] = ticker
+                    row["pending_passive_date"] = str(b.get("date", "") or "")
+                    row["pending_passive_city"] = city_k
+                    row["pending_passive_temp_side"] = side_k
+                    row["pending_passive_units"] = units
+                    row["pending_passive_stake_dollars"] = round(stake_dollars, 2)
+                    row["pending_passive_order_action"] = str(result.get("order_action", "buy")).lower()
+                    row["city"] = city_k
+                    row["temp_side"] = side_k
+                    state[sig] = row
+                    final_exec = {
+                        **result,
+                        "status": "resting",
+                        "filled": total_filled_count > 0,
+                        "filled_all": False,
+                    }
+                    break
                 if remaining_count <= 0:
                     break
                 wait_s = int(a.get("wait_s", 0))

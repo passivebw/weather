@@ -52,11 +52,11 @@ def normalize_time_in_force(tif: str, *, default: str = "fill_or_kill") -> str:
         "fill_or_kill": "fill_or_kill",
         "ioc": "immediate_or_cancel",
         "immediate_or_cancel": "immediate_or_cancel",
-        "gtc": "good_til_cancelled",
-        "good_til_cancelled": "good_til_cancelled",
-        "good_till_cancelled": "good_til_cancelled",
-        "good_til_canceled": "good_til_cancelled",
-        "good_till_canceled": "good_til_cancelled",
+        "gtc": "good_till_canceled",
+        "good_til_cancelled": "good_till_canceled",
+        "good_till_cancelled": "good_till_canceled",
+        "good_til_canceled": "good_till_canceled",
+        "good_till_canceled": "good_till_canceled",
         "gtd": "good_til_date",
         "good_til_date": "good_til_date",
         "good_till_date": "good_til_date",
@@ -74,7 +74,7 @@ def sanitize_time_in_force_for_order(
     """
     allowed = {"fill_or_kill", "immediate_or_cancel"}
     if allow_resting:
-        allowed.update({"good_til_cancelled", "good_til_date"})
+        allowed.update({"good_till_canceled", "good_til_date"})
     safe_default = normalize_time_in_force(default, default="fill_or_kill")
     if safe_default not in allowed:
         safe_default = "fill_or_kill"
@@ -189,7 +189,7 @@ LIVE_PASSIVE_RESCAN_SECONDS = int(os.getenv("LIVE_PASSIVE_RESCAN_SECONDS", "60")
 LIVE_PASSIVE_ONE_TICK_FROM_ASK = env_bool("LIVE_PASSIVE_ONE_TICK_FROM_ASK", default=True)
 LIVE_PASSIVE_TIME_IN_FORCE = sanitize_time_in_force_for_order(
     os.getenv("LIVE_PASSIVE_TIME_IN_FORCE", "fill_or_kill"),
-    default=("good_til_cancelled" if LIVE_PASSIVE_ALLOW_RESTING_LIMITS else LIVE_ORDER_TIME_IN_FORCE),
+    default=("good_till_canceled" if LIVE_PASSIVE_ALLOW_RESTING_LIMITS else LIVE_ORDER_TIME_IN_FORCE),
     allow_resting=LIVE_PASSIVE_ALLOW_RESTING_LIMITS,
 )
 LIVE_PASSIVE_REPRICE_STEP_CENTS = int(os.getenv("LIVE_PASSIVE_REPRICE_STEP_CENTS", "1"))
@@ -4358,7 +4358,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                 mode_norm = str(mode).strip().lower()
                 tif_norm = sanitize_time_in_force_for_order(
                     tif,
-                    default=("fill_or_kill" if mode_norm == "aggressive" else "good_til_cancelled"),
+                    default=("fill_or_kill" if mode_norm == "aggressive" else "good_till_canceled"),
                     allow_resting=(mode_norm == "passive" and LIVE_PASSIVE_ALLOW_RESTING_LIMITS),
                 )
                 payload = {
@@ -4963,7 +4963,7 @@ def maybe_execute_live_exits(now_local: datetime) -> int:
                     continue
             tif_norm = sanitize_time_in_force_for_order(
                 str(a["tif"]),
-                default=("fill_or_kill" if str(a.get("kind", "")).strip().lower() == "aggressive" else "good_til_cancelled"),
+                default=("fill_or_kill" if str(a.get("kind", "")).strip().lower() == "aggressive" else "good_till_canceled"),
             )
             payload = {
                 "ticker": ticker,

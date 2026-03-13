@@ -3893,6 +3893,18 @@ def _current_live_bot_exposure_dollars(now_local: datetime, state: Optional[Dict
             total += max(0.0, float(_to_float(row.get("pending_passive_stake_dollars")) or 0.0))
     return round(float(total), 6)
 
+def _open_live_position_signatures(now_local: datetime) -> set:
+    out = set()
+    try:
+        open_positions = _aggregate_open_live_positions(now_local)
+    except Exception:
+        open_positions = []
+    for pos in open_positions:
+        sig = f"{pos.get('date','')}|{pos.get('ticker','')}|{pos.get('bet','')}"
+        if str(sig).strip():
+            out.add(str(sig))
+    return out
+
 def _is_open_position_currently_losing(pos: dict, quotes: Dict[str, Optional[int]]) -> Optional[bool]:
     bet_side = str(pos.get("bet", "")).strip().upper()
     entry_px = _to_float(pos.get("avg_entry_price_cents"))
@@ -4324,6 +4336,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
     edge_state = _load_edge_lifecycle_state(today_key)
     edge_entries = edge_state.get("entries", {}) if isinstance(edge_state, dict) else {}
     current_bot_exposure_dollars = _current_live_bot_exposure_dollars(now_local, state)
+    open_position_sigs = _open_live_position_signatures(now_local)
     per_city_side: Dict[Tuple[str, str], int] = {}
     total_orders = 0
     for _, row in state.items():
@@ -4521,6 +4534,8 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             break
 
         sig = _live_order_signature(b)
+        if sig in open_position_sigs:
+            continue
         row = state.get(sig, {})
         already = int(row.get("count", 0))
         city_k = str(b.get("city", "")).strip()
@@ -7835,6 +7850,7 @@ def debug_live_candidate_funnel_snapshot(
     edge_state = _load_edge_lifecycle_state(today_key)
     edge_entries = edge_state.get("entries", {}) if isinstance(edge_state, dict) else {}
     current_bot_exposure_dollars = _current_live_bot_exposure_dollars(now_local, state)
+    open_position_sigs = _open_live_position_signatures(now_local)
     blocked_tickers = _manual_blocked_tickers()
     now_et = now_local.astimezone(LOCAL_TZ)
     hour_et = int(now_et.hour)
@@ -7861,6 +7877,16 @@ def debug_live_candidate_funnel_snapshot(
 
     for b in policy_bets:
         sig = _live_order_signature(b)
+        if sig in open_position_sigs:
+            _add_reason(execution_reason_counts, execution_examples, "open_position_already_held", {
+                "date": b.get("date"),
+                "city": b.get("city"),
+                "temp_type": b.get("temp_type"),
+                "bet": b.get("bet"),
+                "line": b.get("line"),
+                "ticker": b.get("ticker"),
+            })
+            continue
         row = state.get(sig, {}) or {}
         already = int(row.get("count", 0) or 0)
         city_k = str(b.get("city", "")).strip()

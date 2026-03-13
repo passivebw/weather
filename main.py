@@ -1465,15 +1465,46 @@ def kalshi_get_orderbook(ticker: str) -> dict:
 
 def best_quotes_from_orderbook(ob: dict) -> Dict[str, Optional[int]]:
     book = ob.get("orderbook", ob)
-    yes_bids = book.get("yes", []) or []
-    no_bids = book.get("no", []) or []
 
     def _price_qty(level):
         if isinstance(level, dict):
-            return int(level.get("price", -1)), int(float(level.get("quantity", 0)))
+            qty = level.get("quantity", level.get("qty", level.get("count", 0)))
+            return int(level.get("price", -1)), int(float(qty or 0))
         if isinstance(level, (list, tuple)) and len(level) >= 2:
             return int(level[0]), int(float(level[1]))
         return -1, 0
+
+    def _levels_from(obj: object) -> List[object]:
+        if isinstance(obj, list):
+            return obj
+        if isinstance(obj, tuple):
+            return list(obj)
+        return []
+
+    def _nested_levels(src: dict, parent_key: str, child_key: str) -> List[object]:
+        parent = src.get(parent_key)
+        if isinstance(parent, dict):
+            return _levels_from(parent.get(child_key))
+        return []
+
+    yes_bids = (
+        _levels_from(book.get("yes"))
+        or _levels_from(book.get("yes_bids"))
+        or _nested_levels(book, "bids", "yes")
+    )
+    no_bids = (
+        _levels_from(book.get("no"))
+        or _levels_from(book.get("no_bids"))
+        or _nested_levels(book, "bids", "no")
+    )
+    yes_asks_direct = (
+        _levels_from(book.get("yes_asks"))
+        or _nested_levels(book, "asks", "yes")
+    )
+    no_asks_direct = (
+        _levels_from(book.get("no_asks"))
+        or _nested_levels(book, "asks", "no")
+    )
 
     best_yes_bid = None
     best_yes_bid_size = None
@@ -1494,14 +1525,29 @@ def best_quotes_from_orderbook(ob: dict) -> Dict[str, Optional[int]]:
             best_no_bid_size = None
 
     best_yes_ask = None
-    if best_no_bid is not None:
+    best_yes_ask_size = None
+    if yes_asks_direct:
+        y1 = min(yes_asks_direct, key=lambda x: _price_qty(x)[0])
+        best_yes_ask, best_yes_ask_size = _price_qty(y1)
+        if best_yes_ask < 0:
+            best_yes_ask = None
+            best_yes_ask_size = None
+    elif best_no_bid is not None:
         best_yes_ask = 100 - best_no_bid
+
     best_no_ask = None
-    if best_yes_bid is not None:
+    best_no_ask_size = None
+    if no_asks_direct:
+        n1 = min(no_asks_direct, key=lambda x: _price_qty(x)[0])
+        best_no_ask, best_no_ask_size = _price_qty(n1)
+        if best_no_ask < 0:
+            best_no_ask = None
+            best_no_ask_size = None
+    elif best_yes_bid is not None:
         best_no_ask = 100 - best_yes_bid
 
     top_size = None
-    sizes = [s for s in [best_yes_bid_size, best_no_bid_size] if s is not None]
+    sizes = [s for s in [best_yes_bid_size, best_no_bid_size, best_yes_ask_size, best_no_ask_size] if s is not None]
     if sizes:
         top_size = min(sizes)
 
@@ -7354,6 +7400,17 @@ def debug_city_comparison(
         market_day=market_day,
         force_refresh=force_refresh,
     )
+
+@app.get("/debug/orderbook")
+def debug_orderbook(ticker: str):
+    ob = kalshi_get_orderbook(ticker)
+    quotes = best_quotes_from_orderbook(ob)
+    return {
+        "ok": True,
+        "ticker": ticker,
+        "quotes": quotes,
+        "raw": ob,
+    }
 
 def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_edge_pct: float) -> Tuple[List[dict], List[dict]]:
     max_rows = max(1, min(200, int(top_n)))

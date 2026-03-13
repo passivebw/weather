@@ -4722,16 +4722,14 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                         _clear_pending_passive(sig)
                         row = state.get(sig, {})
                     else:
-                        desired_count = int(desired_passive_count)
-                        current_price = int(row.get("pending_passive_price_cents", 0) or 0)
-                        current_count = int(row.get("pending_passive_requested_count", 0) or 0)
                         if edge_pct < POLICY_MIN_NET_EDGE_PCT:
                             _cancel_pending_passive_if_possible(sig, pending_order_id)
                             continue
-                        if desired_passive_price is not None and int(desired_passive_price) == current_price and int(desired_count) == current_count:
-                            continue
-                        if not _cancel_pending_passive_if_possible(sig, pending_order_id):
-                            continue
+                        # Conservative resting-order mode: keep exactly one live resting
+                        # order on the book while the edge still qualifies. We do not
+                        # cancel/reprice active resting orders intra-day, because losing
+                        # track during cancel/replace can stack duplicates.
+                        continue
                 else:
                     snap_err = str(snapshot.get("error", "") or "snapshot failed")
                     if ("404" in snap_err) or ("not found" in snap_err.lower()):

@@ -159,6 +159,9 @@ PAPER_TRADE_MAX_ALERTS_PER_MARKET_PER_DAY = int(os.getenv("PAPER_TRADE_MAX_ALERT
 PAPER_TRADE_MAX_ALERTS_PER_CITY_SIDE_PER_DAY = int(os.getenv("PAPER_TRADE_MAX_ALERTS_PER_CITY_SIDE_PER_DAY", "2"))
 PAPER_TRADE_MIN_EDGE_IMPROVEMENT_PCT = float(os.getenv("PAPER_TRADE_MIN_EDGE_IMPROVEMENT_PCT", "3.0"))
 PAPER_TRADE_MIN_MINUTES_BETWEEN_RE_ALERTS = int(os.getenv("PAPER_TRADE_MIN_MINUTES_BETWEEN_RE_ALERTS", "90"))
+RANGE_PACKAGE_PAPER_ENABLED = env_bool("RANGE_PACKAGE_PAPER_ENABLED", default=False)
+RANGE_PACKAGE_PAPER_MIN_EDGE_PCT = float(os.getenv("RANGE_PACKAGE_PAPER_MIN_EDGE_PCT", "2.0"))
+RANGE_PACKAGE_PAPER_BUCKET_COUNT = int(os.getenv("RANGE_PACKAGE_PAPER_BUCKET_COUNT", "2"))
 DISCORD_LEADERBOARD_ENABLED = env_bool("DISCORD_LEADERBOARD_ENABLED", default=True)
 DISCORD_DISCREPANCY_ENABLED = env_bool("DISCORD_DISCREPANCY_ENABLED", default=True)
 LIVE_TRADING_ENABLED = env_bool("LIVE_TRADING_ENABLED", default=False)
@@ -365,6 +368,8 @@ _last_daily_update_date = ""
 _nyc_forecast_brief_state: Dict[str, str] = {}
 _paper_alert_state_date = ""
 _paper_alert_state: Dict[str, dict] = {}
+_range_package_paper_state_date = ""
+_range_package_paper_state: Dict[str, dict] = {}
 _live_trade_state_date = ""
 _live_trade_state: Dict[str, dict] = {}
 _live_exit_state_date = ""
@@ -2677,6 +2682,12 @@ def final_settlements_path() -> str:
 def paper_trade_alert_state_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "paper_trade_alert_state.json")
 
+def range_package_paper_state_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "range_package_paper_state.json")
+
+def range_package_paper_trades_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "range_package_paper_trades.csv")
+
 def live_trade_state_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "live_trade_state.json")
 
@@ -2798,6 +2809,15 @@ def manual_auto_weather_positions_path() -> str:
 def manual_btc_positions_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "manual_positions_btc.csv")
 
+RANGE_PACKAGE_PAPER_FIELDS = [
+    "ts_est", "date", "city", "temp_side", "package_bet", "package_bucket_count",
+    "combined_line", "combined_tickers", "combined_model_yes_prob_pct",
+    "combined_entry_cost_cents", "combined_edge_pct", "package_rank_in_city_side",
+    "leg1_line", "leg1_ticker", "leg1_yes_ask", "leg1_model_yes_prob_pct",
+    "leg2_line", "leg2_ticker", "leg2_yes_ask", "leg2_model_yes_prob_pct",
+    "min_top_size", "max_spread_cents", "source_values_json",
+]
+
 def _read_csv_rows_with_header(path: str) -> Tuple[List[str], List[dict]]:
     if not os.path.exists(path):
         return [], []
@@ -2836,6 +2856,21 @@ def _ensure_csv_header_contains(path: str, required_fields: List[str]) -> None:
         return
     merged_header = list(header) + missing
     _rewrite_csv_with_header(path, merged_header, rows)
+
+def ensure_range_package_paper_header() -> None:
+    _ensure_csv_header_contains(range_package_paper_trades_path(), RANGE_PACKAGE_PAPER_FIELDS)
+
+def load_range_package_paper_rows() -> List[dict]:
+    ensure_range_package_paper_header()
+    _header, rows = _read_csv_rows_with_header(range_package_paper_trades_path())
+    return rows
+
+def _append_range_package_paper_log(row: dict) -> None:
+    ensure_range_package_paper_header()
+    path = range_package_paper_trades_path()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=RANGE_PACKAGE_PAPER_FIELDS)
+        w.writerow({k: row.get(k, "") for k in RANGE_PACKAGE_PAPER_FIELDS})
 
 def ensure_manual_positions_header() -> None:
     path = manual_positions_path()
@@ -3365,6 +3400,36 @@ def _save_paper_trade_alert_state(today_key: str) -> None:
     path = paper_trade_alert_state_path()
     tmp = path + ".tmp"
     payload = {"date": today_key, "entries": _paper_alert_state}
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True)
+    os.replace(tmp, path)
+
+def _load_range_package_paper_state(today_key: str) -> Dict[str, dict]:
+    global _range_package_paper_state_date, _range_package_paper_state
+    if _range_package_paper_state_date == today_key:
+        return _range_package_paper_state
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = range_package_paper_state_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if str(payload.get("date", "")) == today_key and isinstance(payload.get("entries"), dict):
+                _range_package_paper_state = payload["entries"]
+            else:
+                _range_package_paper_state = {}
+        except Exception:
+            _range_package_paper_state = {}
+    else:
+        _range_package_paper_state = {}
+    _range_package_paper_state_date = today_key
+    return _range_package_paper_state
+
+def _save_range_package_paper_state(today_key: str) -> None:
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = range_package_paper_state_path()
+    tmp = path + ".tmp"
+    payload = {"date": today_key, "entries": _range_package_paper_state}
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=True)
     os.replace(tmp, path)
@@ -7235,6 +7300,11 @@ def health():
         "live_locked_outcome_max_units": LIVE_LOCKED_OUTCOME_MAX_UNITS,
         "unit_size_dollars": UNIT_SIZE_DOLLARS,
         "paper_trade_discord_enabled": PAPER_TRADE_DISCORD_ENABLED,
+        "range_package_paper_enabled": RANGE_PACKAGE_PAPER_ENABLED,
+        "range_package_paper_min_edge_pct": RANGE_PACKAGE_PAPER_MIN_EDGE_PCT,
+        "range_package_paper_bucket_count": RANGE_PACKAGE_PAPER_BUCKET_COUNT,
+        "range_package_paper_trades_path": range_package_paper_trades_path(),
+        "range_package_paper_trades_count": len(load_range_package_paper_rows()),
         "discord_trade_alerts_enabled": DISCORD_TRADE_ALERTS_ENABLED,
         "paper_trade_post_top_n": PAPER_TRADE_POST_TOP_N,
         "paper_trade_max_alerts_per_market_per_day": PAPER_TRADE_MAX_ALERTS_PER_MARKET_PER_DAY,
@@ -8246,6 +8316,126 @@ def maybe_post_paper_trades(now_local: datetime, board_payload: dict) -> int:
     discord_send(paper_trade_text(now_local, new_bets))
     _save_paper_trade_alert_state(today_key)
     return len(new_bets)
+
+def _range_package_buckets_adjacent(a: dict, b: dict) -> bool:
+    try:
+        a_hi = int(round(float(a.get("hi"))))
+        b_lo = int(round(float(b.get("lo"))))
+    except Exception:
+        return False
+    return b_lo == (a_hi + 1)
+
+def range_package_paper_signature(pkg: dict) -> str:
+    return f"{pkg.get('date','')}|{pkg.get('city','')}|{pkg.get('temp_side','')}|{pkg.get('combined_tickers','')}"
+
+def build_range_package_paper_candidates(now_local: datetime, market_day: str = "today") -> List[dict]:
+    if int(RANGE_PACKAGE_PAPER_BUCKET_COUNT) != 2:
+        return []
+    grouped = refresh_markets_cache()
+    out: List[dict] = []
+    for city in sorted(CITY_CONFIG.keys()):
+        for temp_side in ("high", "low"):
+            if temp_side == "low" and not LOW_SIGNALS_ENABLED:
+                continue
+            city_markets = [m for m in grouped.get(city, []) if normalize_temp_side(getattr(m, "temp_side", "high")) == temp_side]
+            if not city_markets:
+                continue
+            selected_markets, selected_date, _available_dates = select_markets_for_day(
+                city_markets,
+                now_local,
+                market_day,
+                city=city,
+            )
+            if not selected_markets:
+                continue
+            comparison = build_city_bucket_comparison(
+                city,
+                selected_markets,
+                now_local,
+                temp_side=temp_side,
+            )
+            if not comparison:
+                continue
+            buckets = list(comparison.get("buckets", []) or [])
+            if len(buckets) < 2:
+                continue
+            buckets.sort(key=lambda r: (float(r.get("lo", 0.0)), float(r.get("hi", 0.0))))
+            city_packages: List[dict] = []
+            for idx in range(len(buckets) - 1):
+                a = buckets[idx]
+                b = buckets[idx + 1]
+                if float(a.get("lo", -999.0)) <= -900 or float(a.get("hi", 999.0)) >= 900:
+                    continue
+                if float(b.get("lo", -999.0)) <= -900 or float(b.get("hi", 999.0)) >= 900:
+                    continue
+                if not _range_package_buckets_adjacent(a, b):
+                    continue
+                yes_ask_a = _to_float(a.get("yes_ask"))
+                yes_ask_b = _to_float(b.get("yes_ask"))
+                model_yes_a = _to_float(a.get("source_yes_prob"))
+                model_yes_b = _to_float(b.get("source_yes_prob"))
+                top_size_a = int(_to_float(a.get("top_size")) or 0)
+                top_size_b = int(_to_float(b.get("top_size")) or 0)
+                spread_a = int(_to_float(a.get("spread_cents")) or 0)
+                spread_b = int(_to_float(b.get("spread_cents")) or 0)
+                if yes_ask_a is None or yes_ask_b is None or model_yes_a is None or model_yes_b is None:
+                    continue
+                combined_model_yes_prob_pct = (float(model_yes_a) + float(model_yes_b)) * 100.0
+                combined_entry_cost_cents = float(yes_ask_a) + float(yes_ask_b)
+                combined_edge_pct = combined_model_yes_prob_pct - combined_entry_cost_cents
+                if combined_edge_pct < float(RANGE_PACKAGE_PAPER_MIN_EDGE_PCT):
+                    continue
+                city_packages.append({
+                    "ts_est": fmt_est(now_local),
+                    "date": selected_date or "",
+                    "city": city,
+                    "temp_side": temp_side,
+                    "package_bet": "BUY YES",
+                    "package_bucket_count": 2,
+                    "combined_line": f"{a.get('bucket_label')} + {b.get('bucket_label')}",
+                    "combined_tickers": f"{a.get('ticker')}|{b.get('ticker')}",
+                    "combined_model_yes_prob_pct": round(combined_model_yes_prob_pct, 2),
+                    "combined_entry_cost_cents": round(combined_entry_cost_cents, 2),
+                    "combined_edge_pct": round(combined_edge_pct, 2),
+                    "leg1_line": a.get("bucket_label"),
+                    "leg1_ticker": a.get("ticker"),
+                    "leg1_yes_ask": a.get("yes_ask"),
+                    "leg1_model_yes_prob_pct": round(float(model_yes_a) * 100.0, 2),
+                    "leg2_line": b.get("bucket_label"),
+                    "leg2_ticker": b.get("ticker"),
+                    "leg2_yes_ask": b.get("yes_ask"),
+                    "leg2_model_yes_prob_pct": round(float(model_yes_b) * 100.0, 2),
+                    "min_top_size": min(top_size_a, top_size_b),
+                    "max_spread_cents": max(spread_a, spread_b),
+                    "source_values_json": json.dumps((comparison.get("source_values_map") or {}), sort_keys=True),
+                })
+            city_packages.sort(key=lambda r: float(r.get("combined_edge_pct", -1e9)), reverse=True)
+            for rank, pkg in enumerate(city_packages, start=1):
+                pkg["package_rank_in_city_side"] = rank
+            out.extend(city_packages)
+    out.sort(key=lambda r: float(r.get("combined_edge_pct", -1e9)), reverse=True)
+    return out
+
+def maybe_log_range_package_paper_trades(now_local: datetime, market_day: str = "today") -> int:
+    if not RANGE_PACKAGE_PAPER_ENABLED:
+        return 0
+    today_key = now_local.date().isoformat()
+    state = _load_range_package_paper_state(today_key)
+    new_rows = 0
+    for pkg in build_range_package_paper_candidates(now_local, market_day=market_day):
+        sig = range_package_paper_signature(pkg)
+        if sig in state:
+            continue
+        _append_range_package_paper_log(pkg)
+        state[sig] = {
+            "first_seen_ts_est": fmt_est(now_local),
+            "combined_edge_pct": pkg.get("combined_edge_pct"),
+            "city": pkg.get("city"),
+            "temp_side": pkg.get("temp_side"),
+        }
+        new_rows += 1
+    _save_range_package_paper_state(today_key)
+    return new_rows
 
 @app.get("/bets.txt", response_class=PlainTextResponse)
 def bets_txt(market_day: str = "auto", top_n: int = 20, force_refresh: bool = False):
@@ -9583,6 +9773,45 @@ def analytics_manual_positions(
         "btc_rows": btc_rows,
     }
 
+@app.get("/analytics/range-package-paper")
+def analytics_range_package_paper(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    rows = load_range_package_paper_rows()
+    d0 = None
+    d1 = None
+    try:
+        if start:
+            d0 = datetime.fromisoformat(str(start)).date()
+    except Exception:
+        d0 = None
+    try:
+        if end:
+            d1 = datetime.fromisoformat(str(end)).date()
+    except Exception:
+        d1 = None
+
+    out: List[dict] = []
+    for r in rows:
+        date_iso = str(r.get("date", "")).strip()
+        try:
+            dd = datetime.fromisoformat(date_iso).date()
+        except Exception:
+            dd = None
+        if d0 and dd and dd < d0:
+            continue
+        if d1 and dd and dd > d1:
+            continue
+        out.append(dict(r))
+
+    return {
+        "ok": True,
+        "path": range_package_paper_trades_path(),
+        "count": len(out),
+        "rows": out,
+    }
+
 @app.post("/manual/sync-kalshi")
 def manual_sync_kalshi(
     max_pages: int = 30,
@@ -10329,6 +10558,7 @@ def scan():
     posted = False
     discrepancy_posted = False
     paper_trade_posted_count = 0
+    range_package_paper_logged_count = 0
     edge_tracking = {"active_count": 0, "closed_count": 0}
     daily_update_posted = False
     nyc_forecast_brief_posted = False
@@ -10346,8 +10576,10 @@ def scan():
             except Exception:
                 edge_tracking = {"active_count": 0, "closed_count": 0}
         paper_trade_posted_count = maybe_post_paper_trades(now_local, board_payload)
+        range_package_paper_logged_count = maybe_log_range_package_paper_trades(now_local, market_day="today")
     except Exception:
         paper_trade_posted_count = 0
+        range_package_paper_logged_count = 0
     try:
         daily_update_posted = maybe_post_daily_update(now_local)
     except Exception:
@@ -10361,6 +10593,7 @@ def scan():
         "posted": posted,
         "discrepancy_posted": discrepancy_posted,
         "paper_trade_posted_count": paper_trade_posted_count,
+        "range_package_paper_logged_count": range_package_paper_logged_count,
         "daily_update_posted": daily_update_posted,
         "nyc_forecast_brief_posted": nyc_forecast_brief_posted,
         "edge_active_count": edge_tracking.get("active_count", 0),
@@ -10670,6 +10903,7 @@ def background_loop():
                 if EDGE_TRACKING_ENABLED:
                     track_edge_lifecycles(now_local, board_payload)
                 maybe_post_paper_trades(now_local, board_payload)
+                maybe_log_range_package_paper_trades(now_local, market_day="today")
             except Exception:
                 pass
             try:

@@ -3903,6 +3903,26 @@ def _open_live_position_signatures(now_local: datetime) -> set:
         sig = f"{pos.get('date','')}|{pos.get('ticker','')}|{pos.get('bet','')}"
         if str(sig).strip():
             out.add(str(sig))
+    try:
+        exchange_positions = kalshi_get_market_positions(limit=500, max_pages=5)
+    except Exception:
+        exchange_positions = []
+    for pos in exchange_positions:
+        ticker = str(pos.get("ticker", "") or "").strip()
+        if not ticker:
+            continue
+        qty = _kalshi_int_from_fp(
+            pos.get("position")
+            if pos.get("position") is not None else
+            pos.get("position_fp")
+        )
+        if qty == 0:
+            continue
+        market_date = parse_market_date_iso_from_ticker(ticker) or ""
+        bet = "BUY YES" if qty > 0 else "BUY NO"
+        sig = f"{market_date}|{ticker}|{bet}"
+        if str(sig).strip():
+            out.add(str(sig))
     return out
 
 def _is_open_position_currently_losing(pos: dict, quotes: Dict[str, Optional[int]]) -> Optional[bool]:
@@ -4231,6 +4251,28 @@ def kalshi_get_orders(status: Optional[str] = None, ticker: Optional[str] = None
         orders = resp.get("orders", [])
         if isinstance(orders, list):
             out.extend([o for o in orders if isinstance(o, dict)])
+        cursor = str(resp.get("cursor", "") or "").strip()
+        pages += 1
+        if not cursor:
+            break
+    return out
+
+def kalshi_get_market_positions(limit: int = 500, max_pages: int = 5) -> List[dict]:
+    params = {
+        "limit": max(1, min(1000, int(limit))),
+        "count_filter": "position",
+    }
+    cursor = ""
+    pages = 0
+    out: List[dict] = []
+    while pages < max(1, int(max_pages)):
+        q = dict(params)
+        if cursor:
+            q["cursor"] = cursor
+        resp = kalshi_get("/portfolio/positions", params=q, timeout=20, max_retries=2)
+        positions = resp.get("market_positions", [])
+        if isinstance(positions, list):
+            out.extend([p for p in positions if isinstance(p, dict)])
         cursor = str(resp.get("cursor", "") or "").strip()
         pages += 1
         if not cursor:

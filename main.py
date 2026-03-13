@@ -4286,6 +4286,16 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
         state[sig_key] = row_local
         return int(delta)
 
+    def _cancel_pending_passive_if_possible(sig_key: str, order_id: str) -> bool:
+        canceled, cancel_err = kalshi_cancel_order(order_id)
+        if canceled:
+            _clear_pending_passive(sig_key)
+            return True
+        row_local = state.get(sig_key, {}) or {}
+        row_local["pending_passive_cancel_error"] = str(cancel_err or "cancel failed")
+        state[sig_key] = row_local
+        return False
+
     for sig_key, row_local in list(state.items()):
         pending_order_id = str((row_local or {}).get("pending_passive_order_id", "")).strip()
         if not pending_order_id:
@@ -4295,9 +4305,10 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
         snapshot = kalshi_get_order_snapshot(pending_order_id)
         if bool(snapshot.get("ok")):
             _record_pending_fill(sig_key, row_local, snapshot)
-            if not _is_order_closed_status(str(snapshot.get("status", ""))):
-                kalshi_cancel_order(pending_order_id)
-        _clear_pending_passive(sig_key)
+            if _is_order_closed_status(str(snapshot.get("status", ""))):
+                _clear_pending_passive(sig_key)
+            else:
+                _cancel_pending_passive_if_possible(sig_key, pending_order_id)
 
     for b in bets:
         if placed >= max(1, LIVE_MAX_ORDERS_PER_SCAN):
@@ -4456,15 +4467,17 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                         current_price = int(row.get("pending_passive_price_cents", 0) or 0)
                         current_count = int(row.get("pending_passive_requested_count", 0) or 0)
                         if edge_pct < POLICY_MIN_NET_EDGE_PCT:
-                            kalshi_cancel_order(pending_order_id)
-                            _clear_pending_passive(sig)
+                            _cancel_pending_passive_if_possible(sig, pending_order_id)
                             continue
                         if desired_passive_price is not None and int(desired_passive_price) == current_price and int(desired_count) == current_count:
                             continue
-                        kalshi_cancel_order(pending_order_id)
-                        _clear_pending_passive(sig)
+                        if not _cancel_pending_passive_if_possible(sig, pending_order_id):
+                            continue
                 else:
-                    _clear_pending_passive(sig)
+                    row = state.get(sig, row) or {}
+                    row["pending_passive_snapshot_error"] = str(snapshot.get("error", "") or "snapshot failed")
+                    state[sig] = row
+                    continue
 
             if LIVE_PASSIVE_RESCAN_MODE_ENABLED and (not is_aggressive_override):
                 if LIVE_PASSIVE_ONE_TICK_FROM_ASK:

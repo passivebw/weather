@@ -1466,12 +1466,27 @@ def kalshi_get_orderbook(ticker: str) -> dict:
 def best_quotes_from_orderbook(ob: dict) -> Dict[str, Optional[int]]:
     book = ob.get("orderbook", ob)
 
+    def _normalize_price_to_cents(value: object) -> int:
+        try:
+            if isinstance(value, str):
+                v = value.strip()
+                if "." in v:
+                    return int(round(float(v) * 100.0))
+                return int(v)
+            if isinstance(value, float):
+                if 0.0 <= value <= 1.0:
+                    return int(round(value * 100.0))
+                return int(round(value))
+            return int(value)
+        except Exception:
+            return -1
+
     def _price_qty(level):
         if isinstance(level, dict):
             qty = level.get("quantity", level.get("qty", level.get("count", 0)))
-            return int(level.get("price", -1)), int(float(qty or 0))
+            return _normalize_price_to_cents(level.get("price", -1)), int(float(qty or 0))
         if isinstance(level, (list, tuple)) and len(level) >= 2:
-            return int(level[0]), int(float(level[1]))
+            return _normalize_price_to_cents(level[0]), int(float(level[1]))
         return -1, 0
 
     def _levels_from(obj: object) -> List[object]:
@@ -1487,15 +1502,23 @@ def best_quotes_from_orderbook(ob: dict) -> Dict[str, Optional[int]]:
             return _levels_from(parent.get(child_key))
         return []
 
+    def _fp_levels(src: dict, key: str) -> List[object]:
+        fp = src.get("orderbook_fp")
+        if isinstance(fp, dict):
+            return _levels_from(fp.get(key))
+        return []
+
     yes_bids = (
         _levels_from(book.get("yes"))
         or _levels_from(book.get("yes_bids"))
         or _nested_levels(book, "bids", "yes")
+        or _fp_levels(book, "yes_dollars")
     )
     no_bids = (
         _levels_from(book.get("no"))
         or _levels_from(book.get("no_bids"))
         or _nested_levels(book, "bids", "no")
+        or _fp_levels(book, "no_dollars")
     )
     yes_asks_direct = (
         _levels_from(book.get("yes_asks"))

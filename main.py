@@ -7236,6 +7236,15 @@ def policy(
         out["board_unavailable_preview"] = b.get("unavailable", [])[:50]
     return out
 
+@app.get("/debug/live-candidate-funnel")
+def debug_live_candidate_funnel(market_day: str = "auto", force_refresh: bool = False):
+    now_local = datetime.now(tz=LOCAL_TZ)
+    return debug_live_candidate_funnel_snapshot(
+        now_local,
+        market_day=market_day,
+        force_refresh=force_refresh,
+    )
+
 def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_edge_pct: float) -> Tuple[List[dict], List[dict]]:
     max_rows = max(1, min(200, int(top_n)))
     threshold = float(min_edge_pct)
@@ -7298,6 +7307,209 @@ def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_ed
         })
     executable.sort(key=lambda x: x.get("net_edge_pct", -1e9), reverse=True)
     return executable[:max_rows], excluded
+
+def debug_live_candidate_funnel_snapshot(
+    now_local: datetime,
+    market_day: str = "auto",
+    force_refresh: bool = False,
+) -> dict:
+    day_pref = normalize_market_day(market_day)
+    board_payload = board(market_day=day_pref, force_refresh=force_refresh)
+    if not board_payload.get("ok"):
+        return board_payload
+
+    board_rows = list(board_payload.get("rows", []) or [])
+    board_unavailable = list(board_payload.get("unavailable", []) or [])
+    policy_bets, policy_excluded = build_policy_bets_from_board_payload(
+        board_payload,
+        top_n=200,
+        min_edge_pct=POLICY_MIN_NET_EDGE_PCT,
+    )
+
+    def _add_reason(reason_counts: Dict[str, int], reason_examples: Dict[str, List[dict]], reason: str, payload: dict) -> None:
+        key = str(reason or "unknown").strip() or "unknown"
+        reason_counts[key] = reason_counts.get(key, 0) + 1
+        bucket = reason_examples.setdefault(key, [])
+        if len(bucket) < 5:
+            bucket.append(payload)
+
+    unavailable_reason_counts: Dict[str, int] = {}
+    unavailable_examples: Dict[str, List[dict]] = {}
+    for row in board_unavailable:
+        _add_reason(
+            unavailable_reason_counts,
+            unavailable_examples,
+            str(row.get("reason", "unknown")),
+            {
+                "city": row.get("city"),
+                "temp_side": row.get("temp_side"),
+                "market_date_selected": row.get("market_date_selected"),
+            },
+        )
+
+    policy_reason_counts: Dict[str, int] = {}
+    policy_examples: Dict[str, List[dict]] = {}
+    for row in policy_excluded:
+        _add_reason(
+            policy_reason_counts,
+            policy_examples,
+            str(row.get("reason", "unknown")),
+            {
+                "city": row.get("city"),
+                "temp_type": row.get("temp_type"),
+                "line": row.get("line"),
+                "ticker": row.get("ticker"),
+                "net_edge_pct": row.get("net_edge_pct"),
+            },
+        )
+
+    today_key = now_local.date().isoformat()
+    state = _load_live_trade_state(today_key)
+    edge_state = _load_edge_lifecycle_state(today_key)
+    edge_entries = edge_state.get("entries", {}) if isinstance(edge_state, dict) else {}
+    blocked_tickers = _manual_blocked_tickers()
+    now_et = now_local.astimezone(LOCAL_TZ)
+    hour_et = int(now_et.hour)
+    early_session = (
+        LIVE_EARLY_SESSION_ENABLED
+        and (hour_et >= LIVE_EARLY_SESSION_START_HOUR_ET)
+        and (hour_et < LIVE_EARLY_SESSION_END_HOUR_ET)
+    )
+
+    per_city_side: Dict[Tuple[str, str], int] = {}
+    total_orders = 0
+    for _, row in state.items():
+        total_orders += int(row.get("count", 0) or 0)
+        city_k = str(row.get("city", "")).strip()
+        side_k = normalize_temp_side(str(row.get("temp_side", "high")))
+        if city_k:
+            per_city_side[(city_k, side_k)] = per_city_side.get((city_k, side_k), 0) + int(row.get("count", 0) or 0)
+
+    execution_reason_counts: Dict[str, int] = {}
+    execution_examples: Dict[str, List[dict]] = {}
+    eligible_now: List[dict] = []
+    pending_resting: List[dict] = []
+    scan_capacity_remaining = max(0, max(1, LIVE_MAX_ORDERS_PER_SCAN) - min(total_orders, max(1, LIVE_MAX_ORDERS_PER_SCAN)))
+
+    for b in policy_bets:
+        sig = _live_order_signature(b)
+        row = state.get(sig, {}) or {}
+        already = int(row.get("count", 0) or 0)
+        city_k = str(b.get("city", "")).strip()
+        side_k = normalize_temp_side(str(b.get("temp_type", "high")))
+        ticker = str(b.get("ticker", "")).strip()
+        bet_side = str(b.get("bet", "")).strip().upper()
+        edge_pct = float(b.get("net_edge_pct", 0.0) or 0.0)
+        sig_entry = edge_entries.get(sig, {}) or {}
+        sig_scans = int(sig_entry.get("scan_count", 1) or 1)
+
+        base_payload = {
+            "date": b.get("date"),
+            "city": city_k,
+            "temp_type": side_k,
+            "bet": bet_side,
+            "line": b.get("line"),
+            "ticker": ticker,
+            "net_edge_pct": round(edge_pct, 2),
+            "spread_cents": b.get("spread_cents"),
+            "top_size": b.get("top_size"),
+            "scan_count": sig_scans,
+        }
+
+        pending_order_id = str(row.get("pending_passive_order_id", "")).strip()
+        if pending_order_id:
+            pending_resting.append({
+                **base_payload,
+                "pending_passive_order_id": pending_order_id,
+                "pending_passive_price_cents": row.get("pending_passive_price_cents"),
+                "pending_passive_requested_count": row.get("pending_passive_requested_count"),
+            })
+            _add_reason(execution_reason_counts, execution_examples, "existing_resting_passive_order", base_payload)
+            continue
+        if total_orders >= max(1, LIVE_MAX_ORDERS_PER_DAY):
+            _add_reason(execution_reason_counts, execution_examples, "max_orders_per_day_reached", base_payload)
+            continue
+        if already >= max(1, LIVE_MAX_ORDERS_PER_MARKET_PER_DAY):
+            _add_reason(execution_reason_counts, execution_examples, "max_orders_per_market_reached", base_payload)
+            continue
+        if city_k and per_city_side.get((city_k, side_k), 0) >= max(1, LIVE_MAX_ORDERS_PER_CITY_SIDE_PER_DAY):
+            _add_reason(execution_reason_counts, execution_examples, "max_orders_per_city_side_reached", base_payload)
+            continue
+        if ticker in blocked_tickers:
+            _add_reason(execution_reason_counts, execution_examples, "manual_market_blocked", base_payload)
+            continue
+        order_side, price_field = _bet_side_and_price_field(bet_side)
+        if order_side is None or price_field is None:
+            _add_reason(execution_reason_counts, execution_examples, "invalid_bet_side", base_payload)
+            continue
+        if not ticker:
+            _add_reason(execution_reason_counts, execution_examples, "missing_ticker", base_payload)
+            continue
+        if early_session and ((not LIVE_EARLY_SESSION_APPLY_TO_HIGH_ONLY) or (side_k == "high")):
+            if edge_pct < float(LIVE_EARLY_SESSION_MIN_EDGE_PCT):
+                _add_reason(execution_reason_counts, execution_examples, "early_session_min_edge", base_payload)
+                continue
+            if sig_scans < max(1, LIVE_EARLY_SESSION_MIN_SCANS):
+                _add_reason(execution_reason_counts, execution_examples, "early_session_min_scans", base_payload)
+                continue
+        if LIVE_STABILITY_GATE_ENABLED and (LIVE_STABILITY_GATE_EDGE_MIN_PCT <= edge_pct < LIVE_STABILITY_GATE_EDGE_MAX_PCT):
+            if sig_scans < max(1, LIVE_STABILITY_GATE_MIN_SCANS_MID):
+                _add_reason(execution_reason_counts, execution_examples, "stability_gate_min_scans", base_payload)
+                continue
+            if LIVE_STABILITY_REQUIRE_CHANGE_MID and (not bool(sig_entry.get("fresh_trigger", False))):
+                _add_reason(execution_reason_counts, execution_examples, "stability_gate_requires_fresh_trigger", base_payload)
+                continue
+        eligible_now.append(base_payload)
+
+    top_board_preview = []
+    for r in board_rows[:10]:
+        top_board_preview.append({
+            "city": r.get("city"),
+            "temp_side": r.get("temp_side"),
+            "date": r.get("market_date_selected"),
+            "line": r.get("bucket_label"),
+            "ticker": r.get("ticker"),
+            "best_side": r.get("best_side"),
+            "net_edge_pct": round(float(r.get("net_calibrated_edge_pct", r.get("edge_pct", 0.0)) or 0.0), 2),
+            "spread_cents": r.get("spread_cents"),
+            "top_size": r.get("top_size"),
+        })
+
+    return {
+        "ok": True,
+        "as_of_est": board_payload.get("as_of_est"),
+        "market_day_requested": day_pref,
+        "scan_context": {
+            "today_key": today_key,
+            "hour_et": hour_et,
+            "early_session_active": early_session,
+            "live_trading_enabled": LIVE_TRADING_ENABLED,
+            "live_kill_switch": _live_kill_switch_state,
+            "policy_min_net_edge_pct": POLICY_MIN_NET_EDGE_PCT,
+            "scan_capacity_remaining": scan_capacity_remaining,
+            "orders_placed_today": total_orders,
+        },
+        "counts": {
+            "board_rows": len(board_rows),
+            "board_unavailable": len(board_unavailable),
+            "policy_executable": len(policy_bets),
+            "policy_excluded": len(policy_excluded),
+            "execution_eligible_now": len(eligible_now),
+            "execution_filtered_after_policy": sum(execution_reason_counts.values()),
+            "pending_resting_orders": len(pending_resting),
+        },
+        "board_unavailable_reasons": unavailable_reason_counts,
+        "policy_excluded_reasons": policy_reason_counts,
+        "execution_filtered_reasons": execution_reason_counts,
+        "top_board_preview": top_board_preview,
+        "eligible_now_preview": eligible_now[:20],
+        "pending_resting_preview": pending_resting[:20],
+        "examples": {
+            "board_unavailable": unavailable_examples,
+            "policy_excluded": policy_examples,
+            "execution_filtered": execution_examples,
+        },
+    }
 
 def paper_trade_signature(bet: dict) -> str:
     return f"{bet.get('date','')}|{bet.get('ticker','')}|{bet.get('bet','')}"

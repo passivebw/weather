@@ -810,7 +810,7 @@ def awc_get_latest_metar_obs(station_id: str) -> Optional[dict]:
         "temp_f": temp_f,
         "dewpoint_f": dewpoint_f,
         "raw_text": str(row.get("rawOb") or row.get("raw_text") or ""),
-        "flight_category": row.get("flight_category"),
+        "flight_category": row.get("flight_category") or row.get("fltCat"),
         "wind_dir_degrees": _to_float(row.get("wdir")),
         "wind_speed_kt": _to_float(row.get("wspd")),
         "wind_gust_kt": _to_float(row.get("wgst")),

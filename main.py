@@ -297,6 +297,9 @@ HIGH_EARLY_DAMPING_HOUR_LST = int(os.getenv("HIGH_EARLY_DAMPING_HOUR_LST", "12")
 LIVE_THIN_YES_EDGE_MAX_PCT = float(os.getenv("LIVE_THIN_YES_EDGE_MAX_PCT", "12.5"))
 LIVE_THIN_YES_MAX_SPREAD_CENTS = int(os.getenv("LIVE_THIN_YES_MAX_SPREAD_CENTS", "2"))
 LIVE_THIN_YES_MIN_TOP_SIZE = int(os.getenv("LIVE_THIN_YES_MIN_TOP_SIZE", "5"))
+LIVE_CITY_SIDE_OVERLAP_GUARD_ENABLED = env_bool("LIVE_CITY_SIDE_OVERLAP_GUARD_ENABLED", default=True)
+LIVE_CITY_SIDE_MIN_MIDPOINT_DISTANCE_F = float(os.getenv("LIVE_CITY_SIDE_MIN_MIDPOINT_DISTANCE_F", "3.0"))
+LIVE_CITY_SIDE_DIFF_STRUCTURE_MIN_DISTANCE_F = float(os.getenv("LIVE_CITY_SIDE_DIFF_STRUCTURE_MIN_DISTANCE_F", "1.5"))
 OPEN_METEO_HIST_MAE_F = float(os.getenv("OPEN_METEO_HIST_MAE_F", "2.4"))
 OPEN_METEO_ECMWF_HIST_MAE_F = float(os.getenv("OPEN_METEO_ECMWF_HIST_MAE_F", str(OPEN_METEO_HIST_MAE_F)))
 OPEN_METEO_GFS_HIST_MAE_F = float(os.getenv("OPEN_METEO_GFS_HIST_MAE_F", str(OPEN_METEO_HIST_MAE_F)))
@@ -514,6 +517,90 @@ def _should_filter_thin_yes_trade(b: dict) -> bool:
     spread_bad = (spread_cents is not None) and (float(spread_cents) > float(LIVE_THIN_YES_MAX_SPREAD_CENTS))
     top_bad = (top_size is not None) and (float(top_size) < float(LIVE_THIN_YES_MIN_TOP_SIZE))
     return bool(spread_bad or top_bad)
+
+def _bucket_structure_kind(lo: float, hi: float) -> str:
+    if float(lo) <= -900:
+        return "tail_below"
+    if float(hi) >= 900:
+        return "tail_above"
+    return "exact"
+
+def _city_side_bucket_is_materially_distinct(
+    cand_lo: float,
+    cand_hi: float,
+    exist_lo: float,
+    exist_hi: float,
+) -> bool:
+    cand_kind = _bucket_structure_kind(cand_lo, cand_hi)
+    exist_kind = _bucket_structure_kind(exist_lo, exist_hi)
+    cand_mid = bucket_midpoint(cand_lo, cand_hi)
+    exist_mid = bucket_midpoint(exist_lo, exist_hi)
+    dist = abs(float(cand_mid) - float(exist_mid))
+    if cand_kind != exist_kind:
+        return dist >= float(LIVE_CITY_SIDE_DIFF_STRUCTURE_MIN_DISTANCE_F)
+    return dist >= float(LIVE_CITY_SIDE_MIN_MIDPOINT_DISTANCE_F)
+
+def _has_overlapping_city_side_exposure(
+    bet: dict,
+    today_key: str,
+    state: Optional[Dict[str, dict]] = None,
+) -> bool:
+    if not LIVE_CITY_SIDE_OVERLAP_GUARD_ENABLED:
+        return False
+    date_iso = str(bet.get("date", "")).strip()
+    city = str(bet.get("city", "")).strip()
+    side = normalize_temp_side(str(bet.get("temp_type", "high")))
+    ticker = str(bet.get("ticker", "")).strip().upper()
+    line = str(bet.get("line", "")).strip()
+    if not (date_iso and city and side and ticker and line):
+        return False
+    bucket = parse_bucket_from_line(line)
+    if bucket is None:
+        return False
+    cand_lo, cand_hi = bucket
+
+    for r in load_live_trade_log_rows():
+        if str(r.get("date", "")).strip() != date_iso:
+            continue
+        if str(r.get("city", "")).strip() != city:
+            continue
+        if normalize_temp_side(str(r.get("temp_type", "high"))) != side:
+            continue
+        if str(r.get("ticker", "")).strip().upper() == ticker:
+            continue
+        st = str(r.get("status", "")).strip().lower()
+        if st not in ("resting", "submitted", "partial", "partial_filled"):
+            continue
+        cnt = int(float(_to_float(r.get("count")) or 0) or 0)
+        if st != "resting" and cnt <= 0:
+            continue
+        exist_bucket = parse_bucket_from_line(str(r.get("line", "")).strip())
+        if exist_bucket is None:
+            continue
+        exist_lo, exist_hi = exist_bucket
+        if not _city_side_bucket_is_materially_distinct(cand_lo, cand_hi, exist_lo, exist_hi):
+            return True
+
+    for _sig, row in (state or {}).items():
+        pending_order_id = str((row or {}).get("pending_passive_order_id", "")).strip()
+        if not pending_order_id:
+            continue
+        if str((row or {}).get("pending_passive_date", row.get("date", ""))).strip() != date_iso:
+            continue
+        if str((row or {}).get("pending_passive_city", row.get("city", ""))).strip() != city:
+            continue
+        if normalize_temp_side(str((row or {}).get("pending_passive_temp_side", row.get("temp_side", "high")))) != side:
+            continue
+        if str((row or {}).get("pending_passive_ticker", row.get("ticker", ""))).strip().upper() == ticker:
+            continue
+        exist_bucket = parse_bucket_from_line(str((row or {}).get("pending_passive_line", row.get("line", ""))).strip())
+        if exist_bucket is None:
+            continue
+        exist_lo, exist_hi = exist_bucket
+        if not _city_side_bucket_is_materially_distinct(cand_lo, cand_hi, exist_lo, exist_hi):
+            return True
+
+    return False
 
 def canonical_city_name(city: str) -> Optional[str]:
     key = city.strip().lower()
@@ -2840,9 +2927,12 @@ def build_odds_board(now_local: datetime, market_day: str = "auto") -> dict:
                 "nws_obs_age_minutes": obs_age_min,
                 "nws_obs_fresh": obs_fresh,
                 "locked_outcome": locked_outcome,
-                "locked_reason": locked_reason,
-                "is_locked_capture_candidate": is_locked_capture_candidate,
-            })
+            "locked_reason": locked_reason,
+            "is_locked_capture_candidate": is_locked_capture_candidate,
+            "best_lo": best.get("lo"),
+            "best_hi": best.get("hi"),
+            "best_structure_kind": _bucket_structure_kind(float(best.get("lo")), float(best.get("hi"))),
+        })
     for r in rows:
         raw_edge = float(r.get("best_edge", 0.0))
         cal_edge, meta = calibrate_edge(
@@ -5275,6 +5365,8 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                     continue
                 if LIVE_STABILITY_REQUIRE_CHANGE_MID and (not bool(sig_entry.get("fresh_trigger", False))):
                     continue
+            if _has_overlapping_city_side_exposure(b, today_key, state):
+                continue
             if _should_filter_thin_yes_trade(b):
                 continue
             stake_dollars, kelly_units = _compute_stake_dollars_for_bet(b)
@@ -8202,6 +8294,9 @@ def health():
         "live_thin_yes_edge_max_pct": LIVE_THIN_YES_EDGE_MAX_PCT,
         "live_thin_yes_max_spread_cents": LIVE_THIN_YES_MAX_SPREAD_CENTS,
         "live_thin_yes_min_top_size": LIVE_THIN_YES_MIN_TOP_SIZE,
+        "live_city_side_overlap_guard_enabled": LIVE_CITY_SIDE_OVERLAP_GUARD_ENABLED,
+        "live_city_side_min_midpoint_distance_f": LIVE_CITY_SIDE_MIN_MIDPOINT_DISTANCE_F,
+        "live_city_side_diff_structure_min_distance_f": LIVE_CITY_SIDE_DIFF_STRUCTURE_MIN_DISTANCE_F,
         "policy_min_net_edge_pct": POLICY_MIN_NET_EDGE_PCT,
         "live_locked_outcome_capture_enabled": LIVE_LOCKED_OUTCOME_CAPTURE_ENABLED,
         "live_locked_outcome_min_net_edge_pct": LIVE_LOCKED_OUTCOME_MIN_NET_EDGE_PCT,
@@ -8940,6 +9035,9 @@ def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_ed
             "locked_outcome": bool(r.get("locked_outcome", False)),
             "locked_reason": r.get("locked_reason"),
             "trade_mode": ("locked_capture" if locked_allowed else "normal"),
+            "best_lo": r.get("best_lo"),
+            "best_hi": r.get("best_hi"),
+            "best_structure_kind": r.get("best_structure_kind"),
             "source_values_key": json.dumps((r.get("source_values_map") or {}), sort_keys=True, separators=(",", ":")),
         })
     executable.sort(key=lambda x: x.get("net_edge_pct", -1e9), reverse=True)
@@ -9128,6 +9226,9 @@ def debug_live_candidate_funnel_snapshot(
             if LIVE_STABILITY_REQUIRE_CHANGE_MID and (not bool(sig_entry.get("fresh_trigger", False))):
                 _add_reason(execution_reason_counts, execution_examples, "stability_gate_requires_fresh_trigger", base_payload)
                 continue
+        if _has_overlapping_city_side_exposure(b, today_key, state):
+            _add_reason(execution_reason_counts, execution_examples, "overlapping_city_side_exposure", base_payload)
+            continue
         if _should_filter_thin_yes_trade(b):
             _add_reason(execution_reason_counts, execution_examples, "thin_yes_liquidity_filter", base_payload)
             continue

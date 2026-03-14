@@ -154,6 +154,7 @@ LIVE_LOCKED_OUTCOME_MAX_UNITS = float(os.getenv("LIVE_LOCKED_OUTCOME_MAX_UNITS",
 UNIT_SIZE_DOLLARS = float(os.getenv("UNIT_SIZE_DOLLARS", "50.0"))
 PAPER_TRADE_DISCORD_ENABLED = env_bool("PAPER_TRADE_DISCORD_ENABLED", default=True)
 DISCORD_TRADE_ALERTS_ENABLED = env_bool("DISCORD_TRADE_ALERTS_ENABLED", default=False)
+DISCORD_MISSED_FILL_MAX_AGE_MINUTES = float(os.getenv("DISCORD_MISSED_FILL_MAX_AGE_MINUTES", "20.0"))
 PAPER_TRADE_POST_TOP_N = int(os.getenv("PAPER_TRADE_POST_TOP_N", "3"))
 PAPER_TRADE_MAX_ALERTS_PER_MARKET_PER_DAY = int(os.getenv("PAPER_TRADE_MAX_ALERTS_PER_MARKET_PER_DAY", "2"))
 PAPER_TRADE_MAX_ALERTS_PER_CITY_SIDE_PER_DAY = int(os.getenv("PAPER_TRADE_MAX_ALERTS_PER_CITY_SIDE_PER_DAY", "2"))
@@ -4667,6 +4668,7 @@ def _maybe_send_missed_passive_fill_discord_alerts(now_local: datetime) -> int:
     sent_state = _load_live_trade_discord_state(today_key)
     rows = load_live_trade_log_rows()
     pending: List[dict] = []
+    state_changed = False
     for r in rows:
         if str(r.get("date", "")).strip() != today_key:
             continue
@@ -4684,6 +4686,19 @@ def _maybe_send_missed_passive_fill_discord_alerts(now_local: datetime) -> int:
         sig = _live_trade_discord_sig(r)
         if sig in sent_state:
             continue
+        ts_row = parse_ts_est(str(r.get("ts_est", "")).strip())
+        if ts_row is not None:
+            age_min = max(0.0, (now_local - ts_row).total_seconds() / 60.0)
+            if age_min > float(DISCORD_MISSED_FILL_MAX_AGE_MINUTES):
+                sent_state[sig] = {
+                    "ts_est": fmt_est(now_local),
+                    "ticker": r.get("ticker", ""),
+                    "status": r.get("status", ""),
+                    "count": r.get("count", 0),
+                    "note": "stale_missed_fill_skipped",
+                }
+                state_changed = True
+                continue
         pending.append((sig, r))
     sent_count = 0
     for sig, row in pending:
@@ -4695,10 +4710,11 @@ def _maybe_send_missed_passive_fill_discord_alerts(now_local: datetime) -> int:
                 "status": row.get("status", ""),
                 "count": row.get("count", 0),
             }
+            state_changed = True
             sent_count += 1
         except Exception:
             continue
-    if sent_count > 0:
+    if state_changed:
         _save_live_trade_discord_state(today_key)
     return sent_count
 

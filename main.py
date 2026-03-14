@@ -3411,6 +3411,12 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
                 if changed:
                     updated_weather += 1
                     updated_auto_weather += 1
+                if not dry_run:
+                    try:
+                        if _append_live_fill_backfill_from_settlement(rr):
+                            backfilled_live_weather_fills += 1
+                    except Exception:
+                        pass
             else:
                 aw_rows.append(row)
                 idx_auto_weather[key] = len(aw_rows) - 1

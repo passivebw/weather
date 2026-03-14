@@ -267,6 +267,14 @@ DISCREPANCY_ALERT_THRESHOLD = float(os.getenv("DISCREPANCY_ALERT_THRESHOLD", "0.
 DISCREPANCY_MEAN_TEMP_THRESHOLD_F = float(os.getenv("DISCREPANCY_MEAN_TEMP_THRESHOLD_F", "2.0"))
 MIN_SECONDS_BETWEEN_DISCREPANCY_POSTS = int(os.getenv("MIN_SECONDS_BETWEEN_DISCREPANCY_POSTS", "900"))
 CONSENSUS_BASE_SIGMA_F = float(os.getenv("CONSENSUS_BASE_SIGMA_F", "2.2"))
+CONSENSUS_DISAGREEMENT_SIGMA_MULTIPLIER = float(os.getenv("CONSENSUS_DISAGREEMENT_SIGMA_MULTIPLIER", "0.75"))
+CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER = float(os.getenv("CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER", "0.15"))
+CONSENSUS_SOURCE_RANGE_FREE_F = float(os.getenv("CONSENSUS_SOURCE_RANGE_FREE_F", "1.5"))
+CONSENSUS_MIN_SIGMA_F = float(os.getenv("CONSENSUS_MIN_SIGMA_F", "1.2"))
+BOUNDARY_PENALTY_ENABLED = env_bool("BOUNDARY_PENALTY_ENABLED", default=True)
+BOUNDARY_PENALTY_WIDTH_F = float(os.getenv("BOUNDARY_PENALTY_WIDTH_F", "1.0"))
+BOUNDARY_PENALTY_MIN_MULTIPLIER = float(os.getenv("BOUNDARY_PENALTY_MIN_MULTIPLIER", "0.55"))
+BOUNDARY_PENALTY_NO_ONLY = env_bool("BOUNDARY_PENALTY_NO_ONLY", default=True)
 NWS_HIST_MAE_F = float(os.getenv("NWS_HIST_MAE_F", "2.0"))
 NWS_LOW_HIST_MAE_F = float(os.getenv("NWS_LOW_HIST_MAE_F", str(NWS_HIST_MAE_F)))
 NWS_OBS_STALE_MINUTES = int(os.getenv("NWS_OBS_STALE_MINUTES", "130"))
@@ -285,6 +293,10 @@ OPEN_METEO_HIST_MAE_F = float(os.getenv("OPEN_METEO_HIST_MAE_F", "2.4"))
 OPEN_METEO_ECMWF_HIST_MAE_F = float(os.getenv("OPEN_METEO_ECMWF_HIST_MAE_F", str(OPEN_METEO_HIST_MAE_F)))
 OPEN_METEO_GFS_HIST_MAE_F = float(os.getenv("OPEN_METEO_GFS_HIST_MAE_F", str(OPEN_METEO_HIST_MAE_F)))
 METNO_HIST_MAE_F = float(os.getenv("METNO_HIST_MAE_F", "2.7"))
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
+OPENWEATHER_HIST_MAE_F = float(os.getenv("OPENWEATHER_HIST_MAE_F", "2.3"))
+ENABLE_OPENWEATHER_SOURCE = env_bool("ENABLE_OPENWEATHER_SOURCE", default=False)
+OPENWEATHER_FORECAST_CACHE_TTL_SECONDS = int(os.getenv("OPENWEATHER_FORECAST_CACHE_TTL_SECONDS", "1800"))
 WEATHERCOM_API_KEY = os.getenv("WEATHERCOM_API_KEY", "").strip()
 WEATHERCOM_HIST_MAE_F = float(os.getenv("WEATHERCOM_HIST_MAE_F", "2.1"))
 ACCUWEATHER_API_KEY = os.getenv("ACCUWEATHER_API_KEY", "").strip()
@@ -377,8 +389,10 @@ _live_exit_state: Dict[str, dict] = {}
 _live_kill_switch_state = LIVE_KILL_SWITCH
 _market_cache_lock = threading.Lock()
 _accuweather_cache_lock = threading.Lock()
+_openweather_cache_lock = threading.Lock()
 _kalshi_key_cache = None
 _kalshi_key_lock = threading.Lock()
+_openweather_forecast_cache: Dict[str, Dict[str, object]] = {}
 _accuweather_location_cache: Dict[str, Dict[str, object]] = {}
 _accuweather_forecast_cache: Dict[str, Dict[str, object]] = {}
 _accuweather_cache_loaded = False
@@ -426,6 +440,27 @@ def weighted_std(values: List[Tuple[float, float]], mu: float) -> float:
         return 0.0
     var = sum(w * (v - mu) ** 2 for v, w in values) / total_w
     return math.sqrt(max(0.0, var))
+
+def _source_range(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    return max(values) - min(values)
+
+def _bucket_boundary_distance_f(mu: float, lo: float, hi: float) -> float:
+    lower = float(lo) - 0.5
+    upper = float(hi) + 0.5
+    return min(abs(float(mu) - lower), abs(float(mu) - upper))
+
+def _boundary_edge_multiplier(mu: float, lo: float, hi: float) -> float:
+    if not BOUNDARY_PENALTY_ENABLED:
+        return 1.0
+    width = max(1e-6, float(BOUNDARY_PENALTY_WIDTH_F))
+    dist = _bucket_boundary_distance_f(mu, lo, hi)
+    if dist >= width:
+        return 1.0
+    min_mult = clamp(float(BOUNDARY_PENALTY_MIN_MULTIPLIER), 0.0, 1.0)
+    frac = dist / width
+    return clamp(min_mult + ((1.0 - min_mult) * frac), min_mult, 1.0)
 
 def canonical_city_name(city: str) -> Optional[str]:
     key = city.strip().lower()
@@ -723,6 +758,67 @@ def metno_get_forecast_temp_f(lat: float, lon: float, now_local: datetime, temp_
     if not temps_f:
         return None
     return max(temps_f) if side == "high" else min(temps_f)
+
+def openweather_get_forecast_high_f(lat: float, lon: float, now_local: datetime) -> Optional[float]:
+    return openweather_get_forecast_temp_f(lat, lon, now_local, temp_side="high")
+
+def openweather_get_forecast_low_f(lat: float, lon: float, now_local: datetime) -> Optional[float]:
+    return openweather_get_forecast_temp_f(lat, lon, now_local, temp_side="low")
+
+def openweather_get_forecast_temp_f(lat: float, lon: float, now_local: datetime, temp_side: str = "high") -> Optional[float]:
+    side = normalize_temp_side(temp_side)
+    if not OPENWEATHER_API_KEY:
+        return None
+    cache_key = f"{lat:.4f},{lon:.4f}"
+    today_iso = now_local.date().isoformat()
+    now_ts = time.time()
+    with _openweather_cache_lock:
+        cached = _openweather_forecast_cache.get(cache_key)
+        if isinstance(cached, dict):
+            age = now_ts - float(cached.get("ts", 0.0) or 0.0)
+            if age < max(60, OPENWEATHER_FORECAST_CACHE_TTL_SECONDS) and str(cached.get("date", "") or "") == today_iso:
+                v = cached.get("high_f") if side == "high" else cached.get("low_f")
+                if v is not None:
+                    return float(v)
+    params = {
+        "lat": f"{lat:.4f}",
+        "lon": f"{lon:.4f}",
+        "appid": OPENWEATHER_API_KEY,
+        "units": "imperial",
+        "exclude": "minutely,alerts",
+    }
+    r = requests.get("https://api.openweathermap.org/data/3.0/onecall", params=params, timeout=20)
+    r.raise_for_status()
+    payload = r.json()
+    daily = payload.get("daily", []) or []
+    if not daily:
+        return None
+    selected = None
+    for row in daily:
+        dt_raw = row.get("dt")
+        if dt_raw is None:
+            continue
+        try:
+            dt_local = datetime.fromtimestamp(int(dt_raw), tz=LOCAL_TZ)
+        except Exception:
+            continue
+        if dt_local.date().isoformat() == today_iso:
+            selected = row
+            break
+    if selected is None:
+        selected = daily[0]
+    temp_obj = selected.get("temp", {}) or {}
+    high_f = _to_float(temp_obj.get("max"))
+    low_f = _to_float(temp_obj.get("min"))
+    with _openweather_cache_lock:
+        _openweather_forecast_cache[cache_key] = {
+            "ts": now_ts,
+            "date": today_iso,
+            "high_f": high_f,
+            "low_f": low_f,
+        }
+    v = high_f if side == "high" else low_f
+    return None if v is None else float(v)
 
 def weathercom_get_forecast_high_f(lat: float, lon: float, now_local: datetime) -> Optional[float]:
     return weathercom_get_forecast_temp_f(lat, lon, now_local, temp_side="high")
@@ -1816,6 +1912,14 @@ def build_expert_consensus(
         except Exception:
             pass
 
+    if ENABLE_OPENWEATHER_SOURCE:
+        try:
+            openweather_v = openweather_get_forecast_temp_f(lat, lon, now_local, temp_side=side)
+            if openweather_v is not None:
+                source_values.append(("OpenWeather", openweather_v, safe_inverse_mae_weight(OPENWEATHER_HIST_MAE_F)))
+        except Exception:
+            pass
+
     if ENABLE_NWS_SOURCE:
         try:
             if side == "high":
@@ -1847,15 +1951,24 @@ def build_expert_consensus(
         return None
 
     temp_weight_pairs = [(temp, weight) for _, temp, weight in source_values]
+    source_only_values = [float(temp) for _, temp, _ in source_values]
     mu = weighted_mean(temp_weight_pairs)
     if mu is None:
         return None
     disagreement_sigma = weighted_std(temp_weight_pairs, mu)
-    sigma = max(1.2, CONSENSUS_BASE_SIGMA_F + 0.5 * disagreement_sigma)
+    source_range_f = _source_range(source_only_values)
+    sigma = max(
+        CONSENSUS_MIN_SIGMA_F,
+        CONSENSUS_BASE_SIGMA_F
+        + (CONSENSUS_DISAGREEMENT_SIGMA_MULTIPLIER * disagreement_sigma)
+        + (CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER * max(0.0, source_range_f - CONSENSUS_SOURCE_RANGE_FREE_F)),
+    )
 
     return {
         "mu": mu,
         "sigma": sigma,
+        "disagreement_sigma_f": disagreement_sigma,
+        "source_range_f": source_range_f,
         "sources": [{"name": name, "high_f": temp, "weight": w} for name, temp, w in source_values],
     }
 
@@ -2059,6 +2172,14 @@ def build_city_bucket_comparison(
         yes_bid_p = r["yes_bid"] / 100.0
         edge_buy_yes = source_yes_p - yes_ask_p
         edge_buy_no = yes_bid_p - source_yes_p
+        boundary_distance_f = _bucket_boundary_distance_f(consensus_mu, r["lo"], r["hi"])
+        boundary_edge_multiplier = _boundary_edge_multiplier(consensus_mu, r["lo"], r["hi"])
+        if not locked_outcome and boundary_edge_multiplier < 0.999:
+            if BOUNDARY_PENALTY_NO_ONLY:
+                edge_buy_no *= boundary_edge_multiplier
+            else:
+                edge_buy_yes *= boundary_edge_multiplier
+                edge_buy_no *= boundary_edge_multiplier
         # Be conservative on high-temp intraday signals before local noon.
         if side == "high" and city_hour_lst < HIGH_EARLY_DAMPING_HOUR_LST and not locked_outcome:
             edge_buy_yes *= HIGH_EARLY_EDGE_DAMPING_MULTIPLIER
@@ -2076,6 +2197,8 @@ def build_city_bucket_comparison(
         r["kalshi_yes_prob"] = kalshi_yes_p
         r["source_yes_prob_raw"] = source_yes_p_raw
         r["source_yes_prob"] = source_yes_p
+        r["boundary_distance_f"] = boundary_distance_f
+        r["boundary_edge_multiplier"] = boundary_edge_multiplier
         r["locked_outcome"] = locked_outcome
         r["locked_reason"] = locked_reason
         r["obs_impossible_prob"] = obs_impossible_prob
@@ -2096,6 +2219,8 @@ def build_city_bucket_comparison(
         "kalshi_mean_f": kalshi_mean,
         "consensus_mu_f": consensus_mu,
         "consensus_sigma_f": consensus_sigma,
+        "consensus_disagreement_sigma_f": float(consensus.get("disagreement_sigma_f", 0.0) or 0.0),
+        "consensus_source_range_f": float(consensus.get("source_range_f", 0.0) or 0.0),
         "city_hour_lst": city_hour_lst,
         "forecast_ceiling_f": forecast_ceiling_f,
         "source_text": source_text,
@@ -7634,6 +7759,12 @@ def health():
         "OpenMeteo-GFS",
         "MET-Norway" if ENABLE_METNO_SOURCE else "MET-Norway (disabled via ENABLE_METNO_SOURCE)",
     ]
+    if ENABLE_OPENWEATHER_SOURCE and OPENWEATHER_API_KEY:
+        configured_sources.append("OpenWeather")
+    elif ENABLE_OPENWEATHER_SOURCE and not OPENWEATHER_API_KEY:
+        configured_sources.append("OpenWeather (enabled but missing OPENWEATHER_API_KEY)")
+    else:
+        configured_sources.append("OpenWeather (disabled via ENABLE_OPENWEATHER_SOURCE)")
     if ENABLE_NWS_SOURCE:
         configured_sources.append("NWS")
     else:
@@ -7675,6 +7806,16 @@ def health():
         "high_lock_margin_f": HIGH_LOCK_MARGIN_F,
         "low_lock_margin_f": LOW_LOCK_MARGIN_F,
         "obs_boundary_sigma_f": OBS_BOUNDARY_SIGMA_F,
+        "consensus_disagreement_sigma_multiplier": CONSENSUS_DISAGREEMENT_SIGMA_MULTIPLIER,
+        "consensus_source_range_sigma_multiplier": CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER,
+        "consensus_source_range_free_f": CONSENSUS_SOURCE_RANGE_FREE_F,
+        "consensus_min_sigma_f": CONSENSUS_MIN_SIGMA_F,
+        "enable_openweather_source": ENABLE_OPENWEATHER_SOURCE,
+        "openweather_forecast_cache_ttl_seconds": OPENWEATHER_FORECAST_CACHE_TTL_SECONDS,
+        "boundary_penalty_enabled": BOUNDARY_PENALTY_ENABLED,
+        "boundary_penalty_width_f": BOUNDARY_PENALTY_WIDTH_F,
+        "boundary_penalty_min_multiplier": BOUNDARY_PENALTY_MIN_MULTIPLIER,
+        "boundary_penalty_no_only": BOUNDARY_PENALTY_NO_ONLY,
         "high_hard_lock_extra_margin_f": HIGH_HARD_LOCK_EXTRA_MARGIN_F,
         "low_hard_lock_extra_margin_f": LOW_HARD_LOCK_EXTRA_MARGIN_F,
         "high_early_edge_damping_multiplier": HIGH_EARLY_EDGE_DAMPING_MULTIPLIER,

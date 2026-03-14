@@ -3564,7 +3564,11 @@ def _append_live_fill_backfill_from_settlement(settlement_row: dict) -> bool:
         "line": str(settlement_row.get("line", "")).strip() or str((ref or {}).get("line", "")).strip(),
         "edge_pct": str((ref or {}).get("edge_pct", "")),
         "units": str((ref or {}).get("units", "")),
-        "stake_dollars": str(settlement_row.get("stake_dollars", "")).strip() or str((ref or {}).get("stake_dollars", "")),
+        "stake_dollars": (
+            str(settlement_row.get("stake_dollars", "")).strip()
+            or str(settlement_row.get("total_cost_dollars", "")).strip()
+            or str((ref or {}).get("stake_dollars", ""))
+        ),
         "side": str((ref or {}).get("side", "buy")).strip() or "buy",
         "limit_price_cents": str((ref or {}).get("limit_price_cents", "")),
         "count": int(max(1, count)),
@@ -4329,8 +4333,13 @@ def _infer_contract_count_from_settlement_row(settlement_row: dict, reference_ro
     payout = float(_to_float(settlement_row.get("total_payout_dollars")) or 0.0)
     if payout > 0.0:
         return max(1, int(round(payout)))
-    stake = float(_to_float(settlement_row.get("stake_dollars")) or 0.0)
     ref = reference_row or {}
+    stake = float(
+        _to_float(settlement_row.get("stake_dollars"))
+        or _to_float(settlement_row.get("total_cost_dollars"))
+        or _to_float(ref.get("stake_dollars"))
+        or 0.0
+    )
     price_cents = float(_to_float(ref.get("limit_price_cents")) or _to_float(ref.get("price_cents")) or 0.0)
     if stake > 0.0 and price_cents > 0.0:
         try:

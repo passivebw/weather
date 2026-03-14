@@ -2809,6 +2809,9 @@ def manual_auto_weather_positions_path() -> str:
 def manual_btc_positions_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "manual_positions_btc.csv")
 
+def loss_postmortems_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "loss_postmortems.csv")
+
 RANGE_PACKAGE_PAPER_FIELDS = [
     "ts_est", "date", "city", "temp_side", "package_bet", "package_bucket_count",
     "combined_line", "combined_tickers", "combined_model_yes_prob_pct",
@@ -2816,6 +2819,23 @@ RANGE_PACKAGE_PAPER_FIELDS = [
     "leg1_line", "leg1_ticker", "leg1_yes_ask", "leg1_model_yes_prob_pct",
     "leg2_line", "leg2_ticker", "leg2_yes_ask", "leg2_model_yes_prob_pct",
     "min_top_size", "max_spread_cents", "source_values_json",
+]
+
+LOSS_POSTMORTEM_FIELDS = [
+    "entry_ts_est", "date", "city", "temp_side", "station",
+    "ticker", "bet", "line",
+    "entry_count", "entry_stake_dollars", "entry_fee_dollars", "entry_price_cents",
+    "entry_market_prob_pct", "entry_model_prob_pct", "entry_edge_pct",
+    "consensus_mu_f", "consensus_sigma_f",
+    "source_values_json", "source_weights_json", "source_range_f",
+    "yes_bid", "yes_ask", "spread_cents", "top_size",
+    "edge_lifecycle_first_seen_est", "edge_lifecycle_last_seen_est",
+    "edge_lifecycle_scan_count", "edge_lifecycle_max_edge_pct", "edge_lifecycle_close_reason",
+    "final_outcome_f", "settlement_station", "settlement_source",
+    "bucket_lo_f", "bucket_hi_f", "bucket_mid_f", "miss_distance_f",
+    "actual_yes_outcome", "actual_win",
+    "realized_pnl_dollars",
+    "diagnostic_tags",
 ]
 
 def _read_csv_rows_with_header(path: str) -> Tuple[List[str], List[dict]]:
@@ -2871,6 +2891,14 @@ def _append_range_package_paper_log(row: dict) -> None:
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=RANGE_PACKAGE_PAPER_FIELDS)
         w.writerow({k: row.get(k, "") for k in RANGE_PACKAGE_PAPER_FIELDS})
+
+def ensure_loss_postmortems_header() -> None:
+    _ensure_csv_header_contains(loss_postmortems_path(), LOSS_POSTMORTEM_FIELDS)
+
+def load_loss_postmortem_rows() -> List[dict]:
+    ensure_loss_postmortems_header()
+    _header, rows = _read_csv_rows_with_header(loss_postmortems_path())
+    return rows
 
 def ensure_manual_positions_header() -> None:
     path = manual_positions_path()
@@ -6042,6 +6070,302 @@ def dedupe_snapshot_rows(rows: List[dict]) -> List[dict]:
             keep[key] = r
     return list(keep.values())
 
+def _load_edge_lifecycle_history_rows() -> List[dict]:
+    path = edge_lifecycle_history_path()
+    if not os.path.exists(path):
+        return []
+    out: List[dict] = []
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                out.append(dict(r))
+    except Exception:
+        return []
+    return out
+
+def _nearest_snapshot_for_trade(date_iso: str, city: str, temp_side: str, ticker: str, entry_ts: Optional[datetime]) -> Optional[dict]:
+    rows = dedupe_snapshot_rows(load_snapshot_rows_filtered(date=date_iso, city=city, temp_side=temp_side))
+    candidates: List[Tuple[int, datetime, dict]] = []
+    for r in rows:
+        if str(r.get("best_ticker", "")).strip() != str(ticker).strip():
+            continue
+        ts = parse_ts_est(str(r.get("ts_est", "")))
+        if ts is None:
+            continue
+        if entry_ts is not None and ts <= entry_ts:
+            candidates.append((0, ts, r))
+        else:
+            candidates.append((1, ts, r))
+    if not candidates:
+        return None
+    if entry_ts is not None:
+        prior = [x for x in candidates if x[0] == 0]
+        if prior:
+            prior.sort(key=lambda x: x[1], reverse=True)
+            return prior[0][2]
+        later = [x for x in candidates if x[0] == 1]
+        if later:
+            later.sort(key=lambda x: x[1])
+            return later[0][2]
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[0][2]
+
+def _edge_lifecycle_context_for_trade(date_iso: str, city: str, temp_side: str, ticker: str, bet: str) -> Optional[dict]:
+    best = None
+    for r in _load_edge_lifecycle_history_rows():
+        if str(r.get("date", "")).strip() != str(date_iso).strip():
+            continue
+        if str(r.get("city", "")).strip() != str(city).strip():
+            continue
+        if normalize_temp_side(str(r.get("temp_type", "high"))) != normalize_temp_side(temp_side):
+            continue
+        if str(r.get("ticker", "")).strip() != str(ticker).strip():
+            continue
+        if str(r.get("bet", "")).strip().upper() != str(bet).strip().upper():
+            continue
+        prev = best
+        if prev is None:
+            best = r
+            continue
+        try:
+            if float(_to_float(r.get("max_edge_pct")) or 0.0) > float(_to_float(prev.get("max_edge_pct")) or 0.0):
+                best = r
+        except Exception:
+            pass
+    return best
+
+def _loss_postmortem_diagnostic_tags(
+    *,
+    bet: str,
+    entry_model_prob_pct: Optional[float],
+    entry_edge_pct: Optional[float],
+    spread_cents: Optional[float],
+    top_size: Optional[float],
+    source_range_f: Optional[float],
+    consensus_sigma_f: Optional[float],
+    miss_distance_f: Optional[float],
+) -> List[str]:
+    tags: List[str] = []
+    if entry_model_prob_pct is not None and float(entry_model_prob_pct) >= 80.0:
+        tags.append("high_confidence_loss")
+    if entry_edge_pct is not None and float(entry_edge_pct) < 12.0:
+        tags.append("thin_edge")
+    if spread_cents is not None and float(spread_cents) >= 4.0:
+        tags.append("wide_spread")
+    if top_size is not None and float(top_size) < 10.0:
+        tags.append("thin_liquidity")
+    if source_range_f is not None and float(source_range_f) >= 3.0:
+        tags.append("source_disagreement")
+    if consensus_sigma_f is not None and miss_distance_f is not None and float(consensus_sigma_f) <= 2.0 and float(miss_distance_f) >= 2.0:
+        tags.append("distribution_too_narrow")
+    if miss_distance_f is not None:
+        if float(miss_distance_f) <= 1.0:
+            tags.append("near_bucket_boundary")
+        elif float(miss_distance_f) >= 3.0:
+            tags.append("far_from_bucket")
+    if "NO" in str(bet).upper():
+        tags.append("no_side_loss")
+    elif "YES" in str(bet).upper():
+        tags.append("yes_side_loss")
+    return tags
+
+def build_loss_postmortems(start: Optional[str] = None, end: Optional[str] = None) -> dict:
+    d0 = None
+    d1 = None
+    try:
+        if start:
+            d0 = datetime.fromisoformat(str(start)).date()
+    except Exception:
+        d0 = None
+    try:
+        if end:
+            d1 = datetime.fromisoformat(str(end)).date()
+    except Exception:
+        d1 = None
+
+    settlement_map = load_final_settlement_map()
+    grouped: Dict[Tuple[str, str, str, str, str, str], dict] = {}
+    for r in load_live_trade_log_rows():
+        st = str(r.get("status", "")).strip().lower()
+        if st not in ("submitted", "partial", "partial_filled"):
+            continue
+        if str(r.get("order_action", "buy")).strip().lower() != "buy":
+            continue
+        cnt = int(float(_to_float(r.get("count")) or 0))
+        if cnt <= 0:
+            continue
+        date_iso = str(r.get("date", "")).strip()
+        city = str(r.get("city", "")).strip()
+        temp_side = normalize_temp_side(str(r.get("temp_type", r.get("temp_side", "high"))))
+        ticker = str(r.get("ticker", "")).strip()
+        bet = str(r.get("bet", "")).strip().upper()
+        line = str(r.get("line", "")).strip()
+        if not (date_iso and city and ticker and bet and line):
+            continue
+        try:
+            dd = datetime.fromisoformat(date_iso).date()
+        except Exception:
+            dd = None
+        if d0 and dd and dd < d0:
+            continue
+        if d1 and dd and dd > d1:
+            continue
+        key = (date_iso, city, temp_side, ticker, bet, line)
+        g = grouped.get(key)
+        stake = float(_to_float(r.get("stake_dollars")) or 0.0)
+        fees = float(_to_float(r.get("fee_dollars")) or 0.0)
+        edge_pct = float(_to_float(r.get("edge_pct")) or 0.0)
+        count = cnt
+        if g is None:
+            grouped[key] = {
+                "date": date_iso,
+                "city": city,
+                "temp_side": temp_side,
+                "ticker": ticker,
+                "bet": bet,
+                "line": line,
+                "entry_ts_est": r.get("ts_est"),
+                "entry_count": count,
+                "entry_stake_dollars": stake,
+                "entry_fee_dollars": fees,
+                "edge_weighted_sum": edge_pct * stake,
+            }
+        else:
+            ts_prev = parse_ts_est(str(g.get("entry_ts_est", "")))
+            ts_new = parse_ts_est(str(r.get("ts_est", "")))
+            if ts_prev is None or (ts_new is not None and ts_new < ts_prev):
+                g["entry_ts_est"] = r.get("ts_est")
+            g["entry_count"] = int(g.get("entry_count", 0) or 0) + count
+            g["entry_stake_dollars"] = float(g.get("entry_stake_dollars", 0.0) or 0.0) + stake
+            g["entry_fee_dollars"] = float(g.get("entry_fee_dollars", 0.0) or 0.0) + fees
+            g["edge_weighted_sum"] = float(g.get("edge_weighted_sum", 0.0) or 0.0) + (edge_pct * stake)
+
+    rows_out: List[dict] = []
+    for (_date, city, temp_side, ticker, bet, line), g in grouped.items():
+        settle = settlement_map.get((_date, city, temp_side))
+        outcome_f = _to_float((settle or {}).get("outcome_f"))
+        bucket = parse_bucket_from_line(line)
+        if outcome_f is None or bucket is None:
+            continue
+        lo, hi = bucket
+        yes_outcome = _bucket_yes_from_outcome(float(outcome_f), float(lo), float(hi))
+        actual_win = bool(yes_outcome) if "YES" in bet else (not bool(yes_outcome))
+        if actual_win:
+            continue
+        entry_count = int(g.get("entry_count", 0) or 0)
+        entry_stake = float(g.get("entry_stake_dollars", 0.0) or 0.0)
+        entry_fees = float(g.get("entry_fee_dollars", 0.0) or 0.0)
+        if entry_count <= 0 or entry_stake <= 0:
+            continue
+        entry_price_cents = (100.0 * entry_stake / entry_count) if entry_count > 0 else 0.0
+        entry_edge_pct = (float(g.get("edge_weighted_sum", 0.0) or 0.0) / entry_stake) if entry_stake > 0 else 0.0
+        entry_ts = parse_ts_est(str(g.get("entry_ts_est", "")))
+        snap = _nearest_snapshot_for_trade(_date, city, temp_side, ticker, entry_ts) or {}
+        model_yes_prob_pct = 100.0 * float(_to_float(snap.get("model_yes_prob")) or 0.0) if str(snap.get("model_yes_prob", "")).strip() else None
+        market_yes_prob_pct = 100.0 * float(_to_float(snap.get("kalshi_yes_prob")) or 0.0) if str(snap.get("kalshi_yes_prob", "")).strip() else None
+        if "NO" in bet:
+            entry_model_prob_pct = (100.0 - model_yes_prob_pct) if model_yes_prob_pct is not None else None
+            entry_market_prob_pct = (100.0 - market_yes_prob_pct) if market_yes_prob_pct is not None else None
+        else:
+            entry_model_prob_pct = model_yes_prob_pct
+            entry_market_prob_pct = market_yes_prob_pct
+        source_values_json = str(snap.get("source_values_json", "") or "")
+        source_weights_json = str(snap.get("source_weights_json", "") or "")
+        source_range_f = None
+        try:
+            src_vals = json.loads(source_values_json) if source_values_json else {}
+            nums = [float(v) for v in src_vals.values() if isinstance(v, (int, float))]
+            if nums:
+                source_range_f = max(nums) - min(nums)
+        except Exception:
+            source_range_f = None
+        bucket_mid = (float(lo) + float(hi)) / 2.0 if hi < 900 and lo > -900 else (float(lo) if hi >= 900 else float(hi))
+        if yes_outcome:
+            miss_distance_f = 0.0
+        else:
+            if float(outcome_f) < float(lo):
+                miss_distance_f = float(lo) - float(outcome_f)
+            elif float(outcome_f) > float(hi):
+                miss_distance_f = float(outcome_f) - float(hi)
+            else:
+                miss_distance_f = 0.0
+        realized_pnl = -entry_stake - entry_fees
+        edge_ctx = _edge_lifecycle_context_for_trade(_date, city, temp_side, ticker, bet) or {}
+        tags = _loss_postmortem_diagnostic_tags(
+            bet=bet,
+            entry_model_prob_pct=entry_model_prob_pct,
+            entry_edge_pct=entry_edge_pct,
+            spread_cents=_to_float(snap.get("spread_cents")),
+            top_size=_to_float(snap.get("top_size")),
+            source_range_f=source_range_f,
+            consensus_sigma_f=_to_float(snap.get("consensus_sigma_f")),
+            miss_distance_f=miss_distance_f,
+        )
+        rows_out.append({
+            "entry_ts_est": g.get("entry_ts_est", ""),
+            "date": _date,
+            "city": city,
+            "temp_side": temp_side,
+            "station": (snap.get("station") or (settle or {}).get("station", "")),
+            "ticker": ticker,
+            "bet": bet,
+            "line": line,
+            "entry_count": entry_count,
+            "entry_stake_dollars": round(entry_stake, 2),
+            "entry_fee_dollars": round(entry_fees, 6),
+            "entry_price_cents": round(entry_price_cents, 2),
+            "entry_market_prob_pct": entry_market_prob_pct,
+            "entry_model_prob_pct": entry_model_prob_pct,
+            "entry_edge_pct": round(entry_edge_pct, 4),
+            "consensus_mu_f": _to_float(snap.get("consensus_mu_f")),
+            "consensus_sigma_f": _to_float(snap.get("consensus_sigma_f")),
+            "source_values_json": source_values_json,
+            "source_weights_json": source_weights_json,
+            "source_range_f": source_range_f,
+            "yes_bid": _to_float(snap.get("yes_bid")),
+            "yes_ask": _to_float(snap.get("yes_ask")),
+            "spread_cents": _to_float(snap.get("spread_cents")),
+            "top_size": _to_float(snap.get("top_size")),
+            "edge_lifecycle_first_seen_est": edge_ctx.get("first_seen_est", ""),
+            "edge_lifecycle_last_seen_est": edge_ctx.get("last_seen_est", ""),
+            "edge_lifecycle_scan_count": int(_to_float(edge_ctx.get("scan_count")) or 0),
+            "edge_lifecycle_max_edge_pct": _to_float(edge_ctx.get("max_edge_pct")),
+            "edge_lifecycle_close_reason": edge_ctx.get("close_reason", ""),
+            "final_outcome_f": outcome_f,
+            "settlement_station": (settle or {}).get("station", ""),
+            "settlement_source": (settle or {}).get("source", ""),
+            "bucket_lo_f": lo,
+            "bucket_hi_f": hi,
+            "bucket_mid_f": bucket_mid,
+            "miss_distance_f": round(float(miss_distance_f), 4),
+            "actual_yes_outcome": bool(yes_outcome),
+            "actual_win": False,
+            "realized_pnl_dollars": round(float(realized_pnl), 6),
+            "diagnostic_tags": "|".join(tags),
+        })
+
+    rows_out.sort(key=lambda r: parse_ts_est(str(r.get("entry_ts_est", ""))) or datetime.min.replace(tzinfo=LOCAL_TZ), reverse=True)
+    ensure_loss_postmortems_header()
+    _rewrite_csv_with_header(loss_postmortems_path(), LOSS_POSTMORTEM_FIELDS, rows_out)
+    summary = {
+        "loss_count": len(rows_out),
+        "total_realized_pnl_dollars": round(sum(float(_to_float(r.get("realized_pnl_dollars")) or 0.0) for r in rows_out), 6),
+        "avg_entry_edge_pct": (
+            sum(float(_to_float(r.get("entry_edge_pct")) or 0.0) for r in rows_out) / len(rows_out)
+            if rows_out else None
+        ),
+        "avg_miss_distance_f": (
+            sum(float(_to_float(r.get("miss_distance_f")) or 0.0) for r in rows_out) / len(rows_out)
+            if rows_out else None
+        ),
+    }
+    return {
+        "ok": True,
+        "path": loss_postmortems_path(),
+        "summary": summary,
+        "rows": rows_out,
+    }
+
 def build_calibration_tables() -> dict:
     path = snapshot_log_path()
     if not os.path.exists(path):
@@ -7369,6 +7693,8 @@ def health():
         "range_package_paper_bucket_count": RANGE_PACKAGE_PAPER_BUCKET_COUNT,
         "range_package_paper_trades_path": range_package_paper_trades_path(),
         "range_package_paper_trades_count": len(load_range_package_paper_rows()),
+        "loss_postmortems_path": loss_postmortems_path(),
+        "loss_postmortems_count": len(load_loss_postmortem_rows()),
         "discord_trade_alerts_enabled": DISCORD_TRADE_ALERTS_ENABLED,
         "paper_trade_post_top_n": PAPER_TRADE_POST_TOP_N,
         "paper_trade_max_alerts_per_market_per_day": PAPER_TRADE_MAX_ALERTS_PER_MARKET_PER_DAY,
@@ -9890,6 +10216,13 @@ def analytics_range_package_paper(
         "count": len(out),
         "rows": out,
     }
+
+@app.get("/analytics/loss-postmortems")
+def analytics_loss_postmortems(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    return build_loss_postmortems(start=start, end=end)
 
 @app.post("/manual/sync-kalshi")
 def manual_sync_kalshi(

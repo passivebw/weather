@@ -271,10 +271,15 @@ CONSENSUS_DISAGREEMENT_SIGMA_MULTIPLIER = float(os.getenv("CONSENSUS_DISAGREEMEN
 CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER = float(os.getenv("CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER", "0.15"))
 CONSENSUS_SOURCE_RANGE_FREE_F = float(os.getenv("CONSENSUS_SOURCE_RANGE_FREE_F", "1.5"))
 CONSENSUS_MIN_SIGMA_F = float(os.getenv("CONSENSUS_MIN_SIGMA_F", "1.2"))
+CONSENSUS_NWS_OUTLIER_TRIGGER_F = float(os.getenv("CONSENSUS_NWS_OUTLIER_TRIGGER_F", "4.0"))
+CONSENSUS_NWS_OUTLIER_SIGMA_ADD_F = float(os.getenv("CONSENSUS_NWS_OUTLIER_SIGMA_ADD_F", "0.6"))
 BOUNDARY_PENALTY_ENABLED = env_bool("BOUNDARY_PENALTY_ENABLED", default=True)
 BOUNDARY_PENALTY_WIDTH_F = float(os.getenv("BOUNDARY_PENALTY_WIDTH_F", "1.0"))
 BOUNDARY_PENALTY_MIN_MULTIPLIER = float(os.getenv("BOUNDARY_PENALTY_MIN_MULTIPLIER", "0.55"))
 BOUNDARY_PENALTY_NO_ONLY = env_bool("BOUNDARY_PENALTY_NO_ONLY", default=True)
+EXACT_NO_MIDPOINT_PENALTY_ENABLED = env_bool("EXACT_NO_MIDPOINT_PENALTY_ENABLED", default=True)
+EXACT_NO_MIDPOINT_WIDTH_F = float(os.getenv("EXACT_NO_MIDPOINT_WIDTH_F", "1.5"))
+EXACT_NO_MIDPOINT_MIN_MULTIPLIER = float(os.getenv("EXACT_NO_MIDPOINT_MIN_MULTIPLIER", "0.45"))
 NWS_HIST_MAE_F = float(os.getenv("NWS_HIST_MAE_F", "2.0"))
 NWS_LOW_HIST_MAE_F = float(os.getenv("NWS_LOW_HIST_MAE_F", str(NWS_HIST_MAE_F)))
 NWS_OBS_STALE_MINUTES = int(os.getenv("NWS_OBS_STALE_MINUTES", "130"))
@@ -289,6 +294,9 @@ HIGH_HARD_LOCK_EXTRA_MARGIN_F = float(os.getenv("HIGH_HARD_LOCK_EXTRA_MARGIN_F",
 LOW_HARD_LOCK_EXTRA_MARGIN_F = float(os.getenv("LOW_HARD_LOCK_EXTRA_MARGIN_F", "1.5"))
 HIGH_EARLY_EDGE_DAMPING_MULTIPLIER = float(os.getenv("HIGH_EARLY_EDGE_DAMPING_MULTIPLIER", "0.8"))
 HIGH_EARLY_DAMPING_HOUR_LST = int(os.getenv("HIGH_EARLY_DAMPING_HOUR_LST", "12"))
+LIVE_THIN_YES_EDGE_MAX_PCT = float(os.getenv("LIVE_THIN_YES_EDGE_MAX_PCT", "12.5"))
+LIVE_THIN_YES_MAX_SPREAD_CENTS = int(os.getenv("LIVE_THIN_YES_MAX_SPREAD_CENTS", "2"))
+LIVE_THIN_YES_MIN_TOP_SIZE = int(os.getenv("LIVE_THIN_YES_MIN_TOP_SIZE", "5"))
 OPEN_METEO_HIST_MAE_F = float(os.getenv("OPEN_METEO_HIST_MAE_F", "2.4"))
 OPEN_METEO_ECMWF_HIST_MAE_F = float(os.getenv("OPEN_METEO_ECMWF_HIST_MAE_F", str(OPEN_METEO_HIST_MAE_F)))
 OPEN_METEO_GFS_HIST_MAE_F = float(os.getenv("OPEN_METEO_GFS_HIST_MAE_F", str(OPEN_METEO_HIST_MAE_F)))
@@ -461,6 +469,51 @@ def _boundary_edge_multiplier(mu: float, lo: float, hi: float) -> float:
     min_mult = clamp(float(BOUNDARY_PENALTY_MIN_MULTIPLIER), 0.0, 1.0)
     frac = dist / width
     return clamp(min_mult + ((1.0 - min_mult) * frac), min_mult, 1.0)
+
+def _exact_bucket_no_midpoint_multiplier(mu: float, lo: float, hi: float) -> float:
+    if not EXACT_NO_MIDPOINT_PENALTY_ENABLED:
+        return 1.0
+    if float(lo) <= -900 or float(hi) >= 900:
+        return 1.0
+    mid = (float(lo) + float(hi)) / 2.0
+    width = max(1e-6, float(EXACT_NO_MIDPOINT_WIDTH_F))
+    dist = abs(float(mu) - mid)
+    if dist >= width:
+        return 1.0
+    min_mult = clamp(float(EXACT_NO_MIDPOINT_MIN_MULTIPLIER), 0.0, 1.0)
+    frac = dist / width
+    return clamp(min_mult + ((1.0 - min_mult) * frac), min_mult, 1.0)
+
+def _consensus_nws_outlier_metrics(source_values: List[Tuple[str, float, float]]) -> Tuple[float, float]:
+    nws_val: Optional[float] = None
+    others: List[float] = []
+    for name, temp, _weight in source_values:
+        if str(name).strip().upper() == "NWS":
+            nws_val = float(temp)
+        else:
+            others.append(float(temp))
+    if nws_val is None or not others:
+        return 0.0, 0.0
+    others_mu = sum(others) / float(len(others))
+    dist = abs(float(nws_val) - float(others_mu))
+    trigger = max(0.0, float(CONSENSUS_NWS_OUTLIER_TRIGGER_F))
+    if dist < trigger or trigger <= 0.0:
+        return dist, 0.0
+    scale = 1.0 + ((dist - trigger) / trigger)
+    sigma_add = float(CONSENSUS_NWS_OUTLIER_SIGMA_ADD_F) * max(1.0, scale)
+    return dist, sigma_add
+
+def _should_filter_thin_yes_trade(b: dict) -> bool:
+    if str(b.get("bet", "")).strip().upper() != "BUY YES":
+        return False
+    edge_pct = float(_to_float(b.get("net_edge_pct")) or 0.0)
+    if edge_pct > float(LIVE_THIN_YES_EDGE_MAX_PCT):
+        return False
+    spread_cents = _to_float(b.get("spread_cents"))
+    top_size = _to_float(b.get("top_size"))
+    spread_bad = (spread_cents is not None) and (float(spread_cents) > float(LIVE_THIN_YES_MAX_SPREAD_CENTS))
+    top_bad = (top_size is not None) and (float(top_size) < float(LIVE_THIN_YES_MIN_TOP_SIZE))
+    return bool(spread_bad or top_bad)
 
 def canonical_city_name(city: str) -> Optional[str]:
     key = city.strip().lower()
@@ -1948,11 +2001,13 @@ def build_expert_consensus(
         return None
     disagreement_sigma = weighted_std(temp_weight_pairs, mu)
     source_range_f = _source_range(source_only_values)
+    nws_outlier_f, nws_outlier_sigma_add = _consensus_nws_outlier_metrics(source_values)
     sigma = max(
         CONSENSUS_MIN_SIGMA_F,
         CONSENSUS_BASE_SIGMA_F
         + (CONSENSUS_DISAGREEMENT_SIGMA_MULTIPLIER * disagreement_sigma)
         + (CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER * max(0.0, source_range_f - CONSENSUS_SOURCE_RANGE_FREE_F)),
+        + nws_outlier_sigma_add,
     )
 
     return {
@@ -1960,6 +2015,8 @@ def build_expert_consensus(
         "sigma": sigma,
         "disagreement_sigma_f": disagreement_sigma,
         "source_range_f": source_range_f,
+        "nws_outlier_f": nws_outlier_f,
+        "nws_outlier_sigma_add_f": nws_outlier_sigma_add,
         "sources": [{"name": name, "high_f": temp, "weight": w} for name, temp, w in source_values],
     }
 
@@ -2177,12 +2234,15 @@ def build_city_bucket_comparison(
         edge_buy_no = yes_bid_p - source_yes_p
         boundary_distance_f = _bucket_boundary_distance_f(consensus_mu, r["lo"], r["hi"])
         boundary_edge_multiplier = _boundary_edge_multiplier(consensus_mu, r["lo"], r["hi"])
+        exact_no_midpoint_multiplier = _exact_bucket_no_midpoint_multiplier(consensus_mu, r["lo"], r["hi"])
         if not locked_outcome and boundary_edge_multiplier < 0.999:
             if BOUNDARY_PENALTY_NO_ONLY:
                 edge_buy_no *= boundary_edge_multiplier
             else:
                 edge_buy_yes *= boundary_edge_multiplier
                 edge_buy_no *= boundary_edge_multiplier
+        if not locked_outcome and exact_no_midpoint_multiplier < 0.999:
+            edge_buy_no *= exact_no_midpoint_multiplier
         # Be conservative on high-temp intraday signals before local noon.
         if side == "high" and city_hour_lst < HIGH_EARLY_DAMPING_HOUR_LST and not locked_outcome:
             edge_buy_yes *= HIGH_EARLY_EDGE_DAMPING_MULTIPLIER
@@ -2202,6 +2262,7 @@ def build_city_bucket_comparison(
         r["source_yes_prob"] = source_yes_p
         r["boundary_distance_f"] = boundary_distance_f
         r["boundary_edge_multiplier"] = boundary_edge_multiplier
+        r["exact_no_midpoint_multiplier"] = exact_no_midpoint_multiplier
         r["locked_outcome"] = locked_outcome
         r["locked_reason"] = locked_reason
         r["obs_impossible_prob"] = obs_impossible_prob
@@ -2224,6 +2285,8 @@ def build_city_bucket_comparison(
         "consensus_sigma_f": consensus_sigma,
         "consensus_disagreement_sigma_f": float(consensus.get("disagreement_sigma_f", 0.0) or 0.0),
         "consensus_source_range_f": float(consensus.get("source_range_f", 0.0) or 0.0),
+        "consensus_nws_outlier_f": float(consensus.get("nws_outlier_f", 0.0) or 0.0),
+        "consensus_nws_outlier_sigma_add_f": float(consensus.get("nws_outlier_sigma_add_f", 0.0) or 0.0),
         "city_hour_lst": city_hour_lst,
         "forecast_ceiling_f": forecast_ceiling_f,
         "source_text": source_text,
@@ -5212,6 +5275,8 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                     continue
                 if LIVE_STABILITY_REQUIRE_CHANGE_MID and (not bool(sig_entry.get("fresh_trigger", False))):
                     continue
+            if _should_filter_thin_yes_trade(b):
+                continue
             stake_dollars, kelly_units = _compute_stake_dollars_for_bet(b)
             units = kelly_units if KELLY_SIZING_ENABLED else units
             if early_session and (
@@ -8119,16 +8184,24 @@ def health():
         "consensus_source_range_sigma_multiplier": CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER,
         "consensus_source_range_free_f": CONSENSUS_SOURCE_RANGE_FREE_F,
         "consensus_min_sigma_f": CONSENSUS_MIN_SIGMA_F,
+        "consensus_nws_outlier_trigger_f": CONSENSUS_NWS_OUTLIER_TRIGGER_F,
+        "consensus_nws_outlier_sigma_add_f": CONSENSUS_NWS_OUTLIER_SIGMA_ADD_F,
         "enable_awc_obs": ENABLE_AWC_OBS,
         "awc_metar_cache_ttl_seconds": AWC_METAR_CACHE_TTL_SECONDS,
         "boundary_penalty_enabled": BOUNDARY_PENALTY_ENABLED,
         "boundary_penalty_width_f": BOUNDARY_PENALTY_WIDTH_F,
         "boundary_penalty_min_multiplier": BOUNDARY_PENALTY_MIN_MULTIPLIER,
         "boundary_penalty_no_only": BOUNDARY_PENALTY_NO_ONLY,
+        "exact_no_midpoint_penalty_enabled": EXACT_NO_MIDPOINT_PENALTY_ENABLED,
+        "exact_no_midpoint_width_f": EXACT_NO_MIDPOINT_WIDTH_F,
+        "exact_no_midpoint_min_multiplier": EXACT_NO_MIDPOINT_MIN_MULTIPLIER,
         "high_hard_lock_extra_margin_f": HIGH_HARD_LOCK_EXTRA_MARGIN_F,
         "low_hard_lock_extra_margin_f": LOW_HARD_LOCK_EXTRA_MARGIN_F,
         "high_early_edge_damping_multiplier": HIGH_EARLY_EDGE_DAMPING_MULTIPLIER,
         "high_early_damping_hour_lst": HIGH_EARLY_DAMPING_HOUR_LST,
+        "live_thin_yes_edge_max_pct": LIVE_THIN_YES_EDGE_MAX_PCT,
+        "live_thin_yes_max_spread_cents": LIVE_THIN_YES_MAX_SPREAD_CENTS,
+        "live_thin_yes_min_top_size": LIVE_THIN_YES_MIN_TOP_SIZE,
         "policy_min_net_edge_pct": POLICY_MIN_NET_EDGE_PCT,
         "live_locked_outcome_capture_enabled": LIVE_LOCKED_OUTCOME_CAPTURE_ENABLED,
         "live_locked_outcome_min_net_edge_pct": LIVE_LOCKED_OUTCOME_MIN_NET_EDGE_PCT,
@@ -9055,6 +9128,9 @@ def debug_live_candidate_funnel_snapshot(
             if LIVE_STABILITY_REQUIRE_CHANGE_MID and (not bool(sig_entry.get("fresh_trigger", False))):
                 _add_reason(execution_reason_counts, execution_examples, "stability_gate_requires_fresh_trigger", base_payload)
                 continue
+        if _should_filter_thin_yes_trade(b):
+            _add_reason(execution_reason_counts, execution_examples, "thin_yes_liquidity_filter", base_payload)
+            continue
         stake_dollars, _kelly_units = _compute_stake_dollars_for_bet(b)
         if early_session and ((not LIVE_EARLY_SESSION_APPLY_TO_HIGH_ONLY) or (side_k == "high")):
             size_mult = clamp(float(LIVE_EARLY_SESSION_SIZE_MULT), 0.05, 1.0)

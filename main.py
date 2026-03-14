@@ -6323,6 +6323,38 @@ def load_final_settlement_map() -> Dict[Tuple[str, str, str], dict]:
             out[key] = r
     return out
 
+def load_auto_weather_settlement_trade_map() -> Dict[Tuple[str, str, str], dict]:
+    out: Dict[Tuple[str, str, str], dict] = {}
+    for r in load_manual_auto_weather_positions_rows():
+        date_iso = str(r.get("date", "")).strip()
+        ticker = str(r.get("ticker", "")).strip().upper()
+        bet = str(r.get("bet", "")).strip().upper()
+        if not (date_iso and ticker and bet):
+            continue
+        city = str(r.get("city", "")).strip()
+        temp_side = normalize_temp_side(str(r.get("temp_side", "high")))
+        line = str(r.get("line", "")).strip()
+        if not city or not line:
+            dec = _decode_weather_ticker_fields(ticker) or {}
+            city = city or str(dec.get("city", "")).strip()
+            temp_side = normalize_temp_side(str(dec.get("temp_side", temp_side)))
+            line = line or str(dec.get("line", "")).strip()
+        out[(date_iso, ticker, bet)] = {
+            "date": date_iso,
+            "ticker": ticker,
+            "bet": bet,
+            "city": city,
+            "temp_side": temp_side,
+            "line": line,
+            "outcome": str(r.get("outcome", "")).strip().upper(),
+            "realized_pnl_dollars": _to_float(r.get("total_return_dollars")),
+            "fees_dollars": _to_float(r.get("fees_dollars")),
+            "source": str(r.get("source", "")).strip(),
+            "station": CITY_CONFIG.get(city, {}).get("station", "") if city else "",
+            "outcome_f": _to_float(r.get("outcome_f")),
+        }
+    return out
+
 def upsert_final_settlements(rows: List[dict]) -> None:
     ensure_final_settlements_header()
     path = final_settlements_path()
@@ -6561,6 +6593,7 @@ def build_loss_postmortems(start: Optional[str] = None, end: Optional[str] = Non
         d1 = None
 
     settlement_map = load_final_settlement_map()
+    auto_trade_settlements = load_auto_weather_settlement_trade_map()
     grouped: Dict[Tuple[str, str, str, str, str, str], dict] = {}
     for r in load_live_trade_log_rows():
         st = str(r.get("status", "")).strip().lower()
@@ -6619,14 +6652,31 @@ def build_loss_postmortems(start: Optional[str] = None, end: Optional[str] = Non
 
     rows_out: List[dict] = []
     for (_date, city, temp_side, ticker, bet, line), g in grouped.items():
+        auto_settle = auto_trade_settlements.get((_date, ticker, bet)) or {}
+        if not city:
+            city = str(auto_settle.get("city", "")).strip()
+        if not line:
+            line = str(auto_settle.get("line", "")).strip()
+        if not city or not line:
+            continue
         settle = settlement_map.get((_date, city, temp_side))
         outcome_f = _to_float((settle or {}).get("outcome_f"))
         bucket = parse_bucket_from_line(line)
-        if outcome_f is None or bucket is None:
+        if bucket is None:
             continue
         lo, hi = bucket
-        yes_outcome = _bucket_yes_from_outcome(float(outcome_f), float(lo), float(hi))
-        actual_win = bool(yes_outcome) if "YES" in bet else (not bool(yes_outcome))
+        actual_yes_outcome: Optional[bool] = None
+        if outcome_f is not None:
+            actual_yes_outcome = _bucket_yes_from_outcome(float(outcome_f), float(lo), float(hi))
+        else:
+            outcome_txt = str(auto_settle.get("outcome", "")).strip().upper()
+            if outcome_txt == "YES":
+                actual_yes_outcome = True
+            elif outcome_txt == "NO":
+                actual_yes_outcome = False
+        if actual_yes_outcome is None:
+            continue
+        actual_win = bool(actual_yes_outcome) if "YES" in bet else (not bool(actual_yes_outcome))
         if actual_win:
             continue
         entry_count = int(g.get("entry_count", 0) or 0)
@@ -6657,16 +6707,20 @@ def build_loss_postmortems(start: Optional[str] = None, end: Optional[str] = Non
         except Exception:
             source_range_f = None
         bucket_mid = (float(lo) + float(hi)) / 2.0 if hi < 900 and lo > -900 else (float(lo) if hi >= 900 else float(hi))
-        if yes_outcome:
-            miss_distance_f = 0.0
+        if outcome_f is None:
+            miss_distance_f = None
         else:
-            if float(outcome_f) < float(lo):
+            if actual_yes_outcome:
+                miss_distance_f = 0.0
+            elif float(outcome_f) < float(lo):
                 miss_distance_f = float(lo) - float(outcome_f)
             elif float(outcome_f) > float(hi):
                 miss_distance_f = float(outcome_f) - float(hi)
             else:
                 miss_distance_f = 0.0
-        realized_pnl = -entry_stake - entry_fees
+        realized_pnl = _to_float(auto_settle.get("realized_pnl_dollars"))
+        if realized_pnl is None:
+            realized_pnl = -entry_stake - entry_fees
         edge_ctx = _edge_lifecycle_context_for_trade(_date, city, temp_side, ticker, bet) or {}
         tags = _loss_postmortem_diagnostic_tags(
             bet=bet,
@@ -6676,14 +6730,14 @@ def build_loss_postmortems(start: Optional[str] = None, end: Optional[str] = Non
             top_size=_to_float(snap.get("top_size")),
             source_range_f=source_range_f,
             consensus_sigma_f=_to_float(snap.get("consensus_sigma_f")),
-            miss_distance_f=miss_distance_f,
+            miss_distance_f=(float(miss_distance_f) if miss_distance_f is not None else None),
         )
         rows_out.append({
             "entry_ts_est": g.get("entry_ts_est", ""),
             "date": _date,
             "city": city,
             "temp_side": temp_side,
-            "station": (snap.get("station") or (settle or {}).get("station", "")),
+            "station": (snap.get("station") or (settle or {}).get("station", "") or auto_settle.get("station", "")),
             "ticker": ticker,
             "bet": bet,
             "line": line,
@@ -6709,13 +6763,13 @@ def build_loss_postmortems(start: Optional[str] = None, end: Optional[str] = Non
             "edge_lifecycle_max_edge_pct": _to_float(edge_ctx.get("max_edge_pct")),
             "edge_lifecycle_close_reason": edge_ctx.get("close_reason", ""),
             "final_outcome_f": outcome_f,
-            "settlement_station": (settle or {}).get("station", ""),
-            "settlement_source": (settle or {}).get("source", ""),
+            "settlement_station": (settle or {}).get("station", "") or auto_settle.get("station", ""),
+            "settlement_source": (settle or {}).get("source", "") or auto_settle.get("source", ""),
             "bucket_lo_f": lo,
             "bucket_hi_f": hi,
             "bucket_mid_f": bucket_mid,
-            "miss_distance_f": round(float(miss_distance_f), 4),
-            "actual_yes_outcome": bool(yes_outcome),
+            "miss_distance_f": (round(float(miss_distance_f), 4) if miss_distance_f is not None else ""),
+            "actual_yes_outcome": bool(actual_yes_outcome),
             "actual_win": False,
             "realized_pnl_dollars": round(float(realized_pnl), 6),
             "diagnostic_tags": "|".join(tags),

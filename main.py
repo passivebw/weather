@@ -8332,6 +8332,38 @@ def calibration(min_samples: int = CALIBRATION_MIN_SAMPLES):
         "final_settlements_path": final_settlements_path(),
     }
 
+@app.get("/debug/awc-metar")
+def debug_awc_metar(city: Optional[str] = None, station: Optional[str] = None):
+    resolved_city = canonical_city_name(city or "") if city else None
+    resolved_station = str(station or "").strip().upper()
+    if not resolved_station and resolved_city:
+        resolved_station = str(CITY_CONFIG.get(resolved_city, {}).get("station", "")).strip().upper()
+    if not resolved_station:
+        return {
+            "ok": False,
+            "error": "provide city or station",
+            "cities": list(CITY_CONFIG.keys()),
+        }
+    try:
+        raw = awc_get_latest_metar(resolved_station)
+        parsed = awc_get_latest_metar_obs(resolved_station)
+    except Exception as e:
+        return {
+            "ok": False,
+            "city": resolved_city,
+            "station": resolved_station,
+            "error": f"{type(e).__name__}: {str(e)}",
+        }
+    return {
+        "ok": True,
+        "city": resolved_city,
+        "station": resolved_station,
+        "awc_obs_enabled": ENABLE_AWC_OBS,
+        "awc_metar_cache_ttl_seconds": AWC_METAR_CACHE_TTL_SECONDS,
+        "parsed": parsed,
+        "raw": raw,
+    }
+
 @app.get("/board")
 def board(market_day: str = "auto", force_refresh: bool = False):
     now_local = datetime.now(tz=LOCAL_TZ)

@@ -382,6 +382,8 @@ _range_package_paper_state_date = ""
 _range_package_paper_state: Dict[str, dict] = {}
 _live_trade_state_date = ""
 _live_trade_state: Dict[str, dict] = {}
+_live_trade_discord_state_date = ""
+_live_trade_discord_state: Dict[str, dict] = {}
 _live_exit_state_date = ""
 _live_exit_state: Dict[str, dict] = {}
 _live_kill_switch_state = LIVE_KILL_SWITCH
@@ -2820,6 +2822,9 @@ def live_trade_state_path() -> str:
 def live_exit_state_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "live_exit_state.json")
 
+def live_trade_discord_state_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "live_trade_discord_state.json")
+
 def daily_update_state_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "daily_update_state.json")
 
@@ -3618,6 +3623,36 @@ def _save_live_trade_state(today_key: str) -> None:
         json.dump(payload, f, ensure_ascii=True)
     os.replace(tmp, path)
 
+def _load_live_trade_discord_state(today_key: str) -> Dict[str, dict]:
+    global _live_trade_discord_state_date, _live_trade_discord_state
+    if _live_trade_discord_state_date == today_key:
+        return _live_trade_discord_state
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = live_trade_discord_state_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if str(payload.get("date", "")) == today_key and isinstance(payload.get("entries"), dict):
+                _live_trade_discord_state = payload["entries"]
+            else:
+                _live_trade_discord_state = {}
+        except Exception:
+            _live_trade_discord_state = {}
+    else:
+        _live_trade_discord_state = {}
+    _live_trade_discord_state_date = today_key
+    return _live_trade_discord_state
+
+def _save_live_trade_discord_state(today_key: str) -> None:
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = live_trade_discord_state_path()
+    tmp = path + ".tmp"
+    payload = {"date": today_key, "entries": _live_trade_discord_state}
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True)
+    os.replace(tmp, path)
+
 def _load_live_exit_state(today_key: str) -> Dict[str, dict]:
     global _live_exit_state_date, _live_exit_state
     if _live_exit_state_date == today_key:
@@ -4333,6 +4368,54 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
             f"{r.get('limit_price_cents')}c | {r.get('count')} | {r.get('status')} | {order_type} | {str(r.get('order_action', 'buy')).upper()}"
         )
     return "\n".join(lines)
+
+def _maybe_send_missed_passive_fill_discord_alerts(now_local: datetime) -> int:
+    if not DISCORD_TRADE_ALERTS_ENABLED:
+        return 0
+    today_key = now_local.date().isoformat()
+    sent_state = _load_live_trade_discord_state(today_key)
+    rows = load_live_trade_log_rows()
+    pending: List[dict] = []
+    for r in rows:
+        if str(r.get("date", "")).strip() != today_key:
+            continue
+        if str(r.get("execution_mode", "")).strip().lower() != "passive_resting_fill":
+            continue
+        try:
+            count = int(float(r.get("count", 0) or 0))
+        except Exception:
+            count = 0
+        if count <= 0:
+            continue
+        status = str(r.get("status", "")).strip().lower()
+        if status not in ("submitted", "partial", "partial_filled", "filled", "executed"):
+            continue
+        sig = "|".join([
+            str(r.get("ts_est", "")).strip(),
+            str(r.get("order_id", "")).strip(),
+            str(r.get("ticker", "")).strip(),
+            str(r.get("status", "")).strip(),
+            str(count),
+        ])
+        if sig in sent_state:
+            continue
+        pending.append((sig, r))
+    sent_count = 0
+    for sig, row in pending:
+        try:
+            discord_send(_live_trade_text(now_local, [row]))
+            sent_state[sig] = {
+                "ts_est": fmt_est(now_local),
+                "ticker": row.get("ticker", ""),
+                "status": row.get("status", ""),
+                "count": row.get("count", 0),
+            }
+            sent_count += 1
+        except Exception:
+            continue
+    if sent_count > 0:
+        _save_live_trade_discord_state(today_key)
+    return sent_count
 
 def _response_order_meta(resp: dict) -> Tuple[str, int]:
     order = resp.get("order", {}) if isinstance(resp, dict) else {}
@@ -5428,6 +5511,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             rows = executed_for_discord[:max_rows]
             for i in range(0, len(rows), chunk_size):
                 discord_send(_live_trade_text(now_local, rows[i:i + chunk_size]))
+    _maybe_send_missed_passive_fill_discord_alerts(now_local)
     _save_live_trade_state(today_key)
     return placed
 

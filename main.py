@@ -3274,6 +3274,7 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
     updated_auto_weather = 0
     updated_user_weather = 0
     updated_btc = 0
+    backfilled_live_weather_fills = 0
     skipped_bot_weather = 0
     skipped_unclassified = 0
     skipped_missing_ticker = 0
@@ -3392,6 +3393,12 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
                     updated_weather += 1
                     updated_user_weather += 1
             elif ticker in bot_weather_tickers:
+                if not dry_run:
+                    try:
+                        if _append_live_fill_backfill_from_settlement(row):
+                            backfilled_live_weather_fills += 1
+                    except Exception:
+                        pass
                 skipped_bot_weather += 1
             elif key in idx_auto_weather:
                 rr = aw_rows[idx_auto_weather[key]]
@@ -3452,6 +3459,7 @@ def sync_manual_positions_from_kalshi(max_pages: int = 30, per_page_limit: int =
         "updated_auto_weather": updated_auto_weather,
         "inserted_btc": inserted_btc,
         "updated_btc": updated_btc,
+        "backfilled_live_weather_fills": backfilled_live_weather_fills,
         "skipped_bot_weather": skipped_bot_weather,
         "skipped_unclassified": skipped_unclassified,
         "skipped_missing_ticker": skipped_missing_ticker,
@@ -3526,6 +3534,51 @@ def rewrite_live_trade_log_rows(path: str, rows: List[dict]) -> None:
             out = {k: r.get(k, "") for k in fieldnames}
             w.writerow(out)
     os.replace(tmp, path)
+
+def _append_live_fill_backfill_from_settlement(settlement_row: dict) -> bool:
+    if not isinstance(settlement_row, dict):
+        return False
+    date_iso = str(settlement_row.get("date", "")).strip()
+    ticker = str(settlement_row.get("ticker", "")).strip().upper()
+    bet = str(settlement_row.get("bet", "")).strip().upper()
+    if not (date_iso and ticker and bet):
+        return False
+    if _has_live_fill_row(date_iso, ticker, bet):
+        return False
+    ref = _find_reference_live_order_row(date_iso, ticker, bet)
+    count = _infer_contract_count_from_settlement_row(settlement_row, reference_row=ref)
+    ts_est = str(settlement_row.get("opened_ts_est", "")).strip() or fmt_est(datetime.now(tz=LOCAL_TZ))
+    done_item = {
+        "ts_est": ts_est,
+        "date": date_iso,
+        "city": str(settlement_row.get("city", "")).strip() or str((ref or {}).get("city", "")).strip(),
+        "temp_type": normalize_temp_side(str(settlement_row.get("temp_side", "") or (ref or {}).get("temp_type", "high"))),
+        "ticker": ticker,
+        "bet": bet,
+        "line": str(settlement_row.get("line", "")).strip() or str((ref or {}).get("line", "")).strip(),
+        "edge_pct": str((ref or {}).get("edge_pct", "")),
+        "units": str((ref or {}).get("units", "")),
+        "stake_dollars": str(settlement_row.get("stake_dollars", "")).strip() or str((ref or {}).get("stake_dollars", "")),
+        "side": str((ref or {}).get("side", "buy")).strip() or "buy",
+        "limit_price_cents": str((ref or {}).get("limit_price_cents", "")),
+        "count": int(max(1, count)),
+        "time_in_force": str((ref or {}).get("time_in_force", LIVE_PASSIVE_TIME_IN_FORCE)),
+        "order_action": str((ref or {}).get("order_action", "buy")).strip().lower() or "buy",
+        "status": "submitted",
+        "error": "",
+        "fee_dollars": str(settlement_row.get("fees_dollars", "")).strip() or "0.0",
+        "order_id": str((ref or {}).get("order_id", "")),
+        "client_order_id": str((ref or {}).get("client_order_id", "")),
+        "execution_mode": "passive_resting_fill_backfill",
+        "attempt_count": str((ref or {}).get("attempt_count", "1")),
+        "passive_attempted": True,
+        "aggressive_attempted": False,
+        "aggressive_used": False,
+        "initial_limit_price_cents": str((ref or {}).get("initial_limit_price_cents", (ref or {}).get("limit_price_cents", ""))),
+        "final_order_status_raw": "backfilled_from_auto_settlement",
+    }
+    _append_live_trade_log(done_item)
+    return True
 
 def edge_lifecycle_state_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "edge_lifecycle_state.json")
@@ -4242,6 +4295,62 @@ def _entered_contract_signatures_for_day(date_key: str) -> set:
             out.add(str(sig))
     return out
 
+def _has_live_fill_row(date_iso: str, ticker: str, bet: str) -> bool:
+    d = str(date_iso or "").strip()
+    t = str(ticker or "").strip().upper()
+    b = str(bet or "").strip().upper()
+    if not (d and t and b):
+        return False
+    for r in load_live_trade_log_rows():
+        if str(r.get("date", "")).strip() != d:
+            continue
+        if str(r.get("ticker", "")).strip().upper() != t:
+            continue
+        if str(r.get("bet", "")).strip().upper() != b:
+            continue
+        st = str(r.get("status", "")).strip().lower()
+        if st not in ("submitted", "partial", "partial_filled", "filled", "executed"):
+            continue
+        try:
+            c = int(float(_to_float(r.get("count")) or 0))
+        except Exception:
+            c = 0
+        if c > 0:
+            return True
+    return False
+
+def _infer_contract_count_from_settlement_row(settlement_row: dict, reference_row: Optional[dict] = None) -> int:
+    payout = float(_to_float(settlement_row.get("total_payout_dollars")) or 0.0)
+    if payout > 0.0:
+        return max(1, int(round(payout)))
+    stake = float(_to_float(settlement_row.get("stake_dollars")) or 0.0)
+    ref = reference_row or {}
+    price_cents = float(_to_float(ref.get("limit_price_cents")) or _to_float(ref.get("price_cents")) or 0.0)
+    if stake > 0.0 and price_cents > 0.0:
+        try:
+            return max(1, int(round(stake / (price_cents / 100.0))))
+        except Exception:
+            pass
+    return 1
+
+def _find_reference_live_order_row(date_iso: str, ticker: str, bet: str) -> Optional[dict]:
+    d = str(date_iso or "").strip()
+    t = str(ticker or "").strip().upper()
+    b = str(bet or "").strip().upper()
+    matches: List[dict] = []
+    for r in load_live_trade_log_rows():
+        if str(r.get("date", "")).strip() != d:
+            continue
+        if str(r.get("ticker", "")).strip().upper() != t:
+            continue
+        if str(r.get("bet", "")).strip().upper() != b:
+            continue
+        matches.append(r)
+    if not matches:
+        return None
+    matches.sort(key=lambda r: parse_ts_est(str(r.get("ts_est", ""))) or datetime.min.replace(tzinfo=LOCAL_TZ))
+    return matches[-1]
+
 def _is_open_position_currently_losing(pos: dict, quotes: Dict[str, Optional[int]]) -> Optional[bool]:
     bet_side = str(pos.get("bet", "")).strip().upper()
     entry_px = _to_float(pos.get("avg_entry_price_cents"))
@@ -4776,6 +4885,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             if ticker_k and order_side_k:
                 active_order_keys.add((ticker_k, "buy"))
     exchange_resting_by_key: Dict[Tuple[str, str], List[dict]] = {}
+    exchange_positions_by_ticker: Dict[str, int] = {}
     if LIVE_PASSIVE_ALLOW_RESTING_LIMITS and LIVE_PASSIVE_RESCAN_MODE_ENABLED:
         try:
             for order in kalshi_get_orders(status="resting", limit=200, max_pages=5):
@@ -4790,6 +4900,18 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                 exchange_resting_by_key.setdefault((ticker_k, action_k), []).append(order)
         except Exception:
             exchange_resting_by_key = {}
+    try:
+        for pos in kalshi_get_market_positions(limit=500, max_pages=5):
+            ticker_k = str(pos.get("ticker", "") or "").strip().upper()
+            if not ticker_k:
+                continue
+            qty_k = _kalshi_int_from_fp(
+                pos.get("position") if pos.get("position") is not None else pos.get("position_fp")
+            )
+            if qty_k != 0:
+                exchange_positions_by_ticker[ticker_k] = int(qty_k)
+    except Exception:
+        exchange_positions_by_ticker = {}
 
     pending_contract_rows: Dict[str, List[Tuple[str, dict]]] = {}
     for sig_key, row_local in list(state.items()):
@@ -4880,6 +5002,45 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
         done.append(done_item)
         state[sig_key] = row_local
         return int(delta)
+
+    def _reconcile_pending_fill_from_open_position(sig_key: str, row_local: dict) -> int:
+        ticker_local = str(row_local.get("pending_passive_ticker", row_local.get("ticker", ""))).strip().upper()
+        bet_local = str(row_local.get("pending_passive_bet", row_local.get("bet", ""))).strip().upper()
+        if not ticker_local or bet_local not in {"BUY YES", "BUY NO"}:
+            return 0
+        qty = int(exchange_positions_by_ticker.get(ticker_local, 0) or 0)
+        if qty == 0:
+            return 0
+        if bet_local == "BUY YES" and qty <= 0:
+            return 0
+        if bet_local == "BUY NO" and qty >= 0:
+            return 0
+        fill_count = abs(int(qty))
+        if fill_count <= int(row_local.get("pending_passive_reported_fill_count", 0) or 0):
+            return 0
+        pending_order_id = str(row_local.get("pending_passive_order_id", "") or "").strip()
+        fee_dollars = 0.0
+        if pending_order_id:
+            try:
+                fee_dollars = float(kalshi_get_order_fee_dollars(pending_order_id) or 0.0)
+            except Exception:
+                fee_dollars = 0.0
+        snapshot = {
+            "order_id": pending_order_id,
+            "status": "executed",
+            "fill_count": fill_count,
+            "fee_dollars": fee_dollars,
+        }
+        return _record_pending_fill(sig_key, row_local, snapshot)
+
+    for sig_key, row_local in list(state.items()):
+        pending_order_id = str((row_local or {}).get("pending_passive_order_id", "")).strip()
+        if not pending_order_id:
+            continue
+        try:
+            _reconcile_pending_fill_from_open_position(sig_key, row_local)
+        except Exception:
+            continue
 
     def _log_pending_passive_cancel(sig_key: str, row_local: dict, order_id: str, reason: str) -> None:
         done_item = {

@@ -4646,6 +4646,20 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
         )
     return "\n".join(lines)
 
+def _live_trade_discord_sig(row: dict) -> str:
+    try:
+        count = int(float(_to_float((row or {}).get("count")) or 0))
+    except Exception:
+        count = 0
+    return "|".join([
+        str((row or {}).get("date", "")).strip(),
+        str((row or {}).get("order_id", "")).strip(),
+        str((row or {}).get("ticker", "")).strip(),
+        str((row or {}).get("status", "")).strip().lower(),
+        str(count),
+        str((row or {}).get("execution_mode", "")).strip().lower(),
+    ])
+
 def _maybe_send_missed_passive_fill_discord_alerts(now_local: datetime) -> int:
     if not DISCORD_TRADE_ALERTS_ENABLED:
         return 0
@@ -4656,7 +4670,7 @@ def _maybe_send_missed_passive_fill_discord_alerts(now_local: datetime) -> int:
     for r in rows:
         if str(r.get("date", "")).strip() != today_key:
             continue
-        if str(r.get("execution_mode", "")).strip().lower() != "passive_resting_fill":
+        if str(r.get("execution_mode", "")).strip().lower() not in {"passive_resting_fill", "passive_resting_fill_backfill"}:
             continue
         try:
             count = int(float(r.get("count", 0) or 0))
@@ -4667,13 +4681,7 @@ def _maybe_send_missed_passive_fill_discord_alerts(now_local: datetime) -> int:
         status = str(r.get("status", "")).strip().lower()
         if status not in ("submitted", "partial", "partial_filled", "filled", "executed"):
             continue
-        sig = "|".join([
-            str(r.get("ts_est", "")).strip(),
-            str(r.get("order_id", "")).strip(),
-            str(r.get("ticker", "")).strip(),
-            str(r.get("status", "")).strip(),
-            str(count),
-        ])
+        sig = _live_trade_discord_sig(r)
         if sig in sent_state:
             continue
         pending.append((sig, r))
@@ -5139,7 +5147,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             "ticker": row_local.get("pending_passive_ticker", ""),
             "bet": row_local.get("pending_passive_bet", ""),
             "line": row_local.get("pending_passive_line", ""),
-            "edge_pct": "",
+            "edge_pct": row_local.get("pending_passive_edge_pct", row_local.get("edge_pct", "")),
             "units": row_local.get("pending_passive_units", ""),
             "stake_dollars": row_local.get("pending_passive_stake_dollars", ""),
             "side": row_local.get("pending_passive_order_action", "buy"),
@@ -5164,6 +5172,15 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
         if DISCORD_TRADE_ALERTS_ENABLED:
             try:
                 discord_send(_live_trade_text(now_local, [done_item]))
+                today_key = now_local.date().isoformat()
+                sent_state = _load_live_trade_discord_state(today_key)
+                sent_state[_live_trade_discord_sig(done_item)] = {
+                    "ts_est": fmt_est(now_local),
+                    "ticker": done_item.get("ticker", ""),
+                    "status": done_item.get("status", ""),
+                    "count": done_item.get("count", 0),
+                }
+                _save_live_trade_discord_state(today_key)
                 done_item["discord_sent"] = True
             except Exception:
                 done_item["discord_sent"] = False
@@ -5713,6 +5730,7 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                     row["pending_passive_temp_side"] = side_k
                     row["pending_passive_units"] = units
                     row["pending_passive_stake_dollars"] = round(stake_dollars, 2)
+                    row["pending_passive_edge_pct"] = round(edge_pct, 2)
                     row["pending_passive_order_action"] = str(result.get("order_action", "buy")).lower()
                     row["city"] = city_k
                     row["temp_side"] = side_k

@@ -4450,7 +4450,13 @@ def _entered_contract_signatures_for_day(date_key: str) -> set:
         if str(r.get("date", "")).strip() != str(date_key).strip():
             continue
         st = str(r.get("status", "")).strip().lower()
-        if st not in ("submitted", "partial", "partial_filled", "resting"):
+        order_id = str(r.get("order_id", "") or "").strip()
+        # Include rows that were submitted to Kalshi (has order_id) OR have a known active status.
+        # This catches FOK orders that filled 0 contracts (order_id present, status "cancelled")
+        # so the bot doesn't retry the same market after a process restart.
+        submitted_to_exchange = bool(order_id)
+        known_active_status = st in ("submitted", "partial", "partial_filled", "resting")
+        if not submitted_to_exchange and not known_active_status:
             continue
         if str(r.get("order_action", "buy")).strip().lower() != "buy":
             continue
@@ -5831,6 +5837,15 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                 per_city_side[(city_k, side_k)] = per_city_side.get((city_k, side_k), 0) + 1
                 total_orders += 1
                 placed += 1
+            elif str(final_exec.get("order_id", "")).strip():
+                # Order was submitted to Kalshi but filled 0 contracts (FOK on thin market).
+                # Mark as attempted so the bot doesn't retry the same market all day.
+                row = state.get(sig, {}) or {}
+                row["count"] = already + 1
+                row["city"] = city_k
+                row["temp_side"] = side_k
+                state[sig] = row
+                total_orders += 1
         except Exception as e:
             done_item = {
                 "ts_est": fmt_est(now_local),

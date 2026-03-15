@@ -305,6 +305,7 @@ LIVE_CITY_SIDE_DIFF_STRUCTURE_MIN_DISTANCE_F = float(os.getenv("LIVE_CITY_SIDE_D
 OPEN_METEO_HIST_MAE_F = float(os.getenv("OPEN_METEO_HIST_MAE_F", "2.4"))
 OPEN_METEO_ECMWF_HIST_MAE_F = float(os.getenv("OPEN_METEO_ECMWF_HIST_MAE_F", str(OPEN_METEO_HIST_MAE_F)))
 OPEN_METEO_GFS_HIST_MAE_F = float(os.getenv("OPEN_METEO_GFS_HIST_MAE_F", str(OPEN_METEO_HIST_MAE_F)))
+OPEN_METEO_ICON_HIST_MAE_F = float(os.getenv("OPEN_METEO_ICON_HIST_MAE_F", "2.3"))
 METNO_HIST_MAE_F = float(os.getenv("METNO_HIST_MAE_F", "2.7"))
 ENABLE_AWC_OBS = env_bool("ENABLE_AWC_OBS", default=True)
 AWC_METAR_CACHE_TTL_SECONDS = int(os.getenv("AWC_METAR_CACHE_TTL_SECONDS", "300"))
@@ -313,6 +314,7 @@ WEATHERCOM_HIST_MAE_F = float(os.getenv("WEATHERCOM_HIST_MAE_F", "2.1"))
 ACCUWEATHER_API_KEY = os.getenv("ACCUWEATHER_API_KEY", "").strip()
 ACCUWEATHER_HIST_MAE_F = float(os.getenv("ACCUWEATHER_HIST_MAE_F", "2.0"))
 ENABLE_NWS_SOURCE = env_bool("ENABLE_NWS_SOURCE", default=False)
+ENABLE_ICON_SOURCE = env_bool("ENABLE_ICON_SOURCE", default=True)
 ENABLE_METNO_SOURCE = env_bool("ENABLE_METNO_SOURCE", default=True)
 ENABLE_ACCUWEATHER_SOURCE = env_bool("ENABLE_ACCUWEATHER_SOURCE", default=True)
 ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS", "2592000"))
@@ -2044,6 +2046,13 @@ def build_expert_consensus(
             source_values.append(("OpenMeteo-GFS", om_gfs, safe_inverse_mae_weight(OPEN_METEO_GFS_HIST_MAE_F)))
     except Exception:
         pass
+    if ENABLE_ICON_SOURCE:
+        try:
+            om_icon = open_meteo_get_forecast_temp_f(lat, lon, now_local, model="icon_seamless", temp_side=side)
+            if om_icon is not None:
+                source_values.append(("OpenMeteo-ICON", om_icon, safe_inverse_mae_weight(OPEN_METEO_ICON_HIST_MAE_F)))
+        except Exception:
+            pass
 
     if ENABLE_METNO_SOURCE:
         try:
@@ -8283,6 +8292,7 @@ def health():
     configured_sources = [
         "OpenMeteo-ECMWF",
         "OpenMeteo-GFS",
+        "OpenMeteo-ICON" if ENABLE_ICON_SOURCE else "OpenMeteo-ICON (disabled via ENABLE_ICON_SOURCE)",
         "MET-Norway" if ENABLE_METNO_SOURCE else "MET-Norway (disabled via ENABLE_METNO_SOURCE)",
     ]
     if ENABLE_NWS_SOURCE:

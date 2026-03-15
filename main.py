@@ -2099,7 +2099,7 @@ def build_expert_consensus(
         CONSENSUS_MIN_SIGMA_F,
         CONSENSUS_BASE_SIGMA_F
         + (CONSENSUS_DISAGREEMENT_SIGMA_MULTIPLIER * disagreement_sigma)
-        + (CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER * max(0.0, source_range_f - CONSENSUS_SOURCE_RANGE_FREE_F)),
+        + (CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER * max(0.0, source_range_f - CONSENSUS_SOURCE_RANGE_FREE_F))
         + nws_outlier_sigma_add,
     )
 

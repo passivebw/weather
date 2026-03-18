@@ -277,6 +277,7 @@ CONSENSUS_NWS_OUTLIER_TRIGGER_F = float(os.getenv("CONSENSUS_NWS_OUTLIER_TRIGGER
 CONSENSUS_NWS_OUTLIER_SIGMA_ADD_F = float(os.getenv("CONSENSUS_NWS_OUTLIER_SIGMA_ADD_F", "0.6"))
 BOUNDARY_PENALTY_ENABLED = env_bool("BOUNDARY_PENALTY_ENABLED", default=True)
 BOUNDARY_PENALTY_WIDTH_F = float(os.getenv("BOUNDARY_PENALTY_WIDTH_F", "2.0"))
+CONSENSUS_MIN_BUFFER_F = float(os.getenv("CONSENSUS_MIN_BUFFER_F", "3.0"))
 BOUNDARY_PENALTY_MIN_MULTIPLIER = float(os.getenv("BOUNDARY_PENALTY_MIN_MULTIPLIER", "0.20"))
 BOUNDARY_PENALTY_NO_ONLY = env_bool("BOUNDARY_PENALTY_NO_ONLY", default=True)
 EXACT_NO_MIDPOINT_PENALTY_ENABLED = env_bool("EXACT_NO_MIDPOINT_PENALTY_ENABLED", default=True)
@@ -9071,6 +9072,25 @@ def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_ed
                 "net_edge_pct": round(net_edge_pct, 2),
             })
             continue
+        if not locked_allowed and CONSENSUS_MIN_BUFFER_F > 0:
+            mu = float(r.get("consensus_mu_f") or 0.0)
+            lo = r.get("best_lo")
+            hi = r.get("best_hi")
+            if lo is not None and hi is not None:
+                buf = _bucket_boundary_distance_f(mu, float(lo), float(hi))
+                if buf < CONSENSUS_MIN_BUFFER_F:
+                    excluded.append({
+                        "city": r.get("city"),
+                        "temp_type": r.get("temp_side"),
+                        "date": r.get("market_date_selected"),
+                        "line": r.get("bucket_label"),
+                        "ticker": r.get("ticker"),
+                        "reason": "buffer_too_small",
+                        "net_edge_pct": round(net_edge_pct, 2),
+                        "buffer_f": round(buf, 2),
+                        "min_buffer_f": CONSENSUS_MIN_BUFFER_F,
+                    })
+                    continue
         suggested_units = suggested_units_from_net_edge(net_edge_pct)
         if locked_allowed:
             suggested_units = min(float(suggested_units), float(LIVE_LOCKED_OUTCOME_MAX_UNITS))

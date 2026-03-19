@@ -854,6 +854,8 @@ def open_meteo_get_forecast_temp_f(
     r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=20)
     r.raise_for_status()
     payload = r.json()
+    if payload.get("error"):
+        return None
     daily = payload.get("daily", {})
     days = daily.get("time", []) or []
     values = daily.get(daily_field, []) or []
@@ -2035,7 +2037,8 @@ def build_expert_consensus(
     source_values: List[Tuple[str, float, float]] = []
 
     try:
-        om_ecmwf = open_meteo_get_forecast_temp_f(lat, lon, now_local, model="ecmwf_seamless", temp_side=side)
+        om_ecmwf_model = "ecmwf_seamless" if side == "high" else "best_match"
+        om_ecmwf = open_meteo_get_forecast_temp_f(lat, lon, now_local, model=om_ecmwf_model, temp_side=side)
         if om_ecmwf is not None:
             source_values.append(("OpenMeteo-ECMWF", om_ecmwf, safe_inverse_mae_weight(OPEN_METEO_ECMWF_HIST_MAE_F)))
     except Exception as e:

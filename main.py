@@ -412,6 +412,8 @@ _accuweather_cache_lock = threading.Lock()
 _awc_cache_lock = threading.Lock()
 _tomorrow_io_cache: Dict[str, dict] = {}
 _tomorrow_io_cache_lock = threading.Lock()
+_afd_cache: Dict[str, dict] = {}
+_afd_cache_lock = threading.Lock()
 _kalshi_key_cache = None
 _kalshi_key_lock = threading.Lock()
 _awc_metar_cache: Dict[str, Dict[str, object]] = {}
@@ -855,6 +857,110 @@ def nws_get_forecast_narrative(lat: float, lon: float, now_local: datetime, temp
     except Exception:
         pass
     return None
+
+def nws_get_afd_excerpt(lat: float, lon: float, temp_side: str = "high") -> Optional[str]:
+    """Fetch the NWS Area Forecast Discussion (AFD) for the local forecast office
+    and return a short excerpt relevant to today's high or tonight's low.
+    Cached per office for 2 hours since AFDs update every 6-12 hours."""
+    AFD_CACHE_TTL = 7200
+    # Keywords to find the right section
+    SHORT_TERM_MARKERS = [".SHORT TERM", ".NEAR TERM", ".SHORT-TERM"]
+    OVERNIGHT_MARKERS = [".OVERNIGHT", ".TONIGHT", ".SHORT TERM"]
+    try:
+        headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
+        # Step 1: get forecast office (cwa) from points API
+        points_url = f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}"
+        r_pts = requests.get(points_url, headers=headers, timeout=20)
+        r_pts.raise_for_status()
+        props = r_pts.json().get("properties", {})
+        cwa = (props.get("cwa") or "").strip().upper()
+        if not cwa:
+            return None
+
+        # Step 2: check cache
+        now_ts = time.time()
+        with _afd_cache_lock:
+            cached = _afd_cache.get(cwa)
+            if cached and (now_ts - cached.get("ts", 0)) < AFD_CACHE_TTL:
+                full_text = cached.get("text", "")
+            else:
+                full_text = None
+
+        if full_text is None:
+            # Step 3: fetch latest AFD product id for this office
+            r_list = requests.get(
+                f"https://api.weather.gov/products/types/AFD/locations/{cwa}",
+                headers={"User-Agent": NWS_USER_AGENT, "Accept": "application/ld+json"},
+                timeout=20,
+            )
+            r_list.raise_for_status()
+            items = r_list.json().get("@graph", []) or []
+            if not items:
+                return None
+            product_id = items[0].get("id") or items[0].get("productId") or ""
+            if not product_id:
+                return None
+            # Step 4: fetch full AFD text
+            r_afd = requests.get(
+                f"https://api.weather.gov/products/{product_id}",
+                headers={"User-Agent": NWS_USER_AGENT},
+                timeout=20,
+            )
+            r_afd.raise_for_status()
+            full_text = r_afd.json().get("productText", "") or ""
+            with _afd_cache_lock:
+                _afd_cache[cwa] = {"ts": now_ts, "text": full_text}
+
+        if not full_text:
+            return None
+
+        # Step 5: extract relevant section
+        # Normalize line endings and uppercase for marker search
+        text_upper = full_text.upper()
+        markers = OVERNIGHT_MARKERS if temp_side == "low" else SHORT_TERM_MARKERS
+
+        section_start = -1
+        for marker in markers:
+            idx = text_upper.find(marker)
+            if idx != -1:
+                section_start = idx
+                break
+
+        if section_start == -1:
+            return None
+
+        # Find start of actual content (after the marker line)
+        content_start = full_text.find("\n", section_start)
+        if content_start == -1:
+            return None
+        content_start += 1
+
+        # Find end of section (next section marker starting with ".")
+        section_text = full_text[content_start:]
+        lines = section_text.splitlines()
+        excerpt_lines = []
+        for line in lines:
+            stripped = line.strip()
+            # Stop at next section header (line starting with "." and all caps word)
+            if stripped.startswith(".") and stripped.isupper():
+                break
+            if stripped:
+                excerpt_lines.append(stripped)
+            if len(" ".join(excerpt_lines)) > 400:
+                break
+
+        excerpt = " ".join(excerpt_lines).strip()
+        # Trim to ~400 chars at sentence boundary
+        if len(excerpt) > 400:
+            cutoff = excerpt.rfind(".", 0, 400)
+            if cutoff > 100:
+                excerpt = excerpt[:cutoff + 1]
+            else:
+                excerpt = excerpt[:400].rstrip() + "..."
+        return excerpt if excerpt else None
+    except Exception as e:
+        logging.debug(f"AFD fetch failed for {lat},{lon}: {e}")
+        return None
 
 def open_meteo_get_forecast_conditions(lat: float, lon: float, now_local: datetime) -> dict:
     """Fetch daily weather conditions from OpenMeteo useful for forecast confidence assessment.
@@ -4975,6 +5081,9 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
                 narrative = nws_get_forecast_narrative(lat, lon, now_local, temp_side=temp_type)
                 if narrative:
                     lines.append(f"\nNWS Forecast: \"{narrative}\"")
+                afd = nws_get_afd_excerpt(lat, lon, temp_side=temp_type)
+                if afd:
+                    lines.append(f"NWS Discussion: \"{afd}\"")
                 conditions = open_meteo_get_forecast_conditions(lat, lon, now_local)
                 conditions_text = _interpret_conditions(conditions, temp_type)
                 if conditions_text:

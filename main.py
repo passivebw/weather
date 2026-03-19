@@ -414,6 +414,8 @@ _tomorrow_io_cache: Dict[str, dict] = {}
 _tomorrow_io_cache_lock = threading.Lock()
 _afd_cache: Dict[str, dict] = {}
 _afd_cache_lock = threading.Lock()
+_nws_cwa_cache: Dict[str, str] = {}   # lat,lon key -> CWA office code (permanent)
+_nws_cwa_cache_lock = threading.Lock()
 _kalshi_key_cache = None
 _kalshi_key_lock = threading.Lock()
 _awc_metar_cache: Dict[str, Dict[str, object]] = {}
@@ -858,26 +860,37 @@ def nws_get_forecast_narrative(lat: float, lon: float, now_local: datetime, temp
         pass
     return None
 
+def _nws_get_cwa(lat: float, lon: float) -> Optional[str]:
+    """Return the NWS forecast office code (CWA) for a lat/lon, cached permanently."""
+    loc_key = f"{lat:.4f},{lon:.4f}"
+    with _nws_cwa_cache_lock:
+        if loc_key in _nws_cwa_cache:
+            return _nws_cwa_cache[loc_key]
+    try:
+        headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
+        r = requests.get(f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}", headers=headers, timeout=20)
+        r.raise_for_status()
+        cwa = (r.json().get("properties", {}).get("cwa") or "").strip().upper()
+        if cwa:
+            with _nws_cwa_cache_lock:
+                _nws_cwa_cache[loc_key] = cwa
+            return cwa
+    except Exception as e:
+        logging.debug(f"NWS CWA lookup failed for {lat},{lon}: {e}")
+    return None
+
 def nws_get_afd_excerpt(lat: float, lon: float, temp_side: str = "high") -> Optional[str]:
     """Fetch the NWS Area Forecast Discussion (AFD) for the local forecast office
     and return a short excerpt relevant to today's high or tonight's low.
-    Cached per office for 2 hours since AFDs update every 6-12 hours."""
+    CWA lookup cached permanently; AFD text cached 2 hours per office."""
     AFD_CACHE_TTL = 7200
-    # Keywords to find the right section
     SHORT_TERM_MARKERS = [".SHORT TERM", ".NEAR TERM", ".SHORT-TERM"]
     OVERNIGHT_MARKERS = [".OVERNIGHT", ".TONIGHT", ".SHORT TERM"]
     try:
-        headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
-        # Step 1: get forecast office (cwa) from points API
-        points_url = f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}"
-        r_pts = requests.get(points_url, headers=headers, timeout=20)
-        r_pts.raise_for_status()
-        props = r_pts.json().get("properties", {})
-        cwa = (props.get("cwa") or "").strip().upper()
+        cwa = _nws_get_cwa(lat, lon)
         if not cwa:
             return None
 
-        # Step 2: check cache
         now_ts = time.time()
         with _afd_cache_lock:
             cached = _afd_cache.get(cwa)
@@ -887,7 +900,6 @@ def nws_get_afd_excerpt(lat: float, lon: float, temp_side: str = "high") -> Opti
                 full_text = None
 
         if full_text is None:
-            # Step 3: fetch latest AFD product id for this office
             r_list = requests.get(
                 f"https://api.weather.gov/products/types/AFD/locations/{cwa}",
                 headers={"User-Agent": NWS_USER_AGENT, "Accept": "application/ld+json"},
@@ -900,7 +912,6 @@ def nws_get_afd_excerpt(lat: float, lon: float, temp_side: str = "high") -> Opti
             product_id = items[0].get("id") or items[0].get("productId") or ""
             if not product_id:
                 return None
-            # Step 4: fetch full AFD text
             r_afd = requests.get(
                 f"https://api.weather.gov/products/{product_id}",
                 headers={"User-Agent": NWS_USER_AGENT},
@@ -914,34 +925,27 @@ def nws_get_afd_excerpt(lat: float, lon: float, temp_side: str = "high") -> Opti
         if not full_text:
             return None
 
-        # Step 5: extract relevant section
-        # Normalize line endings and uppercase for marker search
         text_upper = full_text.upper()
         markers = OVERNIGHT_MARKERS if temp_side == "low" else SHORT_TERM_MARKERS
-
         section_start = -1
         for marker in markers:
             idx = text_upper.find(marker)
             if idx != -1:
                 section_start = idx
                 break
-
         if section_start == -1:
             return None
 
-        # Find start of actual content (after the marker line)
         content_start = full_text.find("\n", section_start)
         if content_start == -1:
             return None
         content_start += 1
 
-        # Find end of section (next section marker starting with ".")
         section_text = full_text[content_start:]
         lines = section_text.splitlines()
         excerpt_lines = []
         for line in lines:
             stripped = line.strip()
-            # Stop at next section header (line starting with "." and all caps word)
             if stripped.startswith(".") and stripped.isupper():
                 break
             if stripped:
@@ -950,7 +954,6 @@ def nws_get_afd_excerpt(lat: float, lon: float, temp_side: str = "high") -> Opti
                 break
 
         excerpt = " ".join(excerpt_lines).strip()
-        # Trim to ~400 chars at sentence boundary
         if len(excerpt) > 400:
             cutoff = excerpt.rfind(".", 0, 400)
             if cutoff > 100:
@@ -961,6 +964,70 @@ def nws_get_afd_excerpt(lat: float, lon: float, temp_side: str = "high") -> Opti
     except Exception as e:
         logging.debug(f"AFD fetch failed for {lat},{lon}: {e}")
         return None
+
+def _afd_sigma_adjustment(afd_text: str, temp_side: str) -> Tuple[float, str]:
+    """Parse AFD excerpt for meteorologist confidence signals.
+    Returns (sigma_delta_f, signal_label) where negative delta tightens sigma.
+
+    High-confidence language (models converged, clear pattern) → tighten sigma.
+    Low-confidence language (uncertainty, model spread, complex pattern) → widen sigma.
+    Physical signals (radiational cooling, frontal passage, precipitation) → adjust accordingly.
+    """
+    if not afd_text:
+        return 0.0, ""
+    t = afd_text.lower()
+    adj = 0.0
+    signals = []
+
+    # --- High confidence signals → tighten ---
+    high_conf_phrases = [
+        "good confidence", "high confidence", "models in good agreement",
+        "model agreement", "models agree", "well defined", "straightforward",
+        "models have converged", "converged well", "model consensus",
+        "little uncertainty", "confidence is high",
+    ]
+    for phrase in high_conf_phrases:
+        if phrase in t:
+            adj -= 0.3
+            signals.append("high confidence pattern")
+            break
+
+    # --- Low confidence signals → widen ---
+    low_conf_phrases = [
+        "low confidence", "uncertainty remains", "model spread",
+        "model disagreement", "difficult pattern", "challenging forecast",
+        "wide spread", "poor confidence", "complex pattern", "tricky",
+        "confidence is low", "large spread", "significant uncertainty",
+        "hard to pin", "below average confidence",
+    ]
+    for phrase in low_conf_phrases:
+        if phrase in t:
+            adj += 0.6
+            signals.append("low confidence / model uncertainty")
+            break
+
+    # --- Physical signals ---
+    if temp_side == "low":
+        if "radiational cooling" in t:
+            adj -= 0.25
+            signals.append("radiational cooling noted")
+        if any(p in t for p in ["cold front", "frontal passage", "frontal boundary", "wind shift"]):
+            adj += 0.5
+            signals.append("frontal system")
+        if any(p in t for p in ["precipitation", "rain", "snow", "shower", "freezing"]):
+            adj += 0.3
+            signals.append("precip expected")
+    else:
+        if any(p in t for p in ["cold front", "frontal", "strong winds", "wind shift"]):
+            adj += 0.4
+            signals.append("frontal system")
+        if any(p in t for p in ["precipitation", "rain", "shower"]):
+            adj += 0.25
+            signals.append("precip expected")
+
+    adj = max(-0.8, min(1.5, adj))
+    label = ", ".join(signals) if signals else ""
+    return adj, label
 
 def open_meteo_get_forecast_conditions(lat: float, lon: float, now_local: datetime) -> dict:
     """Fetch daily weather conditions from OpenMeteo useful for forecast confidence assessment.
@@ -2457,14 +2524,28 @@ def build_expert_consensus(
             wind = conditions.get("wind_speed_mph")
             precip_prob = conditions.get("precip_prob_pct", 0.0)
             if cloud is not None and wind is not None:
-                # Radiational cooling setup: clear + calm = tighten sigma
                 if cloud <= 25 and wind <= 8 and (precip_prob or 0) < 20:
-                    conditions_sigma_adj = -0.5  # more predictable
-                # Poor conditions: cloudy or windy = widen sigma
+                    conditions_sigma_adj = -0.5  # radiational cooling: tighten
                 elif cloud >= 75 or wind >= 20 or (precip_prob or 0) >= 40:
-                    conditions_sigma_adj = 0.75  # less predictable
+                    conditions_sigma_adj = 0.75  # poor conditions: widen
         except Exception:
             pass
+
+    # AFD-based sigma adjustment — professional meteorologist confidence signals
+    afd_sigma_adj = 0.0
+    afd_signal_label = ""
+    afd_excerpt: Optional[str] = None
+    try:
+        afd_excerpt = nws_get_afd_excerpt(lat, lon, temp_side=side)
+        if afd_excerpt:
+            afd_sigma_adj, afd_signal_label = _afd_sigma_adjustment(afd_excerpt, side)
+            if afd_sigma_adj != 0.0:
+                logging.info(
+                    f"AFD sigma adj {afd_sigma_adj:+.2f}°F for {city} {side} "
+                    f"({afd_signal_label})"
+                )
+    except Exception:
+        pass
 
     sigma = max(
         CONSENSUS_MIN_SIGMA_F,
@@ -2472,7 +2553,8 @@ def build_expert_consensus(
         + (CONSENSUS_DISAGREEMENT_SIGMA_MULTIPLIER * disagreement_sigma)
         + (CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER * max(0.0, source_range_f - CONSENSUS_SOURCE_RANGE_FREE_F))
         + nws_outlier_sigma_add
-        + conditions_sigma_adj,
+        + conditions_sigma_adj
+        + afd_sigma_adj,
     )
 
     return {
@@ -2484,6 +2566,8 @@ def build_expert_consensus(
         "nws_outlier_sigma_add_f": nws_outlier_sigma_add,
         "conditions": conditions,
         "conditions_sigma_adj_f": conditions_sigma_adj,
+        "afd_sigma_adj_f": afd_sigma_adj,
+        "afd_signal_label": afd_signal_label,
         "sources": [{"name": name, "high_f": temp, "weight": w} for name, temp, w in source_values],
     }
 
@@ -5072,7 +5156,9 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
             lines.append("Sources:")
             lines.extend(source_lines)
 
-        # Fetch NWS narrative and OpenMeteo conditions
+        # Fetch NWS narrative, AFD discussion, and OpenMeteo conditions
+        afd_signal_label = ""
+        afd_sigma_adj = 0.0
         try:
             cfg = CITY_CONFIG.get(city, {})
             lat = float(cfg.get("lat", 0))
@@ -5084,6 +5170,7 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
                 afd = nws_get_afd_excerpt(lat, lon, temp_side=temp_type)
                 if afd:
                     lines.append(f"NWS Discussion: \"{afd}\"")
+                    afd_sigma_adj, afd_signal_label = _afd_sigma_adjustment(afd, temp_type)
                 conditions = open_meteo_get_forecast_conditions(lat, lon, now_local)
                 conditions_text = _interpret_conditions(conditions, temp_type)
                 if conditions_text:
@@ -5091,6 +5178,19 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
         except Exception:
             pass
         lines.append("")
+
+        # Model reasoning summary — show how AFD + conditions influenced the decision
+        model_adj_parts = []
+        if afd_sigma_adj != 0.0 and afd_signal_label:
+            direction = "tightened" if afd_sigma_adj < 0 else "widened"
+            model_adj_parts.append(f"AFD: {afd_signal_label} → sigma {direction} {abs(afd_sigma_adj):.1f}°F")
+        if snap:
+            cond_adj = float(_to_float(snap.get("conditions_sigma_adj_f")) or 0.0)
+            if cond_adj != 0.0:
+                direction = "tightened" if cond_adj < 0 else "widened"
+                model_adj_parts.append(f"Conditions: sigma {direction} {abs(cond_adj):.1f}°F")
+        if model_adj_parts:
+            lines.append("Model adjustments: " + " | ".join(model_adj_parts))
 
         model_prob = float(_to_float(r.get("model_win_prob_pct") or snap.get("model_yes_prob") if snap else None) or 0.0) if snap else 0.0
         lines.append(f"Bot Signal: {model_prob:.0f}% model confidence | {edge_pct:.1f}% edge")

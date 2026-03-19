@@ -850,6 +850,64 @@ def nws_get_forecast_narrative(lat: float, lon: float, now_local: datetime, temp
         pass
     return None
 
+def open_meteo_get_forecast_conditions(lat: float, lon: float, now_local: datetime) -> dict:
+    """Fetch daily weather conditions from OpenMeteo useful for forecast confidence assessment.
+    Returns dict with cloud_cover_pct, wind_speed_mph, precip_prob_pct, dewpoint_f, weather_code.
+    Uses best_match model which supports all daily fields."""
+    result: dict = {}
+    try:
+        daily_fields = ",".join([
+            "cloudcover_mean", "windspeed_10m_max", "precipitation_probability_max",
+            "dewpoint_2m_min", "weather_code",
+        ])
+        params = {
+            "latitude": f"{lat:.4f}",
+            "longitude": f"{lon:.4f}",
+            "daily": daily_fields,
+            "temperature_unit": "fahrenheit",
+            "windspeed_unit": "mph",
+            "timezone": "America/New_York",
+            "forecast_days": 3,
+            "models": "best_match",
+        }
+        r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+        if payload.get("error"):
+            return result
+        daily = payload.get("daily", {})
+        days = daily.get("time", []) or []
+        today = now_local.date().isoformat()
+        idx = None
+        for i, d in enumerate(days):
+            if d == today:
+                idx = i
+                break
+        if idx is None and days:
+            idx = 0
+        if idx is not None:
+            def _get(field: str):
+                vals = daily.get(field) or []
+                return vals[idx] if idx < len(vals) else None
+            cloud = _get("cloudcover_mean")
+            wind = _get("windspeed_10m_max")
+            precip_prob = _get("precipitation_probability_max")
+            dewpoint = _get("dewpoint_2m_min")
+            weather_code = _get("weather_code")
+            if cloud is not None:
+                result["cloud_cover_pct"] = float(cloud)
+            if wind is not None:
+                result["wind_speed_mph"] = float(wind)
+            if precip_prob is not None:
+                result["precip_prob_pct"] = float(precip_prob)
+            if dewpoint is not None:
+                result["dewpoint_f"] = float(dewpoint)
+            if weather_code is not None:
+                result["weather_code"] = int(weather_code)
+    except Exception as e:
+        logging.warning(f"OpenMeteo conditions fetch failed: {e}")
+    return result
+
 def open_meteo_get_forecast_high_f(
     lat: float,
     lon: float,
@@ -857,6 +915,56 @@ def open_meteo_get_forecast_high_f(
     model: Optional[str] = None,
 ) -> Optional[float]:
     return open_meteo_get_forecast_temp_f(lat, lon, now_local, model=model, temp_side="high")
+
+def _interpret_conditions(conditions: dict, temp_side: str) -> str:
+    """Generate a human-readable conditions summary from OpenMeteo conditions dict."""
+    if not conditions:
+        return ""
+    parts = []
+    cloud = conditions.get("cloud_cover_pct")
+    wind = conditions.get("wind_speed_mph")
+    precip_prob = conditions.get("precip_prob_pct")
+    dewpoint = conditions.get("dewpoint_f")
+    wcode = conditions.get("weather_code")
+
+    # Sky conditions
+    if cloud is not None:
+        if cloud <= 20:
+            parts.append("clear skies")
+        elif cloud <= 50:
+            parts.append("partly cloudy")
+        elif cloud <= 80:
+            parts.append("mostly cloudy")
+        else:
+            parts.append("overcast")
+
+    # Wind
+    if wind is not None:
+        if wind <= 5:
+            parts.append("calm/light wind")
+        elif wind <= 15:
+            parts.append(f"light wind ({wind:.0f} mph)")
+        elif wind <= 25:
+            parts.append(f"moderate wind ({wind:.0f} mph)")
+        else:
+            parts.append(f"strong wind ({wind:.0f} mph)")
+
+    # Precipitation
+    if precip_prob is not None and precip_prob >= 20:
+        parts.append(f"precip chance {precip_prob:.0f}%")
+
+    # Dewpoint (relevant for low temps)
+    if dewpoint is not None and temp_side == "low":
+        parts.append(f"dewpoint floor ~{dewpoint:.0f}°F")
+
+    # Radiational cooling signal for low temps
+    if temp_side == "low" and cloud is not None and wind is not None:
+        if cloud <= 25 and wind <= 8 and (precip_prob or 0) < 20:
+            parts.append("→ textbook radiational cooling setup")
+        elif cloud >= 75 or wind >= 20:
+            parts.append("→ poor radiational cooling conditions (cloudy/windy)")
+
+    return ", ".join(parts)
 
 def open_meteo_get_forecast_low_f(
     lat: float,
@@ -2143,12 +2251,33 @@ def build_expert_consensus(
     if source_range_f > CONSENSUS_MAX_SOURCE_RANGE_TRADE_F:
         return None
     nws_outlier_f, nws_outlier_sigma_add = _consensus_nws_outlier_metrics(source_values)
+
+    # Fetch meteorological conditions to adjust sigma for low temp markets
+    conditions: dict = {}
+    conditions_sigma_adj = 0.0
+    if side == "low":
+        try:
+            conditions = open_meteo_get_forecast_conditions(lat, lon, now_local)
+            cloud = conditions.get("cloud_cover_pct")
+            wind = conditions.get("wind_speed_mph")
+            precip_prob = conditions.get("precip_prob_pct", 0.0)
+            if cloud is not None and wind is not None:
+                # Radiational cooling setup: clear + calm = tighten sigma
+                if cloud <= 25 and wind <= 8 and (precip_prob or 0) < 20:
+                    conditions_sigma_adj = -0.5  # more predictable
+                # Poor conditions: cloudy or windy = widen sigma
+                elif cloud >= 75 or wind >= 20 or (precip_prob or 0) >= 40:
+                    conditions_sigma_adj = 0.75  # less predictable
+        except Exception:
+            pass
+
     sigma = max(
         CONSENSUS_MIN_SIGMA_F,
         CONSENSUS_BASE_SIGMA_F
         + (CONSENSUS_DISAGREEMENT_SIGMA_MULTIPLIER * disagreement_sigma)
         + (CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER * max(0.0, source_range_f - CONSENSUS_SOURCE_RANGE_FREE_F))
-        + nws_outlier_sigma_add,
+        + nws_outlier_sigma_add
+        + conditions_sigma_adj,
     )
 
     return {
@@ -2158,6 +2287,8 @@ def build_expert_consensus(
         "source_range_f": source_range_f,
         "nws_outlier_f": nws_outlier_f,
         "nws_outlier_sigma_add_f": nws_outlier_sigma_add,
+        "conditions": conditions,
+        "conditions_sigma_adj_f": conditions_sigma_adj,
         "sources": [{"name": name, "high_f": temp, "weight": w} for name, temp, w in source_values],
     }
 
@@ -4746,7 +4877,7 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
             lines.append("Sources:")
             lines.extend(source_lines)
 
-        # Fetch NWS narrative
+        # Fetch NWS narrative and OpenMeteo conditions
         try:
             cfg = CITY_CONFIG.get(city, {})
             lat = float(cfg.get("lat", 0))
@@ -4755,6 +4886,10 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
                 narrative = nws_get_forecast_narrative(lat, lon, now_local, temp_side=temp_type)
                 if narrative:
                     lines.append(f"\nNWS Forecast: \"{narrative}\"")
+                conditions = open_meteo_get_forecast_conditions(lat, lon, now_local)
+                conditions_text = _interpret_conditions(conditions, temp_type)
+                if conditions_text:
+                    lines.append(f"Conditions: {conditions_text}")
         except Exception:
             pass
         lines.append("")

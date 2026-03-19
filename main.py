@@ -4653,7 +4653,7 @@ def _compute_stake_dollars_for_bet(b: dict) -> Tuple[float, float]:
 
 def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
     ts = fmt_est_short(now_local)
-    lines = [f"Live Execution ({ts})", "City | Type | Bet | Edge | Contract | Price | Count | Status | Order Type | Action", "---"]
+    blocks = []
     for r in results:
         date_part = str(r.get("date", "") or "").strip()
         line_part = str(r.get("line", "") or "").strip()
@@ -4666,11 +4666,59 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
             order_type = "Market"
         else:
             order_type = "Limit"
-        lines.append(
-            f"{r.get('city')} | {r.get('temp_type')} | {r.get('bet')} | {edge_pct:.1f}% | {contract} | "
-            f"{r.get('limit_price_cents')}c | {r.get('count')} | {r.get('status')} | {order_type} | {str(r.get('order_action', 'buy')).upper()}"
-        )
-    return "\n".join(lines)
+        city = str(r.get("city", "") or "")
+        temp_type = str(r.get("temp_type", "") or "")
+        bet = str(r.get("bet", "") or "")
+        price = r.get("limit_price_cents", "?")
+        count = r.get("count", 1)
+        status = str(r.get("status", "") or "")
+
+        # Look up most recent snapshot for this city/side to get source breakdown
+        snap_rows = load_snapshot_rows_filtered(date=date_part, city=city, temp_side=temp_type)
+        snap = snap_rows[-1] if snap_rows else None
+        consensus_mu = None
+        source_lines = []
+        buffer_f = None
+        if snap:
+            try:
+                consensus_mu = float(snap.get("consensus_mu_f") or 0)
+                src_vals = json.loads(snap.get("source_values_json") or "{}")
+                for src_name, src_temp in sorted(src_vals.items()):
+                    source_lines.append(f"  • {src_name}: {src_temp:.1f}°F")
+                # Calculate buffer from bucket boundary
+                lo = _to_float(snap.get("best_lo"))
+                hi = _to_float(snap.get("best_hi"))
+                if lo is not None and hi is not None and consensus_mu is not None:
+                    if "NO" in bet.upper():
+                        if hi > 900:  # tail bucket (e.g. "62F or below")
+                            buffer_f = consensus_mu - lo
+                        elif lo < -900:  # other tail
+                            buffer_f = hi - consensus_mu
+                        else:
+                            buffer_f = min(abs(consensus_mu - lo), abs(consensus_mu - hi))
+            except Exception:
+                pass
+
+        header = f"🌡️ Trade Locked — {city} {temp_type.capitalize()} ({ts})"
+        detail = f"{bet} · {line_part} · {count} contract · {price}¢ ({order_type})"
+        lines = [header, detail, ""]
+
+        if consensus_mu is not None:
+            mu_line = f"Forecast Consensus: {consensus_mu:.1f}°F"
+            if buffer_f is not None:
+                mu_line += f" — {abs(buffer_f):.1f}°F buffer from bucket"
+            lines.append(mu_line)
+        if source_lines:
+            lines.append("Sources:")
+            lines.extend(source_lines)
+        lines.append("")
+
+        model_prob = float(_to_float(r.get("model_win_prob_pct") or snap.get("model_yes_prob") if snap else None) or 0.0) if snap else 0.0
+        lines.append(f"Bot Signal: {model_prob:.0f}% model confidence | {edge_pct:.1f}% edge")
+        lines.append(f"Status: {status}")
+        blocks.append("\n".join(lines))
+
+    return f"\n{'—'*30}\n".join(blocks)
 
 def _live_trade_discord_sig(row: dict) -> str:
     try:

@@ -816,6 +816,40 @@ def nws_get_forecast_low_f(lat: float, lon: float, now_local: datetime) -> Optio
         temp_f = f_from_c(temp_f)
     return temp_f
 
+def nws_get_forecast_narrative(lat: float, lon: float, now_local: datetime, temp_side: str = "high") -> Optional[str]:
+    """Return the NWS short forecast narrative for today's high or low period."""
+    try:
+        side = normalize_temp_side(temp_side)
+        headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
+        points_url = f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}"
+        r_points = requests.get(points_url, headers=headers, timeout=20)
+        r_points.raise_for_status()
+        forecast_url = r_points.json().get("properties", {}).get("forecast")
+        if not forecast_url:
+            return None
+        r_fcst = requests.get(forecast_url, headers=headers, timeout=20)
+        r_fcst.raise_for_status()
+        periods = r_fcst.json().get("properties", {}).get("periods", []) or []
+        today = now_local.date()
+        for p in periods:
+            start = p.get("startTime")
+            if not start:
+                continue
+            try:
+                dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(LOCAL_TZ)
+            except Exception:
+                continue
+            is_daytime = bool(p.get("isDaytime"))
+            if side == "high" and is_daytime and dt.date() == today:
+                narrative = str(p.get("detailedForecast") or p.get("shortForecast") or "").strip()
+                return narrative if narrative else None
+            if side == "low" and not is_daytime and dt.date() in (today, today + timedelta(days=1)):
+                narrative = str(p.get("detailedForecast") or p.get("shortForecast") or "").strip()
+                return narrative if narrative else None
+    except Exception:
+        pass
+    return None
+
 def open_meteo_get_forecast_high_f(
     lat: float,
     lon: float,
@@ -4711,6 +4745,18 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
         if source_lines:
             lines.append("Sources:")
             lines.extend(source_lines)
+
+        # Fetch NWS narrative
+        try:
+            cfg = CITY_CONFIG.get(city, {})
+            lat = float(cfg.get("lat", 0))
+            lon = float(cfg.get("lon", 0))
+            if lat and lon:
+                narrative = nws_get_forecast_narrative(lat, lon, now_local, temp_side=temp_type)
+                if narrative:
+                    lines.append(f"\nNWS Forecast: \"{narrative}\"")
+        except Exception:
+            pass
         lines.append("")
 
         model_prob = float(_to_float(r.get("model_win_prob_pct") or snap.get("model_yes_prob") if snap else None) or 0.0) if snap else 0.0

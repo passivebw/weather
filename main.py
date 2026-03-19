@@ -9,6 +9,7 @@ import base64
 import csv
 import json
 import uuid
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple

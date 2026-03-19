@@ -1967,6 +1967,29 @@ def compute_sleep_seconds(now_local: datetime) -> float:
     nxt = next_scheduled_scan_time(now_local)
     return max(1.0, (nxt - now_local).total_seconds())
 
+_HARDCODED_SERIES: Dict[str, Dict[str, List[str]]] = {
+    "Atlanta":       {"high": ["KXHIGHTATL"], "low": ["KXLOWTATL"]},
+    "Austin":        {"high": ["KXHIGHAUS"],  "low": ["KXLOWTAUS"]},
+    "Boston":        {"high": ["KXHIGHTBOS"], "low": ["KXLOWTBOS"]},
+    "Chicago":       {"high": ["KXHIGHCHI"],  "low": ["KXLOWTCHI"]},
+    "Denver":        {"high": ["KXHIGHDEN"],  "low": ["KXLOWTDEN"]},
+    "Las Vegas":     {"high": ["KXHIGHTLV"],  "low": ["KXLOWTLV"]},
+    "Los Angeles":   {"high": ["KXHIGHLAX"],  "low": ["KXLOWTLAX"]},
+    "Miami":         {"high": ["KXHIGHMIA"],  "low": ["KXLOWTMIA"]},
+    "Philadelphia":  {"high": ["KXHIGHPHIL"], "low": ["KXLOWTPHIL"]},
+    "Seattle":       {"high": ["KXHIGHTSEA"], "low": ["KXLOWTSEA"]},
+    "Washington DC": {"high": ["KXHIGHTDC"],  "low": ["KXLOWTDC"]},
+    "Oklahoma City": {"high": ["KXHIGHTOKC"], "low": ["KXLOWTOKC"]},
+    "San Francisco": {"high": ["KXHIGHTSFO"], "low": ["KXLOWTSFO"]},
+    "Houston":       {"high": ["KXHIGHTHOU"], "low": ["KXLOWTHOU"]},
+    "Dallas":        {"high": ["KXHIGHTDAL"], "low": ["KXLOWTDAL"]},
+    "Phoenix":       {"high": ["KXHIGHTPHX"], "low": ["KXLOWTPHX"]},
+    "New Orleans":   {"high": ["KXHIGHTNOLA"],"low": ["KXLOWTNOLA"]},
+    "Minneapolis":   {"high": ["KXHIGHTMIN"], "low": ["KXLOWTMIN"]},
+    "San Antonio":   {"high": ["KXHIGHTSATX"],"low": ["KXLOWTSATX"]},
+    "New York City": {"high": ["KXHIGHTNY", "KXHIGHNY"], "low": ["KXLOWTNYC"]},
+}
+
 def _load_weather_series_by_city(force: bool = False) -> Dict[str, Dict[str, List[str]]]:
     now_ts = time.time()
     with _market_cache_lock:
@@ -1976,31 +1999,44 @@ def _load_weather_series_by_city(force: bool = False) -> Dict[str, Dict[str, Lis
             if cached:
                 return {k: {"high": list(v.get("high", [])), "low": list(v.get("low", []))} for k, v in cached.items()}
 
-    data = kalshi_get("/series", params={"limit": 10000}, timeout=30, max_retries=3)
-    entries = data.get("series", []) or []
     out: Dict[str, Dict[str, List[str]]] = {city: {"high": [], "low": []} for city in CITY_CONFIG.keys()}
 
-    for s in entries:
-        ticker = str(s.get("ticker", "")).strip()
-        title = str(s.get("title", "")).strip().lower()
-        category = str(s.get("category", "")).strip().lower()
-        if not ticker or not title:
-            continue
-        if category != "climate and weather":
-            continue
+    # Try the /series endpoint first; if it returns nothing (Kalshi API issue),
+    # fall back to hardcoded series tickers derived from observed market data.
+    try:
+        data = kalshi_get("/series", params={"limit": 10000}, timeout=30, max_retries=3)
+        entries = data.get("series", []) or []
+        if entries:
+            for s in entries:
+                ticker = str(s.get("ticker", "")).strip()
+                title = str(s.get("title", "")).strip().lower()
+                category = str(s.get("category", "")).strip().lower()
+                if not ticker or not title:
+                    continue
+                if category != "climate and weather":
+                    continue
+                side = None
+                if ticker.startswith("KXHIGH"):
+                    side = "high"
+                elif ticker.startswith("KXLOW"):
+                    side = "low"
+                if side is None:
+                    continue
+                for city in CITY_CONFIG.keys():
+                    aliases = city_name_aliases(city)
+                    if any(a in title for a in aliases):
+                        out[city][side].append(ticker)
+    except Exception as e:
+        logging.warning(f"Series API call failed: {e}")
 
-        side = None
-        if ticker.startswith("KXHIGH"):
-            side = "high"
-        elif ticker.startswith("KXLOW"):
-            side = "low"
-        if side is None:
-            continue
-
-        for city in CITY_CONFIG.keys():
-            aliases = city_name_aliases(city)
-            if any(a in title for a in aliases):
-                out[city][side].append(ticker)
+    # If /series returned nothing, use hardcoded series tickers.
+    total = sum(len(v["high"]) + len(v["low"]) for v in out.values())
+    if total == 0:
+        logging.warning("Series API returned 0 results — using hardcoded series tickers")
+        for city, series in _HARDCODED_SERIES.items():
+            if city in out:
+                out[city]["high"] = list(series.get("high", []))
+                out[city]["low"] = list(series.get("low", []))
 
     # Keep stable order and unique values.
     for city in out.keys():

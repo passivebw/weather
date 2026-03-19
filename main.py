@@ -318,6 +318,10 @@ ENABLE_NWS_SOURCE = env_bool("ENABLE_NWS_SOURCE", default=False)
 ENABLE_ICON_SOURCE = env_bool("ENABLE_ICON_SOURCE", default=True)
 ENABLE_METNO_SOURCE = env_bool("ENABLE_METNO_SOURCE", default=True)
 ENABLE_ACCUWEATHER_SOURCE = env_bool("ENABLE_ACCUWEATHER_SOURCE", default=True)
+TOMORROW_IO_API_KEY = os.getenv("TOMORROW_IO_API_KEY", "").strip()
+TOMORROW_IO_HIST_MAE_F = float(os.getenv("TOMORROW_IO_HIST_MAE_F", "2.2"))
+ENABLE_TOMORROW_IO_SOURCE = env_bool("ENABLE_TOMORROW_IO_SOURCE", default=True)
+TOMORROW_IO_CACHE_TTL_SECONDS = int(os.getenv("TOMORROW_IO_CACHE_TTL_SECONDS", "3600"))
 ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS", "2592000"))
 ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS", "3600"))
 ACCUWEATHER_STALE_FALLBACK_MAX_AGE_SECONDS = int(os.getenv("ACCUWEATHER_STALE_FALLBACK_MAX_AGE_SECONDS", "172800"))
@@ -406,6 +410,8 @@ _live_kill_switch_state = LIVE_KILL_SWITCH
 _market_cache_lock = threading.Lock()
 _accuweather_cache_lock = threading.Lock()
 _awc_cache_lock = threading.Lock()
+_tomorrow_io_cache: Dict[str, dict] = {}
+_tomorrow_io_cache_lock = threading.Lock()
 _kalshi_key_cache = None
 _kalshi_key_lock = threading.Lock()
 _awc_metar_cache: Dict[str, Dict[str, object]] = {}
@@ -965,6 +971,79 @@ def _interpret_conditions(conditions: dict, temp_side: str) -> str:
             parts.append("→ poor radiational cooling conditions (cloudy/windy)")
 
     return ", ".join(parts)
+
+def tomorrow_io_get_forecast_temp_f(
+    lat: float, lon: float, now_local: datetime, temp_side: str = "high"
+) -> Optional[float]:
+    """Fetch today's high or low from Tomorrow.io with 60-min city-level cache.
+    Only called for edge-candidate cities (≥2 sources already gathered).
+    Rate limits: 25 req/hour, 500 req/day — cache ensures ≤1 call/city/hour."""
+    if not TOMORROW_IO_API_KEY:
+        return None
+    cache_key = f"{lat:.4f},{lon:.4f}"
+    today_date = now_local.date().isoformat()
+    now_ts = time.time()
+
+    with _tomorrow_io_cache_lock:
+        cached = _tomorrow_io_cache.get(cache_key)
+        if (
+            cached
+            and cached.get("date") == today_date
+            and (now_ts - cached.get("ts", 0)) < TOMORROW_IO_CACHE_TTL_SECONDS
+        ):
+            val = cached.get("high_f") if temp_side == "high" else cached.get("low_f")
+            return val
+
+    try:
+        params = {
+            "location": f"{lat:.4f},{lon:.4f}",
+            "timesteps": "1d",
+            "fields": "temperatureMax,temperatureMin",
+            "units": "imperial",
+            "apikey": TOMORROW_IO_API_KEY,
+        }
+        r = requests.get(
+            "https://api.tomorrow.io/v4/weather/forecast", params=params, timeout=20
+        )
+        r.raise_for_status()
+        payload = r.json()
+        daily = payload.get("timelines", {}).get("daily", [])
+
+        high_f: Optional[float] = None
+        low_f: Optional[float] = None
+        for entry in daily:
+            entry_date = (entry.get("time") or "")[:10]
+            if entry_date == today_date:
+                vals = entry.get("values", {})
+                raw_high = vals.get("temperatureMax")
+                raw_low = vals.get("temperatureMin")
+                if raw_high is not None:
+                    high_f = float(raw_high)
+                if raw_low is not None:
+                    low_f = float(raw_low)
+                break
+        # Fall back to first entry if date match fails (timezone edge case)
+        if high_f is None and daily:
+            vals = daily[0].get("values", {})
+            raw_high = vals.get("temperatureMax")
+            raw_low = vals.get("temperatureMin")
+            if raw_high is not None:
+                high_f = float(raw_high)
+            if raw_low is not None:
+                low_f = float(raw_low)
+
+        with _tomorrow_io_cache_lock:
+            _tomorrow_io_cache[cache_key] = {
+                "ts": now_ts,
+                "date": today_date,
+                "high_f": high_f,
+                "low_f": low_f,
+            }
+
+        return high_f if temp_side == "high" else low_f
+    except Exception as e:
+        logging.warning(f"Tomorrow.io fetch failed for {lat},{lon}: {e}")
+        return None
 
 def open_meteo_get_forecast_low_f(
     lat: float,
@@ -2235,6 +2314,16 @@ def build_expert_consensus(
                 source_values.append(("AccuWeather", aw_temp, safe_inverse_mae_weight(ACCUWEATHER_HIST_MAE_F)))
         except Exception:
             pass
+
+    # Tomorrow.io: only fetch if ≥2 sources already gathered (edge-candidate filter)
+    # Cache TTL=60min ensures ≤1 API call per city per hour (25/hr limit respected)
+    if ENABLE_TOMORROW_IO_SOURCE and TOMORROW_IO_API_KEY and len(source_values) >= 2:
+        try:
+            tio_temp = tomorrow_io_get_forecast_temp_f(lat, lon, now_local, temp_side=side)
+            if tio_temp is not None:
+                source_values.append(("Tomorrow.io", tio_temp, safe_inverse_mae_weight(TOMORROW_IO_HIST_MAE_F)))
+        except Exception as e:
+            logging.warning(f"Tomorrow.io failed for {city} {side}: {e}")
 
     if not source_values:
         return None

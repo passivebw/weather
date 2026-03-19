@@ -2038,22 +2038,23 @@ def build_expert_consensus(
         om_ecmwf = open_meteo_get_forecast_temp_f(lat, lon, now_local, model="ecmwf_seamless", temp_side=side)
         if om_ecmwf is not None:
             source_values.append(("OpenMeteo-ECMWF", om_ecmwf, safe_inverse_mae_weight(OPEN_METEO_ECMWF_HIST_MAE_F)))
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"OpenMeteo-ECMWF failed for {city} {side}: {e}")
 
     try:
         om_gfs = open_meteo_get_forecast_temp_f(lat, lon, now_local, model="gfs_seamless", temp_side=side)
         if om_gfs is not None:
             source_values.append(("OpenMeteo-GFS", om_gfs, safe_inverse_mae_weight(OPEN_METEO_GFS_HIST_MAE_F)))
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"OpenMeteo-GFS failed for {city} {side}: {e}")
+
     if ENABLE_ICON_SOURCE:
         try:
             om_icon = open_meteo_get_forecast_temp_f(lat, lon, now_local, model="icon_seamless", temp_side=side)
             if om_icon is not None:
                 source_values.append(("OpenMeteo-ICON", om_icon, safe_inverse_mae_weight(OPEN_METEO_ICON_HIST_MAE_F)))
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"OpenMeteo-ICON failed for {city} {side}: {e}")
 
     if ENABLE_METNO_SOURCE:
         try:

@@ -1969,26 +1969,28 @@ def compute_sleep_seconds(now_local: datetime) -> float:
     return max(1.0, (nxt - now_local).total_seconds())
 
 _HARDCODED_SERIES: Dict[str, Dict[str, List[str]]] = {
-    "Atlanta":       {"high": ["KXHIGHTATL"], "low": ["KXLOWTATL"]},
-    "Austin":        {"high": ["KXHIGHAUS"],  "low": ["KXLOWTAUS"]},
-    "Boston":        {"high": ["KXHIGHTBOS"], "low": ["KXLOWTBOS"]},
-    "Chicago":       {"high": ["KXHIGHCHI"],  "low": ["KXLOWTCHI"]},
-    "Denver":        {"high": ["KXHIGHDEN"],  "low": ["KXLOWTDEN"]},
-    "Las Vegas":     {"high": ["KXHIGHTLV"],  "low": ["KXLOWTLV"]},
-    "Los Angeles":   {"high": ["KXHIGHLAX"],  "low": ["KXLOWTLAX"]},
-    "Miami":         {"high": ["KXHIGHMIA"],  "low": ["KXLOWTMIA"]},
-    "Philadelphia":  {"high": ["KXHIGHPHIL"], "low": ["KXLOWTPHIL"]},
-    "Seattle":       {"high": ["KXHIGHTSEA"], "low": ["KXLOWTSEA"]},
-    "Washington DC": {"high": ["KXHIGHTDC"],  "low": ["KXLOWTDC"]},
-    "Oklahoma City": {"high": ["KXHIGHTOKC"], "low": ["KXLOWTOKC"]},
-    "San Francisco": {"high": ["KXHIGHTSFO"], "low": ["KXLOWTSFO"]},
-    "Houston":       {"high": ["KXHIGHTHOU"], "low": ["KXLOWTHOU"]},
-    "Dallas":        {"high": ["KXHIGHTDAL"], "low": ["KXLOWTDAL"]},
-    "Phoenix":       {"high": ["KXHIGHTPHX"], "low": ["KXLOWTPHX"]},
-    "New Orleans":   {"high": ["KXHIGHTNOLA"],"low": ["KXLOWTNOLA"]},
-    "Minneapolis":   {"high": ["KXHIGHTMIN"], "low": ["KXLOWTMIN"]},
-    "San Antonio":   {"high": ["KXHIGHTSATX"],"low": ["KXLOWTSATX"]},
-    "New York City": {"high": ["KXHIGHTNY", "KXHIGHNY"], "low": ["KXLOWTNYC"]},
+    # Verified against Kalshi /series API 2026-03-20.
+    # Only cities with confirmed Kalshi LOW markets have low series entries.
+    "Atlanta":       {"high": ["KXHIGHTATL"],              "low": []},
+    "Austin":        {"high": ["KXHIGHAUS"],               "low": ["KXLOWAUS", "KXLOWTAUS"]},
+    "Boston":        {"high": ["KXHIGHTBOS"],              "low": []},
+    "Chicago":       {"high": ["KXHIGHCHI"],               "low": ["KXLOWCHI", "KXLOWTCHI"]},
+    "Denver":        {"high": ["KXHIGHDEN"],               "low": ["KXLOWDEN", "KXLOWTDEN"]},
+    "Las Vegas":     {"high": ["KXHIGHTLV"],               "low": []},
+    "Los Angeles":   {"high": ["KXHIGHLAX"],               "low": ["KXLOWLAX", "KXLOWTLAX"]},
+    "Miami":         {"high": ["KXHIGHMIA"],               "low": ["KXLOWMIA", "KXLOWTMIA"]},
+    "Philadelphia":  {"high": ["KXHIGHPHIL"],              "low": ["KXLOWPHIL", "KXLOWTPHIL"]},
+    "Seattle":       {"high": ["KXHIGHTSEA"],              "low": []},
+    "Washington DC": {"high": ["KXHIGHTDC"],               "low": []},
+    "Oklahoma City": {"high": ["KXHIGHTOKC"],              "low": []},
+    "San Francisco": {"high": ["KXHIGHTSFO"],              "low": []},
+    "Houston":       {"high": ["KXHIGHHOU", "KXHIGHTHOU"], "low": []},
+    "Dallas":        {"high": ["KXHIGHTDAL"],              "low": []},
+    "Phoenix":       {"high": ["KXHIGHTPHX"],              "low": []},
+    "New Orleans":   {"high": ["KXHIGHTNOLA"],             "low": []},
+    "Minneapolis":   {"high": ["KXHIGHTMIN"],              "low": []},
+    "San Antonio":   {"high": ["KXHIGHTSATX"],             "low": []},
+    "New York City": {"high": ["KXHIGHNY", "KXHIGHNY0", "KXHIGHNYD"], "low": ["KXLOWNY", "KXLOWNYC"]},
 }
 
 def _load_weather_series_by_city(force: bool = False) -> Dict[str, Dict[str, List[str]]]:

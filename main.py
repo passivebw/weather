@@ -413,6 +413,9 @@ _accuweather_cache_lock = threading.Lock()
 _awc_cache_lock = threading.Lock()
 _tomorrow_io_cache: Dict[str, dict] = {}
 _tomorrow_io_cache_lock = threading.Lock()
+_open_meteo_cache: Dict[str, dict] = {}
+_open_meteo_cache_lock = threading.Lock()
+OPEN_METEO_CACHE_TTL_SECONDS = 3600  # 1-hour cache; free tier has per-minute rate limits
 _afd_cache: Dict[str, dict] = {}
 _afd_cache_lock = threading.Lock()
 _nws_cwa_cache: Dict[str, str] = {}   # lat,lon key -> CWA office code (permanent)
@@ -1146,6 +1149,58 @@ def _interpret_conditions(conditions: dict, temp_side: str) -> str:
 
     return ", ".join(parts)
 
+def _tomorrow_io_cache_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "tomorrow_io_cache.json")
+
+def _open_meteo_cache_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "open_meteo_cache.json")
+
+_forecast_caches_loaded = False
+_forecast_caches_loaded_lock = threading.Lock()
+
+def _load_forecast_caches() -> None:
+    global _forecast_caches_loaded
+    with _forecast_caches_loaded_lock:
+        if _forecast_caches_loaded:
+            return
+        _forecast_caches_loaded = True
+    now_ts = time.time()
+    today = datetime.now().date().isoformat()
+    for path, cache, lock in [
+        (_tomorrow_io_cache_path(), _tomorrow_io_cache, _tomorrow_io_cache_lock),
+        (_open_meteo_cache_path(), _open_meteo_cache, _open_meteo_cache_lock),
+    ]:
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                with lock:
+                    for k, v in data.items():
+                        if isinstance(v, dict) and v.get("date") == today:
+                            cache[k] = v
+        except Exception:
+            pass
+
+def _save_tomorrow_io_cache() -> None:
+    try:
+        os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+        with _tomorrow_io_cache_lock:
+            snapshot = dict(_tomorrow_io_cache)
+        with open(_tomorrow_io_cache_path(), "w", encoding="utf-8") as f:
+            json.dump(snapshot, f)
+    except Exception:
+        pass
+
+def _save_open_meteo_cache() -> None:
+    try:
+        os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+        with _open_meteo_cache_lock:
+            snapshot = dict(_open_meteo_cache)
+        with open(_open_meteo_cache_path(), "w", encoding="utf-8") as f:
+            json.dump(snapshot, f)
+    except Exception:
+        pass
+
 def tomorrow_io_get_forecast_temp_f(
     lat: float, lon: float, now_local: datetime, temp_side: str = "high"
 ) -> Optional[float]:
@@ -1154,6 +1209,7 @@ def tomorrow_io_get_forecast_temp_f(
     Rate limits: 25 req/hour, 500 req/day — cache ensures ≤1 call/city/hour."""
     if not TOMORROW_IO_API_KEY:
         return None
+    _load_forecast_caches()
     cache_key = f"{lat:.4f},{lon:.4f}"
     today_date = now_local.date().isoformat()
     now_ts = time.time()
@@ -1213,6 +1269,7 @@ def tomorrow_io_get_forecast_temp_f(
                 "high_f": high_f,
                 "low_f": low_f,
             }
+        _save_tomorrow_io_cache()
 
         return high_f if temp_side == "high" else low_f
     except Exception as e:
@@ -1236,6 +1293,20 @@ def open_meteo_get_forecast_temp_f(
 ) -> Optional[float]:
     side = normalize_temp_side(temp_side)
     daily_field = "temperature_2m_max" if side == "high" else "temperature_2m_min"
+    today_date = now_local.date().isoformat()
+    now_ts = time.time()
+    cache_key = f"{lat:.4f},{lon:.4f},{model or 'default'},{side}"
+    _load_forecast_caches()
+
+    with _open_meteo_cache_lock:
+        cached = _open_meteo_cache.get(cache_key)
+        if (
+            cached
+            and cached.get("date") == today_date
+            and (now_ts - cached.get("ts", 0)) < OPEN_METEO_CACHE_TTL_SECONDS
+        ):
+            return cached.get("value")
+
     params = {
         "latitude": f"{lat:.4f}",
         "longitude": f"{lon:.4f}",
@@ -1258,11 +1329,19 @@ def open_meteo_get_forecast_temp_f(
     if not days or not values or len(days) != len(values):
         return None
 
-    today = now_local.date().isoformat()
+    result: Optional[float] = None
     for i, day in enumerate(days):
-        if day == today:
-            return float(values[i])
-    return float(values[0]) if values else None
+        if day == today_date:
+            result = float(values[i]) if values[i] is not None else None
+            break
+    if result is None and values and values[0] is not None:
+        result = float(values[0])
+
+    with _open_meteo_cache_lock:
+        _open_meteo_cache[cache_key] = {"ts": now_ts, "date": today_date, "value": result}
+    _save_open_meteo_cache()
+
+    return result
 
 def metno_get_forecast_high_f(lat: float, lon: float, now_local: datetime) -> Optional[float]:
     v = metno_get_forecast_temp_f(lat, lon, now_local, temp_side="high")

@@ -12672,13 +12672,15 @@ def report(request: Request):
     now_local = datetime.now(tz=LOCAL_TZ)
     today_str = now_local.date().isoformat()
 
-    # Today's trades
+    # Today's trades — deduplicated by order_id, showing latest status
     trades_today = []
     try:
+        order_map: dict = {}
         with open(live_trade_log_path()) as f:
             for row in _csv.DictReader(f):
                 if today_str in row.get("ts_est", ""):
-                    trades_today.append({
+                    key = row.get("order_id") or row.get("client_order_id") or row.get("ticker", "")
+                    order_map[key] = {
                         "city": row.get("city"),
                         "temp_type": row.get("temp_type"),
                         "bet": row.get("bet"),
@@ -12686,7 +12688,8 @@ def report(request: Request):
                         "edge_pct": row.get("edge_pct"),
                         "status": row.get("status"),
                         "ticker": row.get("ticker"),
-                    })
+                    }
+        trades_today = list(order_map.values())
     except Exception:
         pass
 

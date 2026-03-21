@@ -1250,6 +1250,7 @@ def open_meteo_get_forecast_temp_f(
     r.raise_for_status()
     payload = r.json()
     if payload.get("error"):
+        logging.warning(f"OpenMeteo error for model={model} lat={lat} lon={lon}: {payload.get('reason', payload)}")
         return None
     daily = payload.get("daily", {})
     days = daily.get("time", []) or []
@@ -2470,7 +2471,7 @@ def build_expert_consensus(
     source_values: List[Tuple[str, float, float]] = []
 
     try:
-        om_ecmwf_model = "ecmwf_seamless" if side == "high" else "best_match"
+        om_ecmwf_model = "ecmwf_ifs04" if side == "high" else "best_match"
         om_ecmwf = open_meteo_get_forecast_temp_f(lat, lon, now_local, model=om_ecmwf_model, temp_side=side)
         if om_ecmwf is not None:
             source_values.append(("OpenMeteo-ECMWF", om_ecmwf, safe_inverse_mae_weight(OPEN_METEO_ECMWF_HIST_MAE_F)))

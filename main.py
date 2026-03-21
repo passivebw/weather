@@ -415,7 +415,7 @@ _tomorrow_io_cache: Dict[str, dict] = {}
 _tomorrow_io_cache_lock = threading.Lock()
 _open_meteo_cache: Dict[str, dict] = {}
 _open_meteo_cache_lock = threading.Lock()
-OPEN_METEO_CACHE_TTL_SECONDS = 3600  # 1-hour cache; free tier has per-minute rate limits
+OPEN_METEO_CACHE_TTL_SECONDS = 600  # 10-min cache; targets ~9,200 calls/day against 10k free limit
 _afd_cache: Dict[str, dict] = {}
 _afd_cache_lock = threading.Lock()
 _nws_cwa_cache: Dict[str, str] = {}   # lat,lon key -> CWA office code (permanent)
@@ -1037,6 +1037,19 @@ def open_meteo_get_forecast_conditions(lat: float, lon: float, now_local: dateti
     """Fetch daily weather conditions from OpenMeteo useful for forecast confidence assessment.
     Returns dict with cloud_cover_pct, wind_speed_mph, precip_prob_pct, dewpoint_f, weather_code.
     Uses best_match model which supports all daily fields."""
+    _load_forecast_caches()
+    today_date = now_local.date().isoformat()
+    now_ts = time.time()
+    cache_key = f"{lat:.4f},{lon:.4f},conditions"
+    with _open_meteo_cache_lock:
+        cached = _open_meteo_cache.get(cache_key)
+        if (
+            cached
+            and cached.get("date") == today_date
+            and (now_ts - cached.get("ts", 0)) < OPEN_METEO_CACHE_TTL_SECONDS
+        ):
+            return cached.get("value") or {}
+
     result: dict = {}
     try:
         daily_fields = ",".join([
@@ -1089,6 +1102,9 @@ def open_meteo_get_forecast_conditions(lat: float, lon: float, now_local: dateti
                 result["weather_code"] = int(weather_code)
     except Exception as e:
         logging.warning(f"OpenMeteo conditions fetch failed: {e}")
+    with _open_meteo_cache_lock:
+        _open_meteo_cache[cache_key] = {"ts": now_ts, "date": today_date, "value": result}
+    _save_open_meteo_cache()
     return result
 
 def open_meteo_get_forecast_high_f(

@@ -12647,6 +12647,140 @@ def background_loop():
             pass
         time.sleep(compute_sleep_seconds(datetime.now(tz=LOCAL_TZ)))
 
+BOT_API_KEY = os.environ.get("BOT_API_KEY", "")
+
+def _check_api_key(request: Request) -> bool:
+    if not BOT_API_KEY:
+        return False
+    return request.headers.get("X-Bot-Api-Key", "") == BOT_API_KEY
+
+@app.get("/report")
+def report(request: Request):
+    if BOT_API_KEY and not _check_api_key(request):
+        return {"ok": False, "error": "unauthorized"}
+    import csv as _csv
+    now_local = datetime.now(tz=LOCAL_TZ)
+    today_str = now_local.date().isoformat()
+
+    # Today's trades
+    trades_today = []
+    try:
+        with open(live_trade_log_path()) as f:
+            for row in _csv.DictReader(f):
+                if today_str in row.get("ts_est", ""):
+                    trades_today.append({
+                        "city": row.get("city"),
+                        "temp_type": row.get("temp_type"),
+                        "bet": row.get("bet"),
+                        "line": row.get("line"),
+                        "edge_pct": row.get("edge_pct"),
+                        "status": row.get("status"),
+                        "ticker": row.get("ticker"),
+                    })
+    except Exception:
+        pass
+
+    # Top snapshot edges today
+    top_edges = []
+    try:
+        rows = []
+        with open(snapshot_log_path(), encoding="utf-8-sig") as f:
+            reader = _csv.reader(f)
+            next(reader)
+            for row in reader:
+                if len(row) > 15 and row[1].strip() == today_str:
+                    try:
+                        rows.append((row[2], row[3], float(row[15]), row[16], row[6]))
+                    except Exception:
+                        pass
+        seen = set()
+        rows.sort(key=lambda x: x[2], reverse=True)
+        for city, side, edge, bucket, mdate in rows:
+            key = (city, side)
+            if key not in seen:
+                seen.add(key)
+                top_edges.append({"city": city, "side": side, "edge_pct": round(edge * 100, 1), "bucket": bucket, "market_date": mdate})
+    except Exception:
+        pass
+
+    # Live funnel summary
+    funnel = {}
+    try:
+        grouped = refresh_markets_cache()
+        results = build_ranked_results(grouped, now_local)
+        candidates = [r for r in results if r.get("net_edge_pct", 0) >= POLICY_MIN_NET_EDGE_PCT]
+        funnel = {
+            "total_markets": sum(len(v) for v in grouped.values()),
+            "candidates_above_threshold": len(candidates),
+            "top_candidates": [
+                {"city": r["city"], "side": r["temp_type"], "edge_pct": round(r["net_edge_pct"], 1), "line": r.get("line", "")}
+                for r in candidates[:10]
+            ],
+        }
+    except Exception as e:
+        funnel = {"error": str(e)}
+
+    return {
+        "ok": True,
+        "as_of_est": now_local.strftime("%Y-%m-%d %I:%M:%S %p EST"),
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "policy_min_net_edge_pct": POLICY_MIN_NET_EDGE_PCT,
+        "trades_today": trades_today,
+        "top_edges_today": top_edges[:20],
+        "funnel": funnel,
+    }
+
+@app.post("/config")
+async def config_update(request: Request):
+    if not _check_api_key(request):
+        return {"ok": False, "error": "unauthorized"}
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False, "error": "invalid json"}
+
+    allowed_keys = {
+        "POLICY_MIN_NET_EDGE_PCT",
+        "LIVE_EDGE_PASSIVE_THEN_AGGR_PCT",
+        "LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT",
+        "LIVE_MAX_CONTRACTS_PER_ORDER",
+        "LIVE_TRADING_ENABLED",
+        "KELLY_SIZING_ENABLED",
+        "ENABLE_METNO_SOURCE",
+        "NYC_FORECAST_BRIEF_ENABLED",
+    }
+
+    env_path = "/opt/kalshi-weather-bot/.env"
+    updates = {}
+    for key, value in body.items():
+        if key not in allowed_keys:
+            return {"ok": False, "error": f"key not allowed: {key}"}
+        updates[key] = str(value)
+
+    try:
+        with open(env_path) as f:
+            lines = f.readlines()
+        new_lines = []
+        updated = set()
+        for line in lines:
+            matched = False
+            for key, value in updates.items():
+                if line.startswith(f"{key}=") or line.startswith(f'{key}="'):
+                    new_lines.append(f'{key}="{value}"\n')
+                    updated.add(key)
+                    matched = True
+                    break
+            if not matched:
+                new_lines.append(line)
+        for key, value in updates.items():
+            if key not in updated:
+                new_lines.append(f'{key}="{value}"\n')
+        with open(env_path, "w") as f:
+            f.writelines(new_lines)
+        return {"ok": True, "updated": updates}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.on_event("startup")
 def on_startup():
     try:

@@ -1333,11 +1333,20 @@ def open_meteo_get_forecast_temp_f(
     }
     if model:
         params["models"] = model
-    r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=20)
-    r.raise_for_status()
-    payload = r.json()
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        # Cache the failure for 2 min so we don't hammer a rate-limited API every scan
+        logging.warning(f"OpenMeteo fetch failed for model={model} lat={lat} lon={lon}: {e}")
+        with _open_meteo_cache_lock:
+            _open_meteo_cache[cache_key] = {"ts": now_ts - (OPEN_METEO_CACHE_TTL_SECONDS - 120), "date": today_date, "value": None}
+        return None
     if payload.get("error"):
         logging.warning(f"OpenMeteo error for model={model} lat={lat} lon={lon}: {payload.get('reason', payload)}")
+        with _open_meteo_cache_lock:
+            _open_meteo_cache[cache_key] = {"ts": now_ts - (OPEN_METEO_CACHE_TTL_SECONDS - 120), "date": today_date, "value": None}
         return None
     daily = payload.get("daily", {})
     days = daily.get("time", []) or []

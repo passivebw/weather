@@ -5231,8 +5231,18 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
         if model_adj_parts:
             lines.append("Model adjustments: " + " | ".join(model_adj_parts))
 
-        model_prob = float(_to_float(r.get("model_win_prob_pct") or snap.get("model_yes_prob") if snap else None) or 0.0) if snap else 0.0
-        lines.append(f"Bot Signal: {model_prob:.0f}% model confidence | {edge_pct:.1f}% edge")
+        model_yes_frac = float(_to_float((snap.get("model_yes_prob") if snap else None)) or 0.0)
+        if model_yes_frac <= 1.0:
+            model_yes_frac_pct = model_yes_frac * 100.0
+        else:
+            model_yes_frac_pct = model_yes_frac
+        win_prob_pct = float(_to_float(r.get("model_win_prob_pct")) or 0.0)
+        if win_prob_pct == 0.0 and model_yes_frac_pct > 0.0:
+            if bet.upper().startswith("BUY NO"):
+                win_prob_pct = 100.0 - model_yes_frac_pct
+            else:
+                win_prob_pct = model_yes_frac_pct
+        lines.append(f"Bot Signal: {win_prob_pct:.0f}% model confidence | {edge_pct:.1f}% edge")
         lines.append(f"Status: {status}")
         blocks.append("\n".join(lines))
 

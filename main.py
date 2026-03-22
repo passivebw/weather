@@ -135,6 +135,9 @@ BOARD_MIN_TOP_SIZE = int(os.getenv("BOARD_MIN_TOP_SIZE", "10"))
 BOARD_MAX_SPREAD_CENTS = int(os.getenv("BOARD_MAX_SPREAD_CENTS", "12"))
 BOARD_MIN_BUCKET_COUNT = int(os.getenv("BOARD_MIN_BUCKET_COUNT", "4"))
 BOARD_MIN_TOP_SIZE_LOW = int(os.getenv("BOARD_MIN_TOP_SIZE_LOW", str(BOARD_MIN_TOP_SIZE)))
+# Thin-book resting: high-edge markets bypass the top_size filter and use GTC limit orders
+LIVE_THIN_BOOK_RESTING_MIN_EDGE_PCT = float(os.getenv("LIVE_THIN_BOOK_RESTING_MIN_EDGE_PCT", "25.0"))
+LIVE_THIN_BOOK_RESTING_ENABLED = env_bool("LIVE_THIN_BOOK_RESTING_ENABLED", default=True)
 BOARD_MAX_SPREAD_CENTS_LOW = int(os.getenv("BOARD_MAX_SPREAD_CENTS_LOW", str(BOARD_MAX_SPREAD_CENTS)))
 BOARD_MIN_BUCKET_COUNT_LOW = int(os.getenv("BOARD_MIN_BUCKET_COUNT_LOW", str(BOARD_MIN_BUCKET_COUNT)))
 NO_TRADE_IMPLIED_PROB_MIN = float(os.getenv("NO_TRADE_IMPLIED_PROB_MIN", "0.08"))
@@ -3470,7 +3473,14 @@ def build_odds_board(now_local: datetime, market_day: str = "auto") -> dict:
                     "spread_cents": best_spread,
                 })
                 continue
-            if best_size is None or best_size < min_top_size:
+            best_edge_pct = float(best.get("best_edge", 0.0)) * 100.0
+            thin_book_resting = (
+                LIVE_THIN_BOOK_RESTING_ENABLED
+                and best_size is not None
+                and 1 <= best_size < min_top_size
+                and best_edge_pct >= LIVE_THIN_BOOK_RESTING_MIN_EDGE_PCT
+            )
+            if (best_size is None or best_size < min_top_size) and not thin_book_resting:
                 unavailable.append({
                     "city": city,
                     "temp_side": side,
@@ -3540,6 +3550,7 @@ def build_odds_board(now_local: datetime, market_day: str = "auto") -> dict:
             "best_lo": best.get("lo"),
             "best_hi": best.get("hi"),
             "best_structure_kind": _bucket_structure_kind(float(best.get("lo")), float(best.get("hi"))),
+            "thin_book_resting": thin_book_resting,
         })
     for r in rows:
         raw_edge = float(r.get("best_edge", 0.0))
@@ -6200,9 +6211,10 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                     "passive_offset_cents": int(max(0, passive_offset_cents)),
                 })
 
-            is_high = edge_pct >= LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT
-            is_mid = edge_pct >= LIVE_EDGE_PASSIVE_THEN_AGGR_PCT
-            is_aggressive_override = edge_pct >= LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT
+            is_thin_book_resting = bool(b.get("thin_book_resting", False))
+            is_high = (not is_thin_book_resting) and edge_pct >= LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT
+            is_mid = (not is_thin_book_resting) and edge_pct >= LIVE_EDGE_PASSIVE_THEN_AGGR_PCT
+            is_aggressive_override = (not is_thin_book_resting) and edge_pct >= LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT
             passive_wait_s = LIVE_PASSIVE_WAIT_SECONDS_MID if (is_high or is_mid) else LIVE_PASSIVE_WAIT_SECONDS_LOW
             passive_steps = LIVE_PASSIVE_REPRICE_STEPS_MID if (is_high or is_mid) else LIVE_PASSIVE_REPRICE_STEPS_LOW
             desired_passive_price = None
@@ -9803,7 +9815,8 @@ def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_ed
             "nws_obs_fresh": r.get("nws_obs_fresh"),
             "locked_outcome": bool(r.get("locked_outcome", False)),
             "locked_reason": r.get("locked_reason"),
-            "trade_mode": ("locked_capture" if locked_allowed else "normal"),
+            "trade_mode": ("locked_capture" if locked_allowed else ("thin_book_resting" if r.get("thin_book_resting") else "normal")),
+            "thin_book_resting": bool(r.get("thin_book_resting", False)),
             "best_lo": r.get("best_lo"),
             "best_hi": r.get("best_hi"),
             "best_structure_kind": r.get("best_structure_kind"),

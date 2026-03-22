@@ -307,6 +307,8 @@ HIGH_EARLY_DAMPING_HOUR_LST = int(os.getenv("HIGH_EARLY_DAMPING_HOUR_LST", "12")
 LIVE_THIN_YES_EDGE_MAX_PCT = float(os.getenv("LIVE_THIN_YES_EDGE_MAX_PCT", "12.5"))
 LIVE_THIN_YES_MAX_SPREAD_CENTS = int(os.getenv("LIVE_THIN_YES_MAX_SPREAD_CENTS", "2"))
 LIVE_THIN_YES_MIN_TOP_SIZE = int(os.getenv("LIVE_THIN_YES_MIN_TOP_SIZE", "5"))
+# BUY YES requires higher edge floor due to historically poor win rate
+LIVE_BUY_YES_MIN_EDGE_PCT = float(os.getenv("LIVE_BUY_YES_MIN_EDGE_PCT", "30.0"))
 LIVE_CITY_SIDE_OVERLAP_GUARD_ENABLED = env_bool("LIVE_CITY_SIDE_OVERLAP_GUARD_ENABLED", default=True)
 LIVE_CITY_SIDE_MIN_MIDPOINT_DISTANCE_F = float(os.getenv("LIVE_CITY_SIDE_MIN_MIDPOINT_DISTANCE_F", "3.0"))
 LIVE_CITY_SIDE_DIFF_STRUCTURE_MIN_DISTANCE_F = float(os.getenv("LIVE_CITY_SIDE_DIFF_STRUCTURE_MIN_DISTANCE_F", "1.5"))
@@ -4645,6 +4647,7 @@ def _append_live_trade_log(row: dict) -> None:
         "execution_mode", "attempt_count", "passive_attempted", "aggressive_attempted",
         "aggressive_used", "initial_limit_price_cents", "final_order_status_raw",
         "source_count", "source_range_f", "afd_signal_label", "entry_hour_et", "trade_day_offset", "trade_mode",
+        "outcome", "won", "pnl_dollars",
     ]
     if os.path.exists(path):
         try:
@@ -6150,6 +6153,12 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
         order_side, price_field = _bet_side_and_price_field(bet_side)
         if order_side is None or price_field is None:
             continue
+
+        # BUY YES requires a higher edge floor due to structural disadvantage
+        if bet_side == "BUY YES":
+            _edge_pct_pre = float(b.get("net_edge_pct", 0.0))
+            if _edge_pct_pre < LIVE_BUY_YES_MIN_EDGE_PCT:
+                continue
 
         ticker = str(b.get("ticker", "")).strip()
         if not ticker:
@@ -9124,6 +9133,7 @@ def health():
         "live_thin_yes_edge_max_pct": LIVE_THIN_YES_EDGE_MAX_PCT,
         "live_thin_yes_max_spread_cents": LIVE_THIN_YES_MAX_SPREAD_CENTS,
         "live_thin_yes_min_top_size": LIVE_THIN_YES_MIN_TOP_SIZE,
+        "live_buy_yes_min_edge_pct": LIVE_BUY_YES_MIN_EDGE_PCT,
         "live_city_side_overlap_guard_enabled": LIVE_CITY_SIDE_OVERLAP_GUARD_ENABLED,
         "live_city_side_min_midpoint_distance_f": LIVE_CITY_SIDE_MIN_MIDPOINT_DISTANCE_F,
         "live_city_side_diff_structure_min_distance_f": LIVE_CITY_SIDE_DIFF_STRUCTURE_MIN_DISTANCE_F,
@@ -10167,6 +10177,232 @@ def paper_trade_text(now_local: datetime, bets: List[dict]) -> str:
 
 _next_day_paper_state: Dict[str, dict] = {}
 _next_day_paper_state_date: str = ""
+
+# -----------------------------------------------------------------------
+# Settlement reconciler: annotate live trade log rows with win/loss/pnl
+# -----------------------------------------------------------------------
+_settlement_cache: Dict[str, dict] = {}       # ticker -> settlement row
+_settlement_cache_ts: float = 0.0
+_settlement_cache_lock = threading.Lock()
+SETTLEMENT_CACHE_TTL_SECONDS = 300            # refresh settlements every 5 min
+_last_reconcile_ts: float = 0.0
+SETTLEMENT_RECONCILE_INTERVAL_SECONDS = 1800  # run reconcile every 30 min
+
+
+def _get_cached_settlements() -> Dict[str, dict]:
+    """Return ticker->settlement map, refreshing from Kalshi API at most every 5 min."""
+    global _settlement_cache, _settlement_cache_ts
+    now_ts = time.time()
+    with _settlement_cache_lock:
+        if now_ts - _settlement_cache_ts < SETTLEMENT_CACHE_TTL_SECONDS and _settlement_cache:
+            return dict(_settlement_cache)
+    if not kalshi_has_auth_config():
+        return {}
+    try:
+        raw = _fetch_kalshi_settlements(max_pages=20, per_page_limit=200)
+    except Exception:
+        return {}
+    by_ticker: Dict[str, dict] = {}
+    for s in raw:
+        ticker = str(s.get("ticker", "")).strip().upper()
+        if not ticker:
+            continue
+        prev = by_ticker.get(ticker)
+        if prev is None:
+            by_ticker[ticker] = s
+        else:
+            # Keep the most-recently-settled record for this ticker
+            try:
+                prev_dt = datetime.fromisoformat(str(prev.get("settled_time", "")).replace("Z", "+00:00"))
+                cur_dt = datetime.fromisoformat(str(s.get("settled_time", "")).replace("Z", "+00:00"))
+                if cur_dt >= prev_dt:
+                    by_ticker[ticker] = s
+            except Exception:
+                pass
+    with _settlement_cache_lock:
+        _settlement_cache = by_ticker
+        _settlement_cache_ts = time.time()
+    return dict(by_ticker)
+
+
+def reconcile_live_trade_outcomes() -> int:
+    """
+    For each submitted live trade that has no outcome yet, check the Kalshi
+    settlement cache and annotate outcome / won / pnl_dollars in-place.
+    Returns number of rows updated.
+    """
+    settlements = _get_cached_settlements()
+    if not settlements:
+        return 0
+
+    updated = 0
+    for path in list_live_trade_log_paths():
+        _, rows = _read_csv_rows_with_header(path)
+        changed = False
+        for r in rows:
+            if str(r.get("status", "")).strip().lower() not in ("submitted", "partial", "partial_filled"):
+                continue
+            if str(r.get("outcome", "")).strip():
+                continue  # already annotated
+            ticker = str(r.get("ticker", "")).strip().upper()
+            if not ticker:
+                continue
+            s = settlements.get(ticker)
+            if s is None:
+                continue
+            market_result = str(s.get("market_result", "")).strip().lower()
+            if market_result not in ("yes", "no"):
+                continue
+            bet = str(r.get("bet", "")).strip().upper()
+            won = ("YES" in bet and market_result == "yes") or ("NO" in bet and market_result == "no")
+            yes_cost_c = float(_to_float(s.get("yes_total_cost")) or 0.0)
+            no_cost_c = float(_to_float(s.get("no_total_cost")) or 0.0)
+            revenue_c = float(_to_float(s.get("revenue")) or 0.0)
+            fee_settle_d = float(_to_float(s.get("fee_cost")) or 0.0)
+            stake_c = yes_cost_c if "YES" in bet else no_cost_c
+            if stake_c <= 0:
+                # Fall back to price * count from the trade row
+                px = float(_to_float(r.get("limit_price_cents")) or 0.0)
+                cnt = int(float(_to_float(r.get("count")) or 1))
+                stake_c = px * cnt
+            pnl = (revenue_c - stake_c) / 100.0 - fee_settle_d
+            r["outcome"] = market_result.upper()
+            r["won"] = str(won)
+            r["pnl_dollars"] = f"{pnl:.4f}"
+            changed = True
+            updated += 1
+        if changed:
+            rewrite_live_trade_log_rows(path, rows)
+    return updated
+
+
+def maybe_reconcile_live_trade_outcomes() -> int:
+    """Throttled wrapper — runs at most every SETTLEMENT_RECONCILE_INTERVAL_SECONDS."""
+    global _last_reconcile_ts
+    now_ts = time.time()
+    if now_ts - _last_reconcile_ts < SETTLEMENT_RECONCILE_INTERVAL_SECONDS:
+        return 0
+    _last_reconcile_ts = now_ts
+    try:
+        n = reconcile_live_trade_outcomes()
+        update_source_accuracy_log()
+        return n
+    except Exception as exc:
+        logging.warning(f"reconcile_live_trade_outcomes error: {exc}")
+        return 0
+
+
+# -----------------------------------------------------------------------
+# Source accuracy log: per-source forecast error vs actual settlement
+# -----------------------------------------------------------------------
+
+def source_accuracy_log_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "source_accuracy_log.csv")
+
+
+_SOURCE_ACCURACY_FIELDS = [
+    "date", "city", "temp_side", "source_name",
+    "forecast_f", "actual_f", "error_f", "abs_error_f",
+    "snapshot_ts_est",
+]
+
+
+def _load_source_accuracy_done_keys() -> set:
+    """Return set of (date, city, temp_side, source_name) already logged."""
+    path = source_accuracy_log_path()
+    if not os.path.exists(path):
+        return set()
+    done: set = set()
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                done.add((
+                    str(r.get("date", "")),
+                    str(r.get("city", "")),
+                    str(r.get("temp_side", "")),
+                    str(r.get("source_name", "")),
+                ))
+    except Exception:
+        pass
+    return done
+
+
+def update_source_accuracy_log() -> int:
+    """
+    For every settled city+date in final_settlements.csv, find the nearest
+    snapshot row and log per-source forecast errors.  Deduplicates by
+    (date, city, temp_side, source_name) so rows are written only once.
+    Returns number of new rows written.
+    """
+    try:
+        settlement_map = load_final_settlement_map()
+    except Exception:
+        return 0
+    if not settlement_map:
+        return 0
+
+    done_keys = _load_source_accuracy_done_keys()
+    new_rows: List[dict] = []
+
+    for (date_iso, city, temp_side), srow in settlement_map.items():
+        actual_f = _to_float(srow.get("outcome_f"))
+        if actual_f is None:
+            continue
+        # Find the most recent snapshot for this city+date (any ticker for that side)
+        snap = None
+        try:
+            city_snaps = load_snapshot_rows_filtered(date=date_iso, city=city, temp_side=temp_side)
+            if city_snaps:
+                city_snaps.sort(key=lambda r: str(r.get("ts_est", "")), reverse=True)
+                snap = city_snaps[0]
+        except Exception:
+            continue
+        if snap is None:
+            continue
+        src_vals_raw = str(snap.get("source_values_json", "") or "")
+        if not src_vals_raw:
+            continue
+        try:
+            src_vals: dict = json.loads(src_vals_raw)
+        except Exception:
+            continue
+        snap_ts = str(snap.get("ts_est", "")).strip()
+        for source_name, forecast_f_raw in src_vals.items():
+            forecast_f = _to_float(forecast_f_raw)
+            if forecast_f is None:
+                continue
+            key = (date_iso, city, temp_side, source_name)
+            if key in done_keys:
+                continue
+            error_f = forecast_f - actual_f
+            new_rows.append({
+                "date": date_iso,
+                "city": city,
+                "temp_side": temp_side,
+                "source_name": source_name,
+                "forecast_f": f"{forecast_f:.2f}",
+                "actual_f": f"{actual_f:.2f}",
+                "error_f": f"{error_f:.2f}",
+                "abs_error_f": f"{abs(error_f):.2f}",
+                "snapshot_ts_est": snap_ts,
+            })
+            done_keys.add(key)
+
+    if not new_rows:
+        return 0
+
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = source_accuracy_log_path()
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_SOURCE_ACCURACY_FIELDS)
+        if not exists:
+            w.writeheader()
+        for r in new_rows:
+            w.writerow({k: r.get(k, "") for k in _SOURCE_ACCURACY_FIELDS})
+    logging.info(f"source_accuracy_log: wrote {len(new_rows)} new rows")
+    return len(new_rows)
+
 
 def maybe_log_next_day_paper_trades(now_local: datetime) -> int:
     """Evaluate tomorrow's markets and log paper trade candidates with weather event gate."""
@@ -11809,6 +12045,40 @@ def analytics_loss_postmortems(
 ):
     return build_loss_postmortems(start=start, end=end)
 
+
+@app.get("/analytics/source-accuracy")
+def analytics_source_accuracy():
+    """Return per-source forecast error stats from source_accuracy_log.csv."""
+    path = source_accuracy_log_path()
+    if not os.path.exists(path):
+        return {"rows": [], "summary": {}, "path": path, "note": "No data yet — runs after markets settle."}
+    _, rows = _read_csv_rows_with_header(path)
+    # Compute per-source aggregate stats
+    from collections import defaultdict
+    stats: Dict[str, dict] = defaultdict(lambda: {"n": 0, "mae": 0.0, "bias": 0.0, "cities": set()})
+    for r in rows:
+        sn = str(r.get("source_name", "")).strip()
+        if not sn:
+            continue
+        ae = _to_float(r.get("abs_error_f"))
+        err = _to_float(r.get("error_f"))
+        if ae is None or err is None:
+            continue
+        stats[sn]["n"] += 1
+        stats[sn]["mae"] += ae
+        stats[sn]["bias"] += err
+        stats[sn]["cities"].add(str(r.get("city", "")))
+    summary = {}
+    for sn, d in sorted(stats.items(), key=lambda x: x[1]["mae"] / max(1, x[1]["n"])):
+        n = d["n"]
+        summary[sn] = {
+            "n": n,
+            "mae_f": round(d["mae"] / n, 3) if n else None,
+            "bias_f": round(d["bias"] / n, 3) if n else None,
+            "cities": sorted(d["cities"]),
+        }
+    return {"rows": rows, "summary": summary, "path": path, "n_rows": len(rows)}
+
 @app.post("/manual/sync-kalshi")
 def manual_sync_kalshi(
     max_pages: int = 30,
@@ -12576,6 +12846,10 @@ def scan():
         range_package_paper_logged_count = maybe_log_range_package_paper_trades(now_local, market_day="today")
         try:
             maybe_log_next_day_paper_trades(now_local)
+        except Exception:
+            pass
+        try:
+            maybe_reconcile_live_trade_outcomes()
         except Exception:
             pass
     except Exception:

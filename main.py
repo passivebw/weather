@@ -1275,7 +1275,8 @@ def _save_open_meteo_cache() -> None:
         pass
 
 def tomorrow_io_get_forecast_temp_f(
-    lat: float, lon: float, now_local: datetime, temp_side: str = "high"
+    lat: float, lon: float, now_local: datetime, temp_side: str = "high",
+    city_date_iso: Optional[str] = None,
 ) -> Optional[float]:
     """Fetch today's high or low from Tomorrow.io with 60-min city-level cache.
     Only called for edge-candidate cities (≥2 sources already gathered).
@@ -1284,7 +1285,8 @@ def tomorrow_io_get_forecast_temp_f(
         return None
     _load_forecast_caches()
     cache_key = f"{lat:.4f},{lon:.4f}"
-    today_date = now_local.date().isoformat()
+    # Use city LST date when provided so we match the correct Kalshi settlement day.
+    today_date = city_date_iso or now_local.date().isoformat()
     now_ts = time.time()
 
     with _tomorrow_io_cache_lock:
@@ -1363,10 +1365,13 @@ def open_meteo_get_forecast_temp_f(
     now_local: datetime,
     model: Optional[str] = None,
     temp_side: str = "high",
+    city_date_iso: Optional[str] = None,
 ) -> Optional[float]:
     side = normalize_temp_side(temp_side)
     daily_field = "temperature_2m_max" if side == "high" else "temperature_2m_min"
-    today_date = now_local.date().isoformat()
+    # Use city's LST date when provided so we query the right settlement day,
+    # not the Eastern-clock date (wrong for western cities).
+    today_date = city_date_iso or now_local.date().isoformat()
     now_ts = time.time()
     cache_key = f"{lat:.4f},{lon:.4f},{model or 'default'},{side}"
     _load_forecast_caches()
@@ -1385,7 +1390,7 @@ def open_meteo_get_forecast_temp_f(
         "longitude": f"{lon:.4f}",
         "daily": daily_field,
         "temperature_unit": "fahrenheit",
-        "timezone": "America/New_York",
+        "timezone": "auto",  # Let OpenMeteo resolve the correct local timezone from coordinates
         "forecast_days": 3,
     }
     if model:
@@ -1433,7 +1438,7 @@ def metno_get_forecast_low_f(lat: float, lon: float, now_local: datetime) -> Opt
     v = metno_get_forecast_temp_f(lat, lon, now_local, temp_side="low")
     return v
 
-def metno_get_forecast_temp_f(lat: float, lon: float, now_local: datetime, temp_side: str = "high") -> Optional[float]:
+def metno_get_forecast_temp_f(lat: float, lon: float, now_local: datetime, temp_side: str = "high", date_tz: Optional[timezone] = None) -> Optional[float]:
     side = normalize_temp_side(temp_side)
     headers = {"User-Agent": NWS_USER_AGENT}
     params = {"lat": f"{lat:.4f}", "lon": f"{lon:.4f}"}
@@ -1441,15 +1446,18 @@ def metno_get_forecast_temp_f(lat: float, lon: float, now_local: datetime, temp_
     r.raise_for_status()
     payload = r.json()
 
+    # Use city's LST timezone when provided so day boundaries match Kalshi settlement,
+    # not Eastern clock which is wrong for western cities.
+    filter_tz = date_tz or LOCAL_TZ
+    today = now_local.astimezone(filter_tz).date()
     timeseries = payload.get("properties", {}).get("timeseries", []) or []
-    today = now_local.date()
     temps_f: List[float] = []
     for row in timeseries:
         ts = row.get("time")
         if not ts:
             continue
         try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(LOCAL_TZ)
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(filter_tz)
         except Exception:
             continue
         if dt.date() != today:
@@ -2643,19 +2651,23 @@ def build_expert_consensus(
     cfg = CITY_CONFIG[city]
     lat = float(cfg["lat"])
     lon = float(cfg["lon"])
+    # City LST date: the settlement day as Kalshi defines it (fixed UTC offset, no DST).
+    # OpenMeteo and MET-Norway must query THIS date, not the Eastern clock date.
+    city_lst_tz_obj = city_lst_tz(city)
+    city_date_iso = now_local.astimezone(city_lst_tz_obj).date().isoformat()
 
     source_values: List[Tuple[str, float, float]] = []
 
     try:
         om_ecmwf_model = "ecmwf_ifs04" if side == "high" else "best_match"
-        om_ecmwf = open_meteo_get_forecast_temp_f(lat, lon, now_local, model=om_ecmwf_model, temp_side=side)
+        om_ecmwf = open_meteo_get_forecast_temp_f(lat, lon, now_local, model=om_ecmwf_model, temp_side=side, city_date_iso=city_date_iso)
         if om_ecmwf is not None:
             source_values.append(("OpenMeteo-ECMWF", om_ecmwf, safe_inverse_mae_weight(OPEN_METEO_ECMWF_HIST_MAE_F)))
     except Exception as e:
         logging.warning(f"OpenMeteo-ECMWF failed for {city} {side}: {e}")
 
     try:
-        om_gfs = open_meteo_get_forecast_temp_f(lat, lon, now_local, model="gfs_seamless", temp_side=side)
+        om_gfs = open_meteo_get_forecast_temp_f(lat, lon, now_local, model="gfs_seamless", temp_side=side, city_date_iso=city_date_iso)
         if om_gfs is not None:
             source_values.append(("OpenMeteo-GFS", om_gfs, safe_inverse_mae_weight(OPEN_METEO_GFS_HIST_MAE_F)))
     except Exception as e:
@@ -2663,7 +2675,7 @@ def build_expert_consensus(
 
     if ENABLE_ICON_SOURCE:
         try:
-            om_icon = open_meteo_get_forecast_temp_f(lat, lon, now_local, model="icon_seamless", temp_side=side)
+            om_icon = open_meteo_get_forecast_temp_f(lat, lon, now_local, model="icon_seamless", temp_side=side, city_date_iso=city_date_iso)
             if om_icon is not None:
                 source_values.append(("OpenMeteo-ICON", om_icon, safe_inverse_mae_weight(OPEN_METEO_ICON_HIST_MAE_F)))
         except Exception as e:
@@ -2671,7 +2683,7 @@ def build_expert_consensus(
 
     if ENABLE_METNO_SOURCE:
         try:
-            metno_v = metno_get_forecast_temp_f(lat, lon, now_local, temp_side=side)
+            metno_v = metno_get_forecast_temp_f(lat, lon, now_local, temp_side=side, date_tz=city_lst_tz_obj)
             if metno_v is not None:
                 source_values.append(("MET-Norway", metno_v, safe_inverse_mae_weight(METNO_HIST_MAE_F)))
         except Exception:
@@ -2708,7 +2720,7 @@ def build_expert_consensus(
     # Cache TTL=60min ensures ≤1 API call per city per hour (25/hr limit respected)
     if ENABLE_TOMORROW_IO_SOURCE and TOMORROW_IO_API_KEY and len(source_values) >= 2:
         try:
-            tio_temp = tomorrow_io_get_forecast_temp_f(lat, lon, now_local, temp_side=side)
+            tio_temp = tomorrow_io_get_forecast_temp_f(lat, lon, now_local, temp_side=side, city_date_iso=city_date_iso)
             if tio_temp is not None:
                 source_values.append(("Tomorrow.io", tio_temp, safe_inverse_mae_weight(TOMORROW_IO_HIST_MAE_F)))
         except Exception as e:

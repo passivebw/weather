@@ -157,6 +157,9 @@ LIVE_LOCKED_OUTCOME_MAX_OBS_AGE_MINUTES = float(os.getenv("LIVE_LOCKED_OUTCOME_M
 LIVE_LOCKED_OUTCOME_MAX_UNITS = float(os.getenv("LIVE_LOCKED_OUTCOME_MAX_UNITS", "1.0"))
 UNIT_SIZE_DOLLARS = float(os.getenv("UNIT_SIZE_DOLLARS", "50.0"))
 PAPER_TRADE_DISCORD_ENABLED = env_bool("PAPER_TRADE_DISCORD_ENABLED", default=True)
+PAPER_NEXT_DAY_ENABLED = env_bool("PAPER_NEXT_DAY_ENABLED", default=True)
+PAPER_NEXT_DAY_MIN_EDGE_PCT = float(os.getenv("PAPER_NEXT_DAY_MIN_EDGE_PCT", "20.0"))
+PAPER_NEXT_DAY_WEATHER_GATE_ENABLED = env_bool("PAPER_NEXT_DAY_WEATHER_GATE_ENABLED", default=True)
 DISCORD_TRADE_ALERTS_ENABLED = env_bool("DISCORD_TRADE_ALERTS_ENABLED", default=False)
 DISCORD_MISSED_FILL_MAX_AGE_MINUTES = float(os.getenv("DISCORD_MISSED_FILL_MAX_AGE_MINUTES", "20.0"))
 PAPER_TRADE_POST_TOP_N = int(os.getenv("PAPER_TRADE_POST_TOP_N", "3"))
@@ -1035,6 +1038,36 @@ def _afd_sigma_adjustment(afd_text: str, temp_side: str) -> Tuple[float, str]:
     adj = max(-0.8, min(1.5, adj))
     label = ", ".join(signals) if signals else ""
     return adj, label
+
+def _detect_significant_weather_event(afd_text: str) -> Tuple[bool, str]:
+    """Scan AFD text for any language indicating significant forecast disruption.
+    Much broader than sigma adjustment — catches anything that could blow up a day+1 forecast.
+    Returns (detected: bool, label: str)."""
+    if not afd_text:
+        return False, ""
+    text = afd_text.lower()
+    checks = [
+        (["cold front", "warm front", "stationary front", "frontal passage", "frontal system", "front mov"], "frontal system"),
+        (["low pressure", "area of low", "surface low", "developing low", "deepening low"], "low pressure system"),
+        (["nor'easter", "nor easter", "noreaster"], "nor'easter"),
+        (["storm system", "storm track", "winter storm", "tropical system", "hurricane", "cyclone"], "storm system"),
+        (["heavy rain", "heavy precipitation", "flooding", "flood", "flash flood"], "heavy precip/flood"),
+        (["heavy snow", "blizzard", "ice storm", "freezing rain", "wintry mix"], "winter precip"),
+        (["severe", "tornado", "thunderstorm", "convect"], "severe weather"),
+        (["advisory", "warning", "watch"], "active advisory/warning"),
+        (["uncertainty", "uncertain", "low confidence", "confidence is low", "confidence remains low", "difficult to pin", "hard to nail"], "low forecast confidence"),
+        (["rapidly", "rapid change", "sharply", "dramatically", "abrupt", "drastic"], "rapid pattern change"),
+        (["significant change", "pattern change", "regime change", "dramatic shift"], "significant pattern change"),
+        (["upper level", "upper-level", "jet stream", "shortwave", "trough", "amplif"], "significant upper-level feature"),
+        (["highly variable", "wide range of solutions", "model disagreement", "spread in the models", "models disagree"], "model disagreement"),
+        (["unseasonably", "record", "extreme heat", "extreme cold", "dangerously"], "extreme/record conditions"),
+        (["fog", "dense fog", "stratus", "inversion"], "fog/inversion"),
+    ]
+    for keywords, label in checks:
+        for kw in keywords:
+            if kw in text:
+                return True, label
+    return False, ""
 
 def open_meteo_get_forecast_conditions(lat: float, lon: float, now_local: datetime) -> dict:
     """Fetch daily weather conditions from OpenMeteo useful for forecast confidence assessment.
@@ -2985,6 +3018,8 @@ def build_city_bucket_comparison(
         "consensus_source_range_f": float(consensus.get("source_range_f", 0.0) or 0.0),
         "consensus_nws_outlier_f": float(consensus.get("nws_outlier_f", 0.0) or 0.0),
         "consensus_nws_outlier_sigma_add_f": float(consensus.get("nws_outlier_sigma_add_f", 0.0) or 0.0),
+        "afd_signal_label": str(consensus.get("afd_signal_label", "") or ""),
+        "source_count": len(consensus.get("sources", [])),
         "city_hour_lst": city_hour_lst,
         "forecast_ceiling_f": forecast_ceiling_f,
         "source_text": source_text,
@@ -3526,6 +3561,9 @@ def build_odds_board(now_local: datetime, market_day: str = "auto") -> dict:
                 "temp_side": side,
                 "market_date_selected": selected_date,
                 "consensus_mu_f": detail["consensus_mu_f"],
+                "consensus_source_range_f": detail.get("consensus_source_range_f", 0.0),
+                "source_count": detail.get("source_count", 0),
+                "afd_signal_label": detail.get("afd_signal_label", ""),
                 "kalshi_mean_f": detail["kalshi_mean_f"],
                 "bucket_label": best.get("bucket_label"),
                 "ticker": best.get("ticker"),
@@ -3705,6 +3743,26 @@ def live_trade_log_path() -> str:
 
 def manual_positions_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "manual_positions.csv")
+
+def next_day_paper_log_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "next_day_paper_trades.csv")
+
+def _append_next_day_paper_log(row: dict) -> None:
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    path = next_day_paper_log_path()
+    header = [
+        "ts_est", "market_date", "city", "temp_type", "ticker", "bet", "line",
+        "edge_pct", "source_count", "source_range_f", "afd_signal_label",
+        "weather_event_flag", "weather_event_label", "trade_day_offset",
+        "consensus_mu_f", "yes_bid", "yes_ask", "price_cents", "top_size",
+    ]
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        if not exists:
+            w.writeheader()
+        out = {k: row.get(k, "") for k in header}
+        w.writerow(out)
 
 def manual_auto_weather_positions_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "manual_positions_auto_weather.csv")
@@ -4586,6 +4644,7 @@ def _append_live_trade_log(row: dict) -> None:
         "count", "time_in_force", "order_action", "status", "error", "fee_dollars", "order_id", "client_order_id",
         "execution_mode", "attempt_count", "passive_attempted", "aggressive_attempted",
         "aggressive_used", "initial_limit_price_cents", "final_order_status_raw",
+        "source_count", "source_range_f", "afd_signal_label", "entry_hour_et", "trade_day_offset", "trade_mode",
     ]
     if os.path.exists(path):
         try:
@@ -6535,6 +6594,15 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                 "aggressive_used": str(final_exec.get("mode", "")) == "aggressive",
                 "initial_limit_price_cents": (submitted_attempts[0].get("limit_price_cents") if submitted_attempts else final_exec.get("limit_price_cents")),
                 "final_order_status_raw": final_exec.get("order_status_raw"),
+                "source_count": b.get("source_count", ""),
+                "source_range_f": b.get("source_range_f", ""),
+                "afd_signal_label": b.get("afd_signal_label", ""),
+                "entry_hour_et": now_local.hour,
+                "trade_day_offset": (
+                    (datetime.fromisoformat(str(b.get("date", now_local.date().isoformat()))).date() - now_local.date()).days
+                    if b.get("date") else 0
+                ),
+                "trade_mode": b.get("trade_mode", "normal"),
             }
             _append_live_trade_log(done_item)
             done.append(done_item)
@@ -9810,6 +9878,9 @@ def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_ed
             "yes_ask": r.get("yes_ask"),
             "spread_cents": r.get("spread_cents"),
             "top_size": r.get("top_size"),
+            "source_count": r.get("source_count", 0),
+            "source_range_f": round(float(r.get("consensus_source_range_f") or 0.0), 2),
+            "afd_signal_label": r.get("afd_signal_label", ""),
             "nws_obs_time_est": r.get("nws_obs_time_est"),
             "nws_obs_age_minutes": r.get("nws_obs_age_minutes"),
             "nws_obs_fresh": r.get("nws_obs_fresh"),
@@ -10093,6 +10164,79 @@ def paper_trade_text(now_local: datetime, bets: List[dict]) -> str:
             f"{float(b.get('net_edge_pct', 0.0)):.1f}% | {b.get('line')} | {b.get('ticker')}"
         )
     return "\n".join(lines)
+
+_next_day_paper_state: Dict[str, dict] = {}
+_next_day_paper_state_date: str = ""
+
+def maybe_log_next_day_paper_trades(now_local: datetime) -> int:
+    """Evaluate tomorrow's markets and log paper trade candidates with weather event gate."""
+    global _next_day_paper_state, _next_day_paper_state_date
+    if not PAPER_NEXT_DAY_ENABLED:
+        return 0
+    today_key = now_local.date().isoformat()
+    if _next_day_paper_state_date != today_key:
+        _next_day_paper_state = {}
+        _next_day_paper_state_date = today_key
+    try:
+        board_payload = build_odds_board(now_local, market_day="next")
+        if not board_payload.get("ok"):
+            return 0
+    except Exception:
+        return 0
+    bets, _ = build_policy_bets_from_board_payload(
+        board_payload,
+        top_n=20,
+        min_edge_pct=PAPER_NEXT_DAY_MIN_EDGE_PCT,
+    )
+    logged = 0
+    for b in bets:
+        sig = f"{b.get('date')}|{b.get('ticker')}|{b.get('bet')}"
+        if sig in _next_day_paper_state:
+            continue
+        city = str(b.get("city", "")).strip()
+        temp_side = normalize_temp_side(str(b.get("temp_type", "high")))
+        cfg = CITY_CONFIG.get(city, {})
+        lat = float(cfg.get("lat", 0))
+        lon = float(cfg.get("lon", 0))
+        weather_flag = False
+        weather_label = ""
+        if PAPER_NEXT_DAY_WEATHER_GATE_ENABLED and lat and lon:
+            try:
+                afd_text = nws_get_afd_excerpt(lat, lon, temp_side=temp_side)
+                weather_flag, weather_label = _detect_significant_weather_event(afd_text or "")
+            except Exception:
+                pass
+        _next_day_paper_state[sig] = {"ts": now_local.timestamp()}
+        market_date = str(b.get("date", ""))
+        today_date = now_local.date()
+        try:
+            day_offset = (datetime.fromisoformat(market_date).date() - today_date).days if market_date else 1
+        except Exception:
+            day_offset = 1
+        price_cents = b.get("yes_ask") if str(b.get("bet", "")).upper().startswith("BUY YES") else b.get("yes_bid")
+        _append_next_day_paper_log({
+            "ts_est": fmt_est(now_local),
+            "market_date": market_date,
+            "city": city,
+            "temp_type": temp_side,
+            "ticker": b.get("ticker", ""),
+            "bet": b.get("bet", ""),
+            "line": b.get("line", ""),
+            "edge_pct": round(float(b.get("net_edge_pct", 0.0)), 2),
+            "source_count": b.get("source_count", ""),
+            "source_range_f": b.get("source_range_f", ""),
+            "afd_signal_label": b.get("afd_signal_label", ""),
+            "weather_event_flag": weather_flag,
+            "weather_event_label": weather_label,
+            "trade_day_offset": day_offset,
+            "consensus_mu_f": round(float(b.get("consensus_mu_f") or 0.0), 2) if b.get("consensus_mu_f") else "",
+            "yes_bid": b.get("yes_bid", ""),
+            "yes_ask": b.get("yes_ask", ""),
+            "price_cents": price_cents,
+            "top_size": b.get("top_size", ""),
+        })
+        logged += 1
+    return logged
 
 def maybe_post_paper_trades(now_local: datetime, board_payload: dict) -> int:
     bets, _ = build_policy_bets_from_board_payload(
@@ -12430,6 +12574,10 @@ def scan():
                 edge_tracking = {"active_count": 0, "closed_count": 0}
         paper_trade_posted_count = maybe_post_paper_trades(now_local, board_payload)
         range_package_paper_logged_count = maybe_log_range_package_paper_trades(now_local, market_day="today")
+        try:
+            maybe_log_next_day_paper_trades(now_local)
+        except Exception:
+            pass
     except Exception:
         paper_trade_posted_count = 0
         range_package_paper_logged_count = 0

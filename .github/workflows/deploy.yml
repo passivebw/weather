@@ -17,5 +17,18 @@ jobs:
           script: |
             cd /opt/kalshi-weather-bot
             git pull origin main
+            # Ensure paper trade Discord alerts are on
+            ENV_FILE="/opt/kalshi-weather-bot/.env"
+            if grep -q "^PAPER_TRADE_DISCORD_ENABLED=" "$ENV_FILE"; then
+              sed -i 's/^PAPER_TRADE_DISCORD_ENABLED=.*/PAPER_TRADE_DISCORD_ENABLED=true/' "$ENV_FILE"
+            else
+              echo "PAPER_TRADE_DISCORD_ENABLED=true" >> "$ENV_FILE"
+            fi
+            # Ensure paper next-day edge floor is 15%
+            if grep -q "^PAPER_NEXT_DAY_MIN_EDGE_PCT=" "$ENV_FILE"; then
+              sed -i 's/^PAPER_NEXT_DAY_MIN_EDGE_PCT=.*/PAPER_NEXT_DAY_MIN_EDGE_PCT=15.0/' "$ENV_FILE"
+            else
+              echo "PAPER_NEXT_DAY_MIN_EDGE_PCT=15.0" >> "$ENV_FILE"
+            fi
             sudo systemctl restart kalshi-weather-bot
             echo "Deploy complete: $(date)"

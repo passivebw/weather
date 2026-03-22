@@ -2893,7 +2893,8 @@ def build_city_bucket_comparison(
                 consensus_sigma = max(0.7, consensus_sigma * intraday_high_sigma_factor(now_local))
             elif side == "low":
                 # Widen sigma in early morning when overnight low is still in progress.
-                consensus_sigma = max(0.7, consensus_sigma * intraday_low_sigma_factor(now_local))
+                # Use city_now_lst so the hour reflects the city's settlement clock, not Eastern.
+                consensus_sigma = max(0.7, consensus_sigma * intraday_low_sigma_factor(city_now_lst))
                 # If observed station minimum is already below the forecast consensus,
                 # clamp consensus_mu downward — the actual low can't exceed what's observed.
                 if obs_context["obs_fresh"] and min_so_far_f is not None:

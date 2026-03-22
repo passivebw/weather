@@ -819,13 +819,32 @@ def nws_get_forecast_low_f(lat: float, lon: float, now_local: datetime) -> Optio
     if not candidates:
         return None
 
-    # Prefer the next nighttime period from now for low-temperature forecasting.
+    # Prefer the nighttime period that CONTAINS now (if we're currently overnight)
+    # over the next future nighttime period.  Without this, at 4 AM the function
+    # would skip the current overnight (startTime = yesterday 8 PM) and pick
+    # tonight's forecast instead — returning the wrong temperature entirely.
     candidates.sort(key=lambda x: x["dt"])
     pick = None
+    # First try: find a period whose start is before now but whose end is after now
+    # (i.e., we are currently inside this nighttime period).
     for c in candidates:
-        if c["dt"] >= now_local:
-            pick = c["period"]
+        p = c["period"]
+        end_raw = p.get("endTime")
+        if not end_raw:
+            continue
+        try:
+            end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00")).astimezone(LOCAL_TZ)
+        except Exception:
+            continue
+        if c["dt"] <= now_local <= end_dt:
+            pick = p
             break
+    # Fallback: next upcoming nighttime period
+    if pick is None:
+        for c in candidates:
+            if c["dt"] >= now_local:
+                pick = c["period"]
+                break
     if pick is None:
         pick = candidates[0]["period"]
 
@@ -2574,6 +2593,21 @@ def intraday_high_sigma_factor(now_local: datetime) -> float:
         return 0.90
     return 1.00
 
+def intraday_low_sigma_factor(now_local: datetime) -> float:
+    """
+    For LOW markets, uncertainty is HIGHEST in early morning (overnight low still developing)
+    and drops once the low has been recorded (typically after 9-10 AM local time).
+    This is the mirror-image of intraday_high_sigma_factor.
+    """
+    h = now_local.hour + (now_local.minute / 60.0)
+    if h < 6:
+        return 1.80   # overnight low still in progress — very high uncertainty
+    if h < 8:
+        return 1.40   # low likely near but not yet locked
+    if h < 10:
+        return 1.10   # low probably recorded, small residual uncertainty
+    return 1.00       # low is locked in, normal sigma
+
 def conditional_high_bucket_prob(mu: float, sigma: float, lo: float, hi: float, max_so_far_f: float) -> float:
     # Settlement is integer-F based; use rounded-integer floor implied by max-so-far.
     min_final_high_int = int(math.floor(max_so_far_f + 0.5))
@@ -2857,6 +2891,14 @@ def build_city_bucket_comparison(
             if side == "high" and obs_context["obs_fresh"] and max_so_far_f is not None:
                 consensus_mu = max(consensus_mu, float(max_so_far_f) + 0.10)
                 consensus_sigma = max(0.7, consensus_sigma * intraday_high_sigma_factor(now_local))
+            elif side == "low":
+                # Widen sigma in early morning when overnight low is still in progress.
+                consensus_sigma = max(0.7, consensus_sigma * intraday_low_sigma_factor(now_local))
+                # If observed station minimum is already below the forecast consensus,
+                # clamp consensus_mu downward — the actual low can't exceed what's observed.
+                if obs_context["obs_fresh"] and min_so_far_f is not None:
+                    if float(min_so_far_f) < consensus_mu:
+                        consensus_mu = min(consensus_mu, float(min_so_far_f) - 0.10)
         except Exception:
             pass
         try:
@@ -6283,9 +6325,11 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                 })
 
             is_thin_book_resting = bool(b.get("thin_book_resting", False))
-            is_high = (not is_thin_book_resting) and edge_pct >= LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT
-            is_mid = (not is_thin_book_resting) and edge_pct >= LIVE_EDGE_PASSIVE_THEN_AGGR_PCT
-            is_aggressive_override = (not is_thin_book_resting) and edge_pct >= LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT
+            # Aggressive override is NOT suppressed by thin_book_resting — at ≥50% edge
+            # we always want a market order regardless of book depth.
+            is_aggressive_override = edge_pct >= LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT
+            is_high = (not is_thin_book_resting) and (not is_aggressive_override) and edge_pct >= LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT
+            is_mid = (not is_thin_book_resting) and (not is_aggressive_override) and edge_pct >= LIVE_EDGE_PASSIVE_THEN_AGGR_PCT
             passive_wait_s = LIVE_PASSIVE_WAIT_SECONDS_MID if (is_high or is_mid) else LIVE_PASSIVE_WAIT_SECONDS_LOW
             passive_steps = LIVE_PASSIVE_REPRICE_STEPS_MID if (is_high or is_mid) else LIVE_PASSIVE_REPRICE_STEPS_LOW
             desired_passive_price = None

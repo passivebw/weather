@@ -5360,8 +5360,11 @@ def _live_trade_text(now_local: datetime, results: List[dict]) -> str:
             except Exception:
                 pass
 
-        header = f"🌡️ Trade Locked — {city} {temp_type.capitalize()} ({ts})"
-        detail = f"{bet} · {line_part} · {count} contract · {price}¢ ({order_type})"
+        is_resting_order = str(r.get("status", "")).strip().lower() == "resting"
+        header_label = "Order Resting" if is_resting_order else "Trade Locked"
+        header = f"🌡️ {header_label} — {city} {temp_type.capitalize()} ({ts})"
+        contract_label = f"{count} contract pending" if is_resting_order else f"{count} contract"
+        detail = f"{bet} · {line_part} · {contract_label} · {price}¢ ({order_type})"
         lines = [header, detail, ""]
 
         if consensus_mu is not None:
@@ -6588,7 +6591,11 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                 "stake_dollars": round(stake_dollars, 2),
                 "side": order_side,
                 "limit_price_cents": final_exec.get("limit_price_cents"),
-                "count": final_exec.get("fill_count_total", final_exec.get("count")),
+                "count": (
+                    final_exec.get("requested_count_total") or final_exec.get("count")
+                    if str(final_exec.get("status", "")) == "resting"
+                    else final_exec.get("fill_count_total", final_exec.get("count"))
+                ),
                 "time_in_force": final_exec.get("time_in_force"),
                 "order_action": str(final_exec.get("order_action", "buy")).lower(),
                 "status": final_exec.get("status"),

@@ -3743,6 +3743,7 @@ def build_odds_board(now_local: datetime, market_day: str = "auto") -> dict:
     unavailable: List[dict] = []
 
     for city in sorted(CITY_CONFIG.keys()):
+        city_today_iso = city_lst_now(now_local, city).date().isoformat()
         for side in ("high", "low"):
             min_bucket_count = BOARD_MIN_BUCKET_COUNT_LOW if side == "low" else BOARD_MIN_BUCKET_COUNT
             min_top_size = BOARD_MIN_TOP_SIZE_LOW if side == "low" else BOARD_MIN_TOP_SIZE

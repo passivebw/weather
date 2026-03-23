@@ -30,5 +30,11 @@ jobs:
             else
               echo "PAPER_NEXT_DAY_MIN_EDGE_PCT=15.0" >> "$ENV_FILE"
             fi
+            # Limit-first for all edges: try limit order, fall back to market if not filled
+            if grep -q "^LIVE_ALWAYS_PASSIVE_FIRST=" "$ENV_FILE"; then
+              sed -i 's/^LIVE_ALWAYS_PASSIVE_FIRST=.*/LIVE_ALWAYS_PASSIVE_FIRST=true/' "$ENV_FILE"
+            else
+              echo "LIVE_ALWAYS_PASSIVE_FIRST=true" >> "$ENV_FILE"
+            fi
             sudo systemctl restart kalshi-weather-bot
             echo "Deploy complete: $(date)"

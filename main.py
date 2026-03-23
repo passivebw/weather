@@ -3870,12 +3870,15 @@ def build_odds_board(now_local: datetime, market_day: str = "auto") -> dict:
                 "nws_obs_age_minutes": obs_age_min,
                 "nws_obs_fresh": obs_fresh,
                 "locked_outcome": locked_outcome,
-            "locked_reason": locked_reason,
-            "is_locked_capture_candidate": is_locked_capture_candidate,
-            "best_lo": best.get("lo"),
-            "best_hi": best.get("hi"),
-            "best_structure_kind": _bucket_structure_kind(float(best.get("lo")), float(best.get("hi"))),
-            "thin_book_resting": thin_book_resting,
+                "locked_reason": locked_reason,
+                "is_locked_capture_candidate": is_locked_capture_candidate,
+                "best_lo": best.get("lo"),
+                "best_hi": best.get("hi"),
+                "best_structure_kind": _bucket_structure_kind(float(best.get("lo")), float(best.get("hi"))),
+                "thin_book_resting": thin_book_resting,
+                "obs_trajectory": obs_ctx.get("obs_trajectory"),
+                "trajectory_locked": bool(obs_ctx.get("high_locked", False)) or bool(obs_ctx.get("low_locked", False)),
+                "trade_day_offset": 0 if selected_date == city_today_iso else 1,
         })
     for r in rows:
         raw_edge = float(r.get("best_edge", 0.0))
@@ -10192,6 +10195,9 @@ def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_ed
             "locked_reason": r.get("locked_reason"),
             "trade_mode": ("locked_capture" if locked_allowed else ("thin_book_resting" if r.get("thin_book_resting") else "normal")),
             "thin_book_resting": bool(r.get("thin_book_resting", False)),
+            "obs_trajectory": r.get("obs_trajectory"),
+            "trajectory_locked": bool(r.get("trajectory_locked", False)),
+            "trade_day_offset": int(r.get("trade_day_offset", 0)),
             "best_lo": r.get("best_lo"),
             "best_hi": r.get("best_hi"),
             "best_structure_kind": r.get("best_structure_kind"),
@@ -10461,12 +10467,28 @@ def paper_trade_signature(bet: dict) -> str:
 
 def paper_trade_text(now_local: datetime, bets: List[dict]) -> str:
     ts = fmt_est_short(now_local)
-    lines = [f"Trade Alert ({ts})", "Date | City | Type | Bet | Edge | Line | Ticker", "---"]
+    lines = [f"📄 Paper Trade — {ts}"]
     for b in bets:
+        city = b.get("city", "")
+        temp_type = str(b.get("temp_type", "")).capitalize()
+        bet = b.get("bet", "")
+        edge = float(b.get("net_edge_pct", 0.0))
+        line = b.get("line", "")
+        ticker = b.get("ticker", "")
+        day_offset = int(b.get("trade_day_offset", 0) or 0)
+        trajectory_locked = bool(b.get("trajectory_locked", False))
+        thin_book = bool(b.get("thin_book_resting", False))
+        obs_traj = b.get("obs_trajectory") or ""
+
+        day_label = "Day+1" if day_offset > 0 else "Today"
+        lock_label = " · 🔒 Locked" if trajectory_locked else ""
+        traj_label = f" ({obs_traj})" if obs_traj and not trajectory_locked else ""
+        order_label = "Resting Limit" if thin_book else "Market Order"
+
         lines.append(
-            f"{b.get('date')} | {b.get('city')} | {b.get('temp_type')} | {b.get('bet')} | "
-            f"{float(b.get('net_edge_pct', 0.0)):.1f}% | {b.get('line')} | {b.get('ticker')}"
+            f"{day_label}{lock_label} | {city} {temp_type} | {bet} | {edge:.1f}% edge | {line} | {order_label}"
         )
+        lines.append(f"  └ {ticker}")
     return "\n".join(lines)
 
 _next_day_paper_state: Dict[str, dict] = {}

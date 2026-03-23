@@ -3083,6 +3083,65 @@ def build_city_bucket_comparison(
                 if obs_context["obs_fresh"] and min_so_far_f is not None:
                     if float(min_so_far_f) < consensus_mu:
                         consensus_mu = min(consensus_mu, float(min_so_far_f) - 0.10)
+
+                # --- Trajectory-based sigma tightening for LOW markets ---
+                # For LOW markets the logic inverts: temps RISING = low is locked in,
+                # temps still FALLING = low is still developing, keep sigma wide.
+                # Low markets typically lock after mid-morning once temps start climbing.
+                if obs_context["obs_fresh"] and min_so_far_f is not None and obs_slope_f_per_hr is not None:
+                    city_hour = city_now_lst.hour + city_now_lst.minute / 60.0
+                    # For LOW markets, obs dominance starts later (10 AM) and is full by 1 PM
+                    # since the low is usually set overnight or early morning.
+                    low_obs_weight = max(0.0, min(1.0,
+                        (city_hour - 10.0) / max(0.1, 13.0 - 10.0)
+                    ))
+                    obs_context["obs_slope_f_per_hr"] = round(obs_slope_f_per_hr, 2)
+                    obs_context["obs_weight"] = round(low_obs_weight, 2)
+
+                    if low_obs_weight > 0.05:
+                        # For LOW: rising slope means low is locked, falling means still developing
+                        if obs_slope_f_per_hr >= OBS_TRAJ_RISING_F_PER_HR:
+                            low_traj = "rising"
+                        elif obs_slope_f_per_hr <= OBS_TRAJ_FALLING_F_PER_HR:
+                            low_traj = "falling"
+                        else:
+                            low_traj = "flat"
+
+                        hourly_delta_f: Optional[float] = None
+                        try:
+                            _, hourly_delta_f = open_meteo_get_hourly_trend_f(lat, lon, city_now_lst, look_ahead_hours=3)
+                        except Exception:
+                            pass
+
+                        forecast_warming = hourly_delta_f is not None and hourly_delta_f >= 0.5
+                        forecast_cooling = hourly_delta_f is not None and hourly_delta_f <= -0.5
+
+                        # Low locked: observed temps rising AND forecast shows warming → low is set
+                        low_locked = low_traj == "rising" and forecast_warming
+                        # Low still developing: temps still falling OR forecast cooling
+                        low_developing = low_traj == "falling" or forecast_cooling
+
+                        if low_locked:
+                            traj_sigma_mult = OBS_SIGMA_FALLING_MULT
+                            # Anchor mu toward observed minimum
+                            blend = low_obs_weight * 0.7
+                            consensus_mu = consensus_mu * (1.0 - blend) + float(min_so_far_f) * blend
+                        elif low_developing:
+                            traj_sigma_mult = 1.0  # keep sigma wide — low still developing
+                        else:  # flat
+                            traj_sigma_mult = OBS_SIGMA_FLAT_MULT
+
+                        tightened = consensus_sigma * (1.0 - low_obs_weight * (1.0 - traj_sigma_mult))
+                        consensus_sigma = max(0.3, tightened)
+
+                        obs_context["obs_trajectory"] = low_traj
+                        obs_context["hourly_delta_f"] = round(hourly_delta_f, 1) if hourly_delta_f is not None else None
+                        obs_context["low_locked"] = low_locked
+                        logging.info(
+                            f"[{city}] LOW traj={low_traj} slope={obs_slope_f_per_hr:+.1f}°F/hr "
+                            f"hourly_delta={hourly_delta_f} locked={low_locked} "
+                            f"obs_weight={low_obs_weight:.2f} sigma→{consensus_sigma:.2f} mu→{consensus_mu:.1f}"
+                        )
         except Exception:
             pass
         try:

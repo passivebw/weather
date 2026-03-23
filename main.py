@@ -333,6 +333,15 @@ ENABLE_TOMORROW_IO_SOURCE = env_bool("ENABLE_TOMORROW_IO_SOURCE", default=True)
 TOMORROW_IO_CACHE_TTL_SECONDS = int(os.getenv("TOMORROW_IO_CACHE_TTL_SECONDS", "5400"))  # 90 min → ~320 calls/day against 500/day limit
 ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS", "2592000"))
 ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS", "3600"))
+# Real-time observation trajectory and dynamic consensus weighting
+OBS_TRAJ_LOOKBACK_MINUTES = int(os.getenv("OBS_TRAJ_LOOKBACK_MINUTES", "90"))
+OBS_WEIGHT_START_HOUR = float(os.getenv("OBS_WEIGHT_START_HOUR", "11.0"))   # begin giving obs weight at 11 AM local
+OBS_WEIGHT_FULL_HOUR = float(os.getenv("OBS_WEIGHT_FULL_HOUR", "15.0"))    # full obs weight by 3 PM local
+OBS_SIGMA_FLAT_MULT = float(os.getenv("OBS_SIGMA_FLAT_MULT", "0.35"))      # sigma multiplier when trajectory is flat
+OBS_SIGMA_FALLING_MULT = float(os.getenv("OBS_SIGMA_FALLING_MULT", "0.15"))# sigma multiplier when high is locked (falling + cooling forecast)
+OBS_TRAJ_RISING_F_PER_HR = float(os.getenv("OBS_TRAJ_RISING_F_PER_HR", "0.5"))   # slope threshold for "rising"
+OBS_TRAJ_FALLING_F_PER_HR = float(os.getenv("OBS_TRAJ_FALLING_F_PER_HR", "-0.3"))# slope threshold for "falling"
+OPEN_METEO_HOURLY_CACHE_TTL_SECONDS = int(os.getenv("OPEN_METEO_HOURLY_CACHE_TTL_SECONDS", "600"))
 ACCUWEATHER_STALE_FALLBACK_MAX_AGE_SECONDS = int(os.getenv("ACCUWEATHER_STALE_FALLBACK_MAX_AGE_SECONDS", "172800"))
 ACCUWEATHER_LOCATION_LOOKUP_MIN_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_LOOKUP_MIN_SECONDS", "10"))
 ACCUWEATHER_LOCATION_ERROR_BACKOFF_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_ERROR_BACKOFF_SECONDS", "1800"))
@@ -699,12 +708,18 @@ def nws_get_recent_observations(station_id: str, limit: int = 200) -> List[dict]
 def nws_get_today_temp_stats_f(
     station_id: str,
     date_tz: Optional[timezone] = None,
-) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[datetime]]:
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[datetime], Optional[float]]:
+    """
+    Returns (current_f, max_so_far_f, min_so_far_f, latest_time, slope_f_per_hr).
+    slope_f_per_hr is the temperature trend over the last OBS_TRAJ_LOOKBACK_MINUTES
+    (positive = rising, negative = falling, None = insufficient data).
+    """
     # Use a larger window so early-morning lows/highs are still included later in the day.
     # date_tz is the settlement timezone basis (LST for the city); all day filtering
     # must happen in this timezone to avoid DST window drift.
     feats = nws_get_recent_observations(station_id, limit=max(200, NWS_OBS_HISTORY_LIMIT))
     obs_tz = date_tz or LOCAL_TZ
+    now_utc = datetime.now(tz=timezone.utc)
     now_local = datetime.now(tz=obs_tz)
     today_date = now_local.date()
 
@@ -735,11 +750,33 @@ def nws_get_today_temp_stats_f(
             temps_today.append((dt, temp_f))
 
     if not temps_today:
-        return latest_temp, None, None, latest_time
+        return latest_temp, None, None, latest_time, None
 
     max_so_far = max(t for _, t in temps_today)
     min_so_far = min(t for _, t in temps_today)
-    return latest_temp, max_so_far, min_so_far, latest_time
+
+    # Compute trajectory slope via linear regression over recent observations.
+    # Positive slope = temperatures rising; negative = falling.
+    slope_f_per_hr: Optional[float] = None
+    cutoff_utc = now_utc - timedelta(minutes=OBS_TRAJ_LOOKBACK_MINUTES)
+    recent_obs = [
+        (dt.astimezone(timezone.utc), tf)
+        for dt, tf in temps_today
+        if dt.astimezone(timezone.utc) >= cutoff_utc
+    ]
+    if len(recent_obs) >= 2:
+        recent_obs.sort(key=lambda x: x[0])
+        times_hr = [(t - recent_obs[0][0]).total_seconds() / 3600.0 for t, _ in recent_obs]
+        temps_vals = [v for _, v in recent_obs]
+        n = len(recent_obs)
+        mean_t = sum(times_hr) / n
+        mean_v = sum(temps_vals) / n
+        num = sum((times_hr[i] - mean_t) * (temps_vals[i] - mean_v) for i in range(n))
+        den = sum((times_hr[i] - mean_t) ** 2 for i in range(n))
+        if den > 1e-9:
+            slope_f_per_hr = num / den
+
+    return latest_temp, max_so_far, min_so_far, latest_time, slope_f_per_hr
 
 def nws_get_forecast_high_f(lat: float, lon: float, now_local: datetime) -> Optional[float]:
     headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
@@ -1358,6 +1395,79 @@ def open_meteo_get_forecast_low_f(
     model: Optional[str] = None,
 ) -> Optional[float]:
     return open_meteo_get_forecast_temp_f(lat, lon, now_local, model=model, temp_side="low")
+
+_open_meteo_hourly_cache: Dict[str, dict] = {}
+_open_meteo_hourly_cache_lock = threading.Lock()
+
+def open_meteo_get_hourly_trend_f(
+    lat: float,
+    lon: float,
+    now_local: datetime,
+    look_ahead_hours: int = 3,
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Fetches OpenMeteo hourly temperature_2m forecast and returns
+    (current_hour_temp_f, delta_f) where delta_f = forecast_in_N_hours - forecast_now.
+    Positive delta = model expects warming; negative = cooling.
+    Returns (None, None) on failure. Cached for OPEN_METEO_HOURLY_CACHE_TTL_SECONDS.
+    """
+    now_ts = time.time()
+    cache_key = f"{lat:.4f},{lon:.4f}"
+    with _open_meteo_hourly_cache_lock:
+        cached = _open_meteo_hourly_cache.get(cache_key)
+        if cached and (now_ts - cached.get("ts", 0)) < OPEN_METEO_HOURLY_CACHE_TTL_SECONDS:
+            return cached.get("current_f"), cached.get("delta_f")
+
+    params = {
+        "latitude": f"{lat:.4f}",
+        "longitude": f"{lon:.4f}",
+        "hourly": "temperature_2m",
+        "temperature_unit": "fahrenheit",
+        "timezone": "auto",
+        "forecast_days": 2,
+    }
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        logging.warning(f"OpenMeteo hourly trend fetch failed lat={lat} lon={lon}: {e}")
+        return None, None
+
+    hourly = payload.get("hourly", {})
+    times = hourly.get("time", []) or []
+    temps = hourly.get("temperature_2m", []) or []
+
+    if not times or not temps:
+        return None, None
+
+    # OpenMeteo with timezone=auto returns naive local time strings: "2026-03-22T16:00"
+    now_str = now_local.strftime("%Y-%m-%dT%H:00")
+    current_f: Optional[float] = None
+    future_f: Optional[float] = None
+    current_idx: Optional[int] = None
+
+    for i, ts_str in enumerate(times):
+        if ts_str == now_str and i < len(temps) and temps[i] is not None:
+            current_f = float(temps[i])
+            current_idx = i
+            break
+
+    if current_idx is not None:
+        future_idx = current_idx + look_ahead_hours
+        if future_idx < len(temps) and temps[future_idx] is not None:
+            future_f = float(temps[future_idx])
+
+    delta_f = (future_f - current_f) if (current_f is not None and future_f is not None) else None
+
+    with _open_meteo_hourly_cache_lock:
+        _open_meteo_hourly_cache[cache_key] = {
+            "ts": now_ts,
+            "current_f": current_f,
+            "delta_f": delta_f,
+        }
+
+    return current_f, delta_f
 
 def open_meteo_get_forecast_temp_f(
     lat: float,
@@ -2886,8 +2996,9 @@ def build_city_bucket_comparison(
         current_f = None
         max_so_far_f = None
         min_so_far_f = None
+        obs_slope_f_per_hr = None
         try:
-            current_f, max_so_far_f, min_so_far_f, obs_time = nws_get_today_temp_stats_f(
+            current_f, max_so_far_f, min_so_far_f, obs_time, obs_slope_f_per_hr = nws_get_today_temp_stats_f(
                 station,
                 date_tz=city_lst_tz(city),
             )
@@ -2901,8 +3012,68 @@ def build_city_bucket_comparison(
                 freshness_cap = max(float(NWS_OBS_STALE_MINUTES), 130.0)
                 obs_context["obs_fresh"] = obs_age_min <= freshness_cap
             if side == "high" and obs_context["obs_fresh"] and max_so_far_f is not None:
+                # Floor: observed max is a hard lower bound on the final daily high.
                 consensus_mu = max(consensus_mu, float(max_so_far_f) + 0.10)
+                # Base time-of-day sigma tightening.
                 consensus_sigma = max(0.7, consensus_sigma * intraday_high_sigma_factor(now_local))
+
+                # --- Trajectory-based dynamic weighting ---
+                # In the afternoon, real-time observations dominate stale forecast models.
+                # If observed temps are falling AND hourly forecast shows cooling, the high
+                # is essentially locked — sigma collapses and mu anchors to the observed max.
+                city_hour = city_now_lst.hour + city_now_lst.minute / 60.0
+                obs_weight = max(0.0, min(1.0,
+                    (city_hour - OBS_WEIGHT_START_HOUR) / max(0.1, OBS_WEIGHT_FULL_HOUR - OBS_WEIGHT_START_HOUR)
+                ))
+                obs_context["obs_slope_f_per_hr"] = round(obs_slope_f_per_hr, 2) if obs_slope_f_per_hr is not None else None
+                obs_context["obs_weight"] = round(obs_weight, 2)
+
+                if obs_weight > 0.05 and obs_slope_f_per_hr is not None:
+                    # Classify observed trajectory from regression slope.
+                    if obs_slope_f_per_hr >= OBS_TRAJ_RISING_F_PER_HR:
+                        obs_traj = "rising"
+                    elif obs_slope_f_per_hr <= OBS_TRAJ_FALLING_F_PER_HR:
+                        obs_traj = "falling"
+                    else:
+                        obs_traj = "flat"
+
+                    # Get OpenMeteo hourly forecast for next 3 hours to confirm trajectory.
+                    hourly_delta_f: Optional[float] = None
+                    try:
+                        _, hourly_delta_f = open_meteo_get_hourly_trend_f(lat, lon, city_now_lst, look_ahead_hours=3)
+                    except Exception:
+                        pass
+
+                    forecast_cooling = hourly_delta_f is not None and hourly_delta_f <= -0.5
+                    forecast_warming = hourly_delta_f is not None and hourly_delta_f >= 1.0
+
+                    # High is "locked" when both observed and forecast agree temps are falling.
+                    high_locked = obs_traj == "falling" and forecast_cooling
+                    # High is "still rising" when either signal shows warming.
+                    high_rising = obs_traj == "rising" or forecast_warming
+
+                    if high_locked:
+                        traj_sigma_mult = OBS_SIGMA_FALLING_MULT
+                        # Anchor mu toward observed max — the high is already set.
+                        blend = obs_weight * 0.7
+                        consensus_mu = consensus_mu * (1.0 - blend) + float(max_so_far_f) * blend
+                    elif high_rising:
+                        traj_sigma_mult = 1.0  # no extra tightening when still warming
+                    else:  # flat
+                        traj_sigma_mult = OBS_SIGMA_FLAT_MULT
+
+                    # Apply trajectory tightening on top of time-based sigma, scaled by obs_weight.
+                    tightened = consensus_sigma * (1.0 - obs_weight * (1.0 - traj_sigma_mult))
+                    consensus_sigma = max(0.3, tightened)
+
+                    obs_context["obs_trajectory"] = obs_traj
+                    obs_context["hourly_delta_f"] = round(hourly_delta_f, 1) if hourly_delta_f is not None else None
+                    obs_context["high_locked"] = high_locked
+                    logging.info(
+                        f"[{city}] HIGH traj={obs_traj} slope={obs_slope_f_per_hr:+.1f}°F/hr "
+                        f"hourly_delta={hourly_delta_f} locked={high_locked} "
+                        f"obs_weight={obs_weight:.2f} sigma→{consensus_sigma:.2f} mu→{consensus_mu:.1f}"
+                    )
             elif side == "low":
                 # Widen sigma in early morning when overnight low is still in progress.
                 # Use city_now_lst so the hour reflects the city's settlement clock, not Eastern.
@@ -3333,7 +3504,7 @@ def compute_city_best_play(city: str, markets: List[Market], now_local: datetime
     station = cfg["station"]
     conf = float(cfg["confidence"])
 
-    current_f, max_so_far_f, _min_so_far_f, obs_time = nws_get_today_temp_stats_f(
+    current_f, max_so_far_f, _min_so_far_f, obs_time, _obs_slope = nws_get_today_temp_stats_f(
         station,
         date_tz=city_lst_tz(city),
     )

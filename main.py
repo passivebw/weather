@@ -208,6 +208,10 @@ LIVE_PASSIVE_TIME_IN_FORCE = sanitize_time_in_force_for_order(
 LIVE_PASSIVE_REPRICE_STEP_CENTS = int(os.getenv("LIVE_PASSIVE_REPRICE_STEP_CENTS", "1"))
 LIVE_PASSIVE_REPRICE_STEPS_MID = int(os.getenv("LIVE_PASSIVE_REPRICE_STEPS_MID", "2"))
 LIVE_PASSIVE_REPRICE_STEPS_LOW = int(os.getenv("LIVE_PASSIVE_REPRICE_STEPS_LOW", "2"))
+# Locked-outcome trades (trajectory confirmed): longer passive window before market order
+# since the outcome is near-certain and avoiding the taker fee matters more than speed.
+LIVE_LOCKED_PASSIVE_WAIT_SECONDS = int(os.getenv("LIVE_LOCKED_PASSIVE_WAIT_SECONDS", "25"))
+LIVE_LOCKED_PASSIVE_REPRICE_STEPS = int(os.getenv("LIVE_LOCKED_PASSIVE_REPRICE_STEPS", "4"))
 LIVE_ALWAYS_PASSIVE_FIRST = env_bool("LIVE_ALWAYS_PASSIVE_FIRST", default=True)
 LIVE_AGGRESSIVE_MAX_SPREAD_CENTS = int(os.getenv("LIVE_AGGRESSIVE_MAX_SPREAD_CENTS", "8"))
 LIVE_REQUIRE_CANCEL_BEFORE_AGGRESSIVE = env_bool("LIVE_REQUIRE_CANCEL_BEFORE_AGGRESSIVE", default=True)
@@ -6576,8 +6580,15 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             is_aggressive_override = edge_pct >= LIVE_AGGRESSIVE_OVERRIDE_EDGE_PCT
             is_high = (not is_thin_book_resting) and (not is_aggressive_override) and edge_pct >= LIVE_EDGE_IMMEDIATE_AGGRESSIVE_PCT
             is_mid = (not is_thin_book_resting) and (not is_aggressive_override) and edge_pct >= LIVE_EDGE_PASSIVE_THEN_AGGR_PCT
-            passive_wait_s = LIVE_PASSIVE_WAIT_SECONDS_MID if (is_high or is_mid) else LIVE_PASSIVE_WAIT_SECONDS_LOW
-            passive_steps = LIVE_PASSIVE_REPRICE_STEPS_MID if (is_high or is_mid) else LIVE_PASSIVE_REPRICE_STEPS_LOW
+            trajectory_locked = bool(b.get("trajectory_locked", False))
+            if trajectory_locked:
+                # Locked outcome: longer window to avoid taker fee — outcome is near-certain
+                # so speed doesn't matter, saving the fee does.
+                passive_wait_s = LIVE_LOCKED_PASSIVE_WAIT_SECONDS
+                passive_steps = LIVE_LOCKED_PASSIVE_REPRICE_STEPS
+            else:
+                passive_wait_s = LIVE_PASSIVE_WAIT_SECONDS_MID if (is_high or is_mid) else LIVE_PASSIVE_WAIT_SECONDS_LOW
+                passive_steps = LIVE_PASSIVE_REPRICE_STEPS_MID if (is_high or is_mid) else LIVE_PASSIVE_REPRICE_STEPS_LOW
             desired_passive_price = None
             desired_passive_count = 0
             if LIVE_PASSIVE_ALLOW_RESTING_LIMITS and LIVE_PASSIVE_RESCAN_MODE_ENABLED and (not is_aggressive_override):

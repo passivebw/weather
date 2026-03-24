@@ -170,6 +170,9 @@ PAPER_TRADE_MIN_MINUTES_BETWEEN_RE_ALERTS = int(os.getenv("PAPER_TRADE_MIN_MINUT
 RANGE_PACKAGE_PAPER_ENABLED = env_bool("RANGE_PACKAGE_PAPER_ENABLED", default=False)
 RANGE_PACKAGE_PAPER_MIN_EDGE_PCT = float(os.getenv("RANGE_PACKAGE_PAPER_MIN_EDGE_PCT", "2.0"))
 RANGE_PACKAGE_PAPER_BUCKET_COUNT = int(os.getenv("RANGE_PACKAGE_PAPER_BUCKET_COUNT", "2"))
+RANGE_PACKAGE_LIVE_ENABLED = env_bool("RANGE_PACKAGE_LIVE_ENABLED", default=False)
+RANGE_PACKAGE_LIVE_MIN_EDGE_PCT = float(os.getenv("RANGE_PACKAGE_LIVE_MIN_EDGE_PCT", "15.0"))
+RANGE_PACKAGE_LIVE_MAX_YES_PRICE_CENTS = float(os.getenv("RANGE_PACKAGE_LIVE_MAX_YES_PRICE_CENTS", "85.0"))
 DISCORD_LEADERBOARD_ENABLED = env_bool("DISCORD_LEADERBOARD_ENABLED", default=True)
 DISCORD_DISCREPANCY_ENABLED = env_bool("DISCORD_DISCREPANCY_ENABLED", default=True)
 LIVE_TRADING_ENABLED = env_bool("LIVE_TRADING_ENABLED", default=False)
@@ -9463,6 +9466,9 @@ def health():
         "range_package_paper_enabled": RANGE_PACKAGE_PAPER_ENABLED,
         "range_package_paper_min_edge_pct": RANGE_PACKAGE_PAPER_MIN_EDGE_PCT,
         "range_package_paper_bucket_count": RANGE_PACKAGE_PAPER_BUCKET_COUNT,
+        "range_package_live_enabled": RANGE_PACKAGE_LIVE_ENABLED,
+        "range_package_live_min_edge_pct": RANGE_PACKAGE_LIVE_MIN_EDGE_PCT,
+        "range_package_live_max_yes_price_cents": RANGE_PACKAGE_LIVE_MAX_YES_PRICE_CENTS,
         "range_package_paper_trades_path": range_package_paper_trades_path(),
         "range_package_paper_trades_count": len(load_range_package_paper_rows()),
         "loss_postmortems_path": loss_postmortems_path(),
@@ -10823,6 +10829,10 @@ def maybe_post_paper_trades(now_local: datetime, board_payload: dict) -> int:
         maybe_execute_live_exits(now_local)
     except Exception:
         pass
+    try:
+        maybe_execute_range_package_live_trades(now_local)
+    except Exception:
+        pass
 
     if not PAPER_TRADE_DISCORD_ENABLED or not DISCORD_TRADE_ALERTS_ENABLED:
         return 0
@@ -10991,6 +11001,97 @@ def maybe_log_range_package_paper_trades(now_local: datetime, market_day: str = 
         new_rows += 1
     _save_range_package_paper_state(today_key)
     return new_rows
+
+
+def maybe_execute_range_package_live_trades(now_local: datetime) -> int:
+    """Execute live multi-bucket (range package) YES trades on adjacent bucket pairs.
+
+    Each package is two adjacent YES bets covering a 4°F temperature range.
+    Both legs are submitted as independent orders through the standard live
+    trade execution path. A max-price gate prevents buying legs that are
+    already expensive (market has priced them in).
+    """
+    if not RANGE_PACKAGE_LIVE_ENABLED:
+        return 0
+    if not LIVE_TRADING_ENABLED or _live_kill_switch_state:
+        return 0
+
+    candidates = build_range_package_paper_candidates(now_local, market_day="today")
+    if not candidates:
+        return 0
+
+    placed = 0
+    seen_city_sides: set = set()
+    for pkg in candidates:
+        combined_edge = float(pkg.get("combined_edge_pct", 0.0))
+        if combined_edge < RANGE_PACKAGE_LIVE_MIN_EDGE_PCT:
+            continue
+
+        city = str(pkg.get("city", ""))
+        temp_side = str(pkg.get("temp_side", "high"))
+        city_side_key = (city, temp_side)
+        # One package per city/side per scan to avoid flooding orders.
+        if city_side_key in seen_city_sides:
+            continue
+
+        leg1_ask = float(pkg.get("leg1_yes_ask") or 0.0)
+        leg2_ask = float(pkg.get("leg2_yes_ask") or 0.0)
+
+        # Max price gate: don't buy YES above configured ceiling per leg.
+        if leg1_ask > RANGE_PACKAGE_LIVE_MAX_YES_PRICE_CENTS:
+            continue
+        if leg2_ask > RANGE_PACKAGE_LIVE_MAX_YES_PRICE_CENTS:
+            continue
+
+        selected_date = str(pkg.get("date", ""))
+        leg1_model_pct = float(pkg.get("leg1_model_yes_prob_pct", 0.0))
+        leg2_model_pct = float(pkg.get("leg2_model_yes_prob_pct", 0.0))
+        leg1_edge = round(leg1_model_pct - leg1_ask, 2)
+        leg2_edge = round(leg2_model_pct - leg2_ask, 2)
+        min_top_size = int(pkg.get("min_top_size") or 0)
+        max_spread = int(pkg.get("max_spread_cents") or 0)
+
+        leg_bets: List[dict] = []
+        for leg_ticker, leg_line, leg_ask, leg_model_pct, leg_edge in [
+            (pkg.get("leg1_ticker"), pkg.get("leg1_line"), leg1_ask, leg1_model_pct, leg1_edge),
+            (pkg.get("leg2_ticker"), pkg.get("leg2_line"), leg2_ask, leg2_model_pct, leg2_edge),
+        ]:
+            if not leg_ticker:
+                continue
+            leg_bets.append({
+                "date": selected_date,
+                "city": city,
+                "temp_type": temp_side,
+                "bet": "BUY YES",
+                "line": leg_line or "",
+                "ticker": leg_ticker,
+                "market_implied_win_prob_pct": round(leg_ask, 2),
+                "model_yes_prob_pct": round(leg_model_pct, 2),
+                "net_edge_pct": round(leg_edge, 2),
+                "suggested_units": 1.0,
+                "yes_bid": max(1, int(leg_ask) - max_spread),
+                "yes_ask": int(leg_ask),
+                "spread_cents": max_spread,
+                "top_size": min_top_size,
+                "source_count": pkg.get("source_values_json", ""),
+                "source_range_f": "",
+                "afd_signal_label": "",
+                "locked_outcome": False,
+                "trade_mode": "range_package",
+                "package_combined_edge_pct": round(combined_edge, 2),
+                "package_combined_line": pkg.get("combined_line", ""),
+            })
+
+        if len(leg_bets) == 2:
+            try:
+                maybe_execute_live_trades(now_local, leg_bets)
+                placed += 1
+                seen_city_sides.add(city_side_key)
+            except Exception:
+                pass
+
+    return placed
+
 
 @app.get("/bets.txt", response_class=PlainTextResponse)
 def bets_txt(market_day: str = "auto", top_n: int = 20, force_refresh: bool = False):

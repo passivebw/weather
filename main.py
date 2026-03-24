@@ -339,8 +339,8 @@ ACCUWEATHER_LOCATION_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_LOCATION_CAC
 ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS = int(os.getenv("ACCUWEATHER_FORECAST_CACHE_TTL_SECONDS", "3600"))
 # Real-time observation trajectory and dynamic consensus weighting
 OBS_TRAJ_LOOKBACK_MINUTES = int(os.getenv("OBS_TRAJ_LOOKBACK_MINUTES", "90"))
-OBS_WEIGHT_START_HOUR = float(os.getenv("OBS_WEIGHT_START_HOUR", "11.0"))   # begin giving obs weight at 11 AM local
-OBS_WEIGHT_FULL_HOUR = float(os.getenv("OBS_WEIGHT_FULL_HOUR", "15.0"))    # full obs weight by 3 PM local
+OBS_WEIGHT_START_HOUR = float(os.getenv("OBS_WEIGHT_START_HOUR", "9.0"))    # begin giving obs weight at 9 AM local
+OBS_WEIGHT_FULL_HOUR = float(os.getenv("OBS_WEIGHT_FULL_HOUR", "13.0"))    # full obs weight by 1 PM local
 OBS_SIGMA_FLAT_MULT = float(os.getenv("OBS_SIGMA_FLAT_MULT", "0.35"))      # sigma multiplier when trajectory is flat
 OBS_SIGMA_FALLING_MULT = float(os.getenv("OBS_SIGMA_FALLING_MULT", "0.15"))# sigma multiplier when high is locked (falling + cooling forecast)
 OBS_TRAJ_RISING_F_PER_HR = float(os.getenv("OBS_TRAJ_RISING_F_PER_HR", "0.5"))   # slope threshold for "rising"
@@ -3063,8 +3063,13 @@ def build_city_bucket_comparison(
                         consensus_mu = consensus_mu * (1.0 - blend) + float(max_so_far_f) * blend
                     elif high_rising:
                         traj_sigma_mult = 1.0  # no extra tightening when still warming
-                    else:  # flat
+                    else:  # flat — temp has plateaued, pull mu toward current observation
                         traj_sigma_mult = OBS_SIGMA_FLAT_MULT
+                        # Blend mu toward current_f: if temp has been flat at 66°F all afternoon,
+                        # the forecast sources saying 71°F should be heavily discounted.
+                        if current_f is not None:
+                            flat_blend = obs_weight * 0.5
+                            consensus_mu = consensus_mu * (1.0 - flat_blend) + float(current_f) * flat_blend
 
                     # Apply trajectory tightening on top of time-based sigma, scaled by obs_weight.
                     tightened = consensus_sigma * (1.0 - obs_weight * (1.0 - traj_sigma_mult))

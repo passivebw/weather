@@ -281,7 +281,7 @@ except Exception:
 # Default observed biases (high side only; override via env var JSON)
 _DEFAULT_HIGH_BIASES: Dict[str, float] = {
     "Denver": 2.5,
-    "Austin": 1.5,
+    "Austin": 2.5,
     "Washington DC": 1.0,
 }
 for _c, _b in _DEFAULT_HIGH_BIASES.items():

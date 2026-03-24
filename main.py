@@ -265,6 +265,27 @@ TRAIL_STOP_ENABLED = env_bool("TRAIL_STOP_ENABLED", default=True)
 TRAIL_STOP_TRIGGER_GAIN_CENTS = float(os.getenv("TRAIL_STOP_TRIGGER_GAIN_CENTS", "25.0"))
 TRAIL_STOP_DISTANCE_CENTS = float(os.getenv("TRAIL_STOP_DISTANCE_CENTS", "10.0"))
 TRAIL_STOP_MAX_STOP_CENTS = float(os.getenv("TRAIL_STOP_MAX_STOP_CENTS", "70.0"))
+# Locked-outcome all-bucket scanner: when trajectory is locked, scan every bucket for YES/NO edges
+LOCKED_SCANNER_ENABLED = env_bool("LOCKED_SCANNER_ENABLED", default=True)
+LOCKED_SCANNER_MIN_EDGE_PCT = float(os.getenv("LOCKED_SCANNER_MIN_EDGE_PCT", "15.0"))
+LOCKED_SCANNER_MAX_SPREAD_CENTS = int(os.getenv("LOCKED_SCANNER_MAX_SPREAD_CENTS", "15"))
+# Per-city forecast bias correction (°F subtracted from consensus_mu before probability calc).
+# Positive = sources run warm (overestimate the high), negative = sources run cold.
+_CITY_BIAS_RAW = os.getenv("CITY_BIAS_CORRECTIONS_JSON", "")
+CITY_BIAS_CORRECTIONS: Dict[str, Dict[str, float]] = {}
+try:
+    if _CITY_BIAS_RAW:
+        CITY_BIAS_CORRECTIONS = json.loads(_CITY_BIAS_RAW)
+except Exception:
+    pass
+# Default observed biases (high side only; override via env var JSON)
+_DEFAULT_HIGH_BIASES: Dict[str, float] = {
+    "Denver": 2.5,
+    "Austin": 1.5,
+    "Washington DC": 1.0,
+}
+for _c, _b in _DEFAULT_HIGH_BIASES.items():
+    CITY_BIAS_CORRECTIONS.setdefault(_c, {}).setdefault("high", _b)
 LIVE_EDGE_DROP_EXIT_ENABLED = env_bool("LIVE_EDGE_DROP_EXIT_ENABLED", default=True)
 LIVE_EDGE_DROP_TRIGGER_PCT_POINTS = float(os.getenv("LIVE_EDGE_DROP_TRIGGER_PCT_POINTS", "25.0"))
 LIVE_EDGE_DROP_SMALL_GREEN_MAX_PCT_OF_STAKE = float(os.getenv("LIVE_EDGE_DROP_SMALL_GREEN_MAX_PCT_OF_STAKE", "10.0"))
@@ -2906,6 +2927,13 @@ def build_expert_consensus(
         + afd_sigma_adj,
     )
 
+    # Per-city bias correction: subtract known warm/cold bias from consensus mu.
+    # Positive bias_f = sources run warm (overestimate high) → subtract to correct.
+    bias_f = float((CITY_BIAS_CORRECTIONS.get(city, {}) or {}).get(side, 0.0))
+    if bias_f != 0.0:
+        mu = mu - bias_f
+        logging.info(f"[{city}] {side} bias correction: {bias_f:+.1f}°F → mu={mu:.1f}°F")
+
     return {
         "mu": mu,
         "sigma": sigma,
@@ -2917,6 +2945,7 @@ def build_expert_consensus(
         "conditions_sigma_adj_f": conditions_sigma_adj,
         "afd_sigma_adj_f": afd_sigma_adj,
         "afd_signal_label": afd_signal_label,
+        "bias_correction_f": bias_f,
         "sources": [{"name": name, "high_f": temp, "weight": w} for name, temp, w in source_values],
     }
 
@@ -3933,6 +3962,9 @@ def range_package_paper_state_path() -> str:
 def range_package_paper_trades_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "range_package_paper_trades.csv")
 
+def salmon_positions_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "salmon_positions.csv")
+
 def live_trade_state_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "live_trade_state.json")
 
@@ -4092,6 +4124,11 @@ RANGE_PACKAGE_PAPER_FIELDS = [
     "min_top_size", "max_spread_cents", "source_values_json",
 ]
 
+SALMON_POSITION_FIELDS = [
+    "ts_est", "date", "city", "temp_side", "setup_type", "confidence",
+    "tickers", "contract_counts", "entry_prices_cents", "notes",
+]
+
 LOSS_POSTMORTEM_FIELDS = [
     "entry_ts_est", "date", "city", "temp_side", "station",
     "ticker", "bet", "line",
@@ -4162,6 +4199,21 @@ def _append_range_package_paper_log(row: dict) -> None:
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=RANGE_PACKAGE_PAPER_FIELDS)
         w.writerow({k: row.get(k, "") for k in RANGE_PACKAGE_PAPER_FIELDS})
+
+def ensure_salmon_positions_header() -> None:
+    _ensure_csv_header_contains(salmon_positions_path(), SALMON_POSITION_FIELDS)
+
+def load_salmon_position_rows() -> List[dict]:
+    ensure_salmon_positions_header()
+    _header, rows = _read_csv_rows_with_header(salmon_positions_path())
+    return rows
+
+def _append_salmon_position_log(row: dict) -> None:
+    ensure_salmon_positions_header()
+    path = salmon_positions_path()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SALMON_POSITION_FIELDS)
+        w.writerow({k: row.get(k, "") for k in SALMON_POSITION_FIELDS})
 
 def ensure_loss_postmortems_header() -> None:
     _ensure_csv_header_contains(loss_postmortems_path(), LOSS_POSTMORTEM_FIELDS)
@@ -10979,6 +11031,10 @@ def maybe_post_paper_trades(now_local: datetime, board_payload: dict) -> int:
     except Exception:
         pass
     try:
+        maybe_execute_locked_outcome_scan(now_local)
+    except Exception:
+        pass
+    try:
         maybe_execute_range_package_live_trades(now_local)
     except Exception:
         pass
@@ -11150,6 +11206,117 @@ def maybe_log_range_package_paper_trades(now_local: datetime, market_day: str = 
         new_rows += 1
     _save_range_package_paper_state(today_key)
     return new_rows
+
+
+def maybe_execute_locked_outcome_scan(now_local: datetime) -> int:
+    """Scan ALL buckets for any city/side where trajectory is locked.
+
+    When the high/low is physically confirmed (obs falling + forecast cooling),
+    every bucket in that market becomes priceable with near-zero uncertainty.
+    This scanner finds any bucket — YES or NO — that Kalshi hasn't repriced yet
+    and submits live orders. This is the automated version of manually spotting
+    DC YES at 54¢ when the high was already recorded at 78.8°F.
+    """
+    if not LOCKED_SCANNER_ENABLED:
+        return 0
+    if not LIVE_TRADING_ENABLED or _live_kill_switch_state:
+        return 0
+    if not kalshi_has_auth_config():
+        return 0
+
+    grouped = refresh_markets_cache()
+    placed = 0
+    bets: List[dict] = []
+
+    for city in sorted(CITY_CONFIG.keys()):
+        city_now_lst = city_lst_now(now_local, city)
+        city_today_iso = city_now_lst.date().isoformat()
+
+        for side in ("high", "low"):
+            if side == "low" and not LOW_SIGNALS_ENABLED:
+                continue
+            city_markets = [
+                m for m in grouped.get(city, [])
+                if normalize_temp_side(getattr(m, "temp_side", "high")) == side
+            ]
+            if not city_markets:
+                continue
+
+            selected_markets, selected_date, _ = select_markets_for_day(
+                city_markets, now_local, "today", city=city
+            )
+            if not selected_markets:
+                continue
+
+            detail = build_city_bucket_comparison(city, selected_markets, now_local, temp_side=side)
+            if detail is None:
+                continue
+
+            obs_ctx = detail.get("nws_obs_context", {}) or {}
+            trajectory_locked = bool(obs_ctx.get("high_locked", False)) or bool(obs_ctx.get("low_locked", False))
+            if not trajectory_locked:
+                continue
+
+            obs_fresh = bool(obs_ctx.get("obs_fresh", False))
+            if not obs_fresh:
+                continue
+
+            for b in (detail.get("buckets", []) or []):
+                ticker = str(b.get("ticker", "")).strip()
+                if not ticker:
+                    continue
+                yes_bid = _to_float(b.get("yes_bid"))
+                yes_ask = _to_float(b.get("yes_ask"))
+                if yes_bid is None or yes_ask is None:
+                    continue
+                spread = int(yes_ask) - int(yes_bid)
+                if spread > LOCKED_SCANNER_MAX_SPREAD_CENTS:
+                    continue
+                top_size = int(_to_float(b.get("top_size")) or 0)
+                model_yes = float(_to_float(b.get("source_yes_prob")) or 0.0)
+
+                edge_yes = model_yes - (float(yes_ask) / 100.0)
+                edge_no  = (float(yes_bid) / 100.0) - model_yes
+
+                if edge_yes >= edge_no and (edge_yes * 100.0) >= LOCKED_SCANNER_MIN_EDGE_PCT:
+                    bet_side = "BUY YES"
+                    edge_pct = round(edge_yes * 100.0, 2)
+                elif edge_no > edge_yes and (edge_no * 100.0) >= LOCKED_SCANNER_MIN_EDGE_PCT:
+                    bet_side = "BUY NO"
+                    edge_pct = round(edge_no * 100.0, 2)
+                else:
+                    continue
+
+                bets.append({
+                    "date": selected_date or city_today_iso,
+                    "city": city,
+                    "temp_type": side,
+                    "bet": bet_side,
+                    "line": str(b.get("bucket_label", "")),
+                    "ticker": ticker,
+                    "market_implied_win_prob_pct": round(float(yes_ask if bet_side == "BUY YES" else 100 - yes_bid), 2),
+                    "model_yes_prob_pct": round(model_yes * 100.0, 2),
+                    "net_edge_pct": edge_pct,
+                    "suggested_units": 1.0,
+                    "yes_bid": int(yes_bid),
+                    "yes_ask": int(yes_ask),
+                    "spread_cents": spread,
+                    "top_size": top_size,
+                    "source_count": detail.get("source_count", 0),
+                    "source_range_f": round(float(detail.get("consensus_source_range_f") or 0.0), 2),
+                    "afd_signal_label": detail.get("afd_signal_label", ""),
+                    "locked_outcome": True,
+                    "trajectory_locked": True,
+                    "trade_mode": "locked_scanner",
+                })
+
+    if bets:
+        try:
+            placed = maybe_execute_live_trades(now_local, bets)
+        except Exception:
+            pass
+
+    return placed or 0
 
 
 def maybe_execute_range_package_live_trades(now_local: datetime) -> int:
@@ -12675,6 +12842,94 @@ def manual_sync_kalshi(
         force_update=force_update,
         dry_run=dry_run,
     )
+
+@app.post("/admin/log-salmon-position")
+def log_salmon_position(payload: dict = Body(...)):
+    """
+    Log a Purple Salmon position for tracking and learning.
+    Body fields:
+      city, temp_side, setup_type, confidence, tickers (list or comma-sep),
+      contract_counts (list or comma-sep), entry_prices_cents (list or comma-sep), notes
+    """
+    now_est = datetime.now(tz=pytz.timezone("America/New_York"))
+    ts_est = now_est.strftime("%Y-%m-%d %H:%M:%S")
+    date_iso = now_est.date().isoformat()
+
+    city = str(payload.get("city", "")).strip()
+    temp_side = str(payload.get("temp_side", "high")).strip().lower()
+    setup_type = str(payload.get("setup_type", "")).strip()
+    confidence = str(payload.get("confidence", "")).strip()
+    notes = str(payload.get("notes", "")).strip()
+
+    def _listify(v):
+        if isinstance(v, list):
+            return ",".join(str(x) for x in v)
+        return str(v or "").strip()
+
+    tickers = _listify(payload.get("tickers", ""))
+    contract_counts = _listify(payload.get("contract_counts", ""))
+    entry_prices_cents = _listify(payload.get("entry_prices_cents", ""))
+
+    row = {
+        "ts_est": ts_est,
+        "date": date_iso,
+        "city": city,
+        "temp_side": temp_side,
+        "setup_type": setup_type,
+        "confidence": confidence,
+        "tickers": tickers,
+        "contract_counts": contract_counts,
+        "entry_prices_cents": entry_prices_cents,
+        "notes": notes,
+    }
+
+    try:
+        _append_salmon_position_log(row)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    return {"ok": True, "logged": row, "path": salmon_positions_path()}
+
+
+@app.get("/analytics/salmon-positions")
+def analytics_salmon_positions(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    rows = load_salmon_position_rows()
+    d0 = None
+    d1 = None
+    try:
+        if start:
+            d0 = datetime.fromisoformat(str(start)).date()
+    except Exception:
+        d0 = None
+    try:
+        if end:
+            d1 = datetime.fromisoformat(str(end)).date()
+    except Exception:
+        d1 = None
+
+    out: List[dict] = []
+    for r in rows:
+        date_iso = str(r.get("date", "")).strip()
+        try:
+            dd = datetime.fromisoformat(date_iso).date()
+        except Exception:
+            dd = None
+        if d0 and dd and dd < d0:
+            continue
+        if d1 and dd and dd > d1:
+            continue
+        out.append(dict(r))
+
+    return {
+        "ok": True,
+        "path": salmon_positions_path(),
+        "count": len(out),
+        "rows": out,
+    }
+
 
 @app.get("/analytics/account-reconciliation")
 def analytics_account_reconciliation():

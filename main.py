@@ -261,6 +261,10 @@ LIVE_EXIT_AGGRESSIVE_TIME_IN_FORCE = sanitize_time_in_force_for_order(
 )
 LIVE_EXIT_MAX_SPREAD_CENTS = int(os.getenv("LIVE_EXIT_MAX_SPREAD_CENTS", "8"))
 LIVE_EXIT_ONLY_WHEN_LOSING = env_bool("LIVE_EXIT_ONLY_WHEN_LOSING", default=True)
+TRAIL_STOP_ENABLED = env_bool("TRAIL_STOP_ENABLED", default=True)
+TRAIL_STOP_TRIGGER_GAIN_CENTS = float(os.getenv("TRAIL_STOP_TRIGGER_GAIN_CENTS", "25.0"))
+TRAIL_STOP_DISTANCE_CENTS = float(os.getenv("TRAIL_STOP_DISTANCE_CENTS", "10.0"))
+TRAIL_STOP_MAX_STOP_CENTS = float(os.getenv("TRAIL_STOP_MAX_STOP_CENTS", "70.0"))
 LIVE_EDGE_DROP_EXIT_ENABLED = env_bool("LIVE_EDGE_DROP_EXIT_ENABLED", default=True)
 LIVE_EDGE_DROP_TRIGGER_PCT_POINTS = float(os.getenv("LIVE_EDGE_DROP_TRIGGER_PCT_POINTS", "25.0"))
 LIVE_EDGE_DROP_SMALL_GREEN_MAX_PCT_OF_STAKE = float(os.getenv("LIVE_EDGE_DROP_SMALL_GREEN_MAX_PCT_OF_STAKE", "10.0"))
@@ -3935,6 +3939,9 @@ def live_trade_state_path() -> str:
 def live_exit_state_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "live_exit_state.json")
 
+def trail_stop_state_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "trail_stop_state.json")
+
 def live_trade_discord_state_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "live_trade_discord_state.json")
 
@@ -7003,6 +7010,140 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
     _save_live_trade_state(today_key)
     return placed
 
+def maybe_manage_trail_stops(now_local: datetime) -> int:
+    """Manage trailing stop-loss GTC orders for open forecast-driven positions.
+
+    Once a position is up TRAIL_STOP_TRIGGER_GAIN_CENTS from entry, place a
+    GTC sell at (current_price - TRAIL_STOP_DISTANCE_CENTS). As the market
+    moves further in our favor, cancel the old stop and place a new one higher.
+    Stop level is capped at TRAIL_STOP_MAX_STOP_CENTS (default 70¢) to avoid
+    near-settlement noise. Trajectory-locked positions are excluded — they
+    hold to settlement.
+    """
+    if not TRAIL_STOP_ENABLED:
+        return 0
+    if not LIVE_TRADING_ENABLED or _live_kill_switch_state:
+        return 0
+    if not kalshi_has_auth_config():
+        return 0
+
+    open_positions = _aggregate_open_live_positions(now_local)
+    if not open_positions:
+        return 0
+
+    state_path = trail_stop_state_path()
+    try:
+        with open(state_path, "r") as f:
+            state: dict = json.load(f)
+    except Exception:
+        state = {}
+
+    managed = 0
+    for pos in open_positions:
+        ticker = str(pos.get("ticker", "")).strip()
+        bet_side = str(pos.get("bet", "")).strip().upper()
+        if not ticker or bet_side not in ("BUY YES", "BUY NO"):
+            continue
+
+        # Skip trajectory-locked positions — hold to settlement.
+        if bool(pos.get("trajectory_locked", False)):
+            continue
+
+        order_side, price_field = _bet_side_and_price_field(bet_side)
+        if order_side is None or price_field is None:
+            continue
+
+        # Get current orderbook to find current market value of our position.
+        ob = kalshi_get_orderbook(ticker)
+        yes_bid, yes_ask, _ = best_bid_and_ask_from_orderbook(ob)
+        if yes_bid is None or yes_ask is None:
+            continue
+
+        # Current liquidation value: what the market will pay for our contracts right now.
+        if bet_side == "BUY NO":
+            current_value = float(100 - yes_ask)   # no_bid
+        else:
+            current_value = float(yes_bid)          # yes_bid
+
+        avg_entry = float(_to_float(pos.get("avg_entry_price_cents")) or 0.0)
+        if avg_entry <= 0:
+            continue
+
+        unrealized_gain = current_value - avg_entry
+        pos_key = f"{ticker}|{bet_side}"
+        prior = state.get(pos_key, {})
+
+        if unrealized_gain < TRAIL_STOP_TRIGGER_GAIN_CENTS:
+            # Not yet triggered — clean up any stale state for this position.
+            if prior.get("stop_order_id"):
+                try:
+                    kalshi_cancel_order(str(prior["stop_order_id"]))
+                except Exception:
+                    pass
+                state.pop(pos_key, None)
+            continue
+
+        # Compute new stop level: trail 10¢ below current value, capped at max.
+        new_hwm = max(float(prior.get("high_water_mark_cents", 0.0)), current_value)
+        new_stop = min(new_hwm - TRAIL_STOP_DISTANCE_CENTS, TRAIL_STOP_MAX_STOP_CENTS)
+        new_stop = max(new_stop, avg_entry + 1.0)  # always above entry
+        new_stop_int = int(new_stop)
+
+        existing_stop = int(prior.get("stop_price_cents", 0))
+        existing_order_id = str(prior.get("stop_order_id", "")).strip()
+
+        # Only update if stop needs to move up (never trail down).
+        if existing_order_id and new_stop_int <= existing_stop:
+            # Update high water mark but keep existing order.
+            state[pos_key] = dict(prior, high_water_mark_cents=new_hwm)
+            continue
+
+        # Cancel the old stop order if one exists.
+        if existing_order_id:
+            try:
+                kalshi_cancel_order(existing_order_id)
+            except Exception:
+                pass
+
+        # Place new GTC stop-loss sell order at new_stop_int.
+        market_date = str(pos.get("date", "")).strip()
+        payload = {
+            "ticker": ticker,
+            "client_order_id": f"bot-trail-{market_date}-{uuid.uuid4().hex[:8]}",
+            "action": "sell",
+            "side": order_side,
+            price_field: new_stop_int,
+            "time_in_force": "good_till_canceled",
+        }
+        try:
+            resp = kalshi_post("/portfolio/orders", payload, timeout=20, max_retries=2)
+            new_order_id = str(resp.get("order", {}).get("order_id") or resp.get("order_id") or "")
+            err = str(resp.get("error", "") or "")
+            if not err and new_order_id:
+                state[pos_key] = {
+                    "stop_order_id": new_order_id,
+                    "stop_price_cents": new_stop_int,
+                    "high_water_mark_cents": new_hwm,
+                    "entry_price_cents": avg_entry,
+                    "updated_ts": fmt_est(now_local),
+                }
+                managed += 1
+                logging.info(
+                    f"[trail_stop] {ticker} {bet_side} stop→{new_stop_int}¢ "
+                    f"hwm={new_hwm:.0f}¢ entry={avg_entry:.0f}¢ gain={unrealized_gain:.0f}¢"
+                )
+        except Exception:
+            pass
+
+    try:
+        with open(state_path, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+    return managed
+
+
 def maybe_execute_live_exits(now_local: datetime) -> int:
     if not LIVE_TRADING_ENABLED or _live_kill_switch_state or not LIVE_EXIT_ENABLED:
         return 0
@@ -9469,6 +9610,10 @@ def health():
         "range_package_live_enabled": RANGE_PACKAGE_LIVE_ENABLED,
         "range_package_live_min_edge_pct": RANGE_PACKAGE_LIVE_MIN_EDGE_PCT,
         "range_package_live_max_yes_price_cents": RANGE_PACKAGE_LIVE_MAX_YES_PRICE_CENTS,
+        "trail_stop_enabled": TRAIL_STOP_ENABLED,
+        "trail_stop_trigger_gain_cents": TRAIL_STOP_TRIGGER_GAIN_CENTS,
+        "trail_stop_distance_cents": TRAIL_STOP_DISTANCE_CENTS,
+        "trail_stop_max_stop_cents": TRAIL_STOP_MAX_STOP_CENTS,
         "range_package_paper_trades_path": range_package_paper_trades_path(),
         "range_package_paper_trades_count": len(load_range_package_paper_rows()),
         "loss_postmortems_path": loss_postmortems_path(),
@@ -10827,6 +10972,10 @@ def maybe_post_paper_trades(now_local: datetime, board_payload: dict) -> int:
         pass
     try:
         maybe_execute_live_exits(now_local)
+    except Exception:
+        pass
+    try:
+        maybe_manage_trail_stops(now_local)
     except Exception:
         pass
     try:

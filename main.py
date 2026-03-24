@@ -12851,7 +12851,7 @@ def log_salmon_position(payload: dict = Body(...)):
       city, temp_side, setup_type, confidence, tickers (list or comma-sep),
       contract_counts (list or comma-sep), entry_prices_cents (list or comma-sep), notes
     """
-    now_est = datetime.now(tz=pytz.timezone("America/New_York"))
+    now_est = datetime.now(tz=LOCAL_TZ)
     ts_est = now_est.strftime("%Y-%m-%d %H:%M:%S")
     date_iso = now_est.date().isoformat()
 

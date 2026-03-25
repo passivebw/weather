@@ -3128,23 +3128,44 @@ def build_city_bucket_comparison(
                 # Widen sigma in early morning when overnight low is still in progress.
                 # Use city_now_lst so the hour reflects the city's settlement clock, not Eastern.
                 consensus_sigma = max(0.7, consensus_sigma * intraday_low_sigma_factor(city_now_lst))
-                # If observed station minimum is already below the forecast consensus,
-                # clamp consensus_mu downward — the actual low can't exceed what's observed.
+
+                city_hour = city_now_lst.hour + city_now_lst.minute / 60.0
+
+                # Overnight obs weight: midnight→7 AM is prime low-occurrence window.
+                # Give full weight 0–4 AM, taper to 0 by 7 AM, then hand off to daytime ramp.
+                if city_hour <= 4.0:
+                    overnight_obs_weight = 1.0
+                elif city_hour < 7.0:
+                    overnight_obs_weight = max(0.0, 1.0 - (city_hour - 4.0) / 3.0)
+                else:
+                    overnight_obs_weight = 0.0
+
                 if obs_context["obs_fresh"] and min_so_far_f is not None:
                     if float(min_so_far_f) < consensus_mu:
+                        # Observed min is colder than forecast — clamp mu down.
                         consensus_mu = min(consensus_mu, float(min_so_far_f) - 0.10)
+                    elif overnight_obs_weight > 0.3 and float(min_so_far_f) > consensus_mu + 1.0:
+                        # Overnight: observed min is already WARMER than forecast — raise mu.
+                        # The low has likely already occurred and it wasn't as cold as models said.
+                        blend = overnight_obs_weight * 0.6
+                        consensus_mu = consensus_mu * (1.0 - blend) + float(min_so_far_f) * blend
+                        logging.info(
+                            f"[{city}] LOW overnight warm floor: min_so_far={min_so_far_f:.1f}°F "
+                            f"> consensus_mu — raised mu to {consensus_mu:.1f}°F "
+                            f"(overnight_obs_weight={overnight_obs_weight:.2f})"
+                        )
 
                 # --- Trajectory-based sigma tightening for LOW markets ---
                 # For LOW markets the logic inverts: temps RISING = low is locked in,
                 # temps still FALLING = low is still developing, keep sigma wide.
                 # Low markets typically lock after mid-morning once temps start climbing.
                 if obs_context["obs_fresh"] and min_so_far_f is not None and obs_slope_f_per_hr is not None:
-                    city_hour = city_now_lst.hour + city_now_lst.minute / 60.0
-                    # For LOW markets, obs dominance starts later (10 AM) and is full by 1 PM
-                    # since the low is usually set overnight or early morning.
-                    low_obs_weight = max(0.0, min(1.0,
+                    # Daytime ramp: obs dominance 10 AM → 1 PM
+                    daytime_low_obs_weight = max(0.0, min(1.0,
                         (city_hour - 10.0) / max(0.1, 13.0 - 10.0)
                     ))
+                    # Use whichever is higher: overnight or daytime weight
+                    low_obs_weight = max(overnight_obs_weight, daytime_low_obs_weight)
                     obs_context["obs_slope_f_per_hr"] = round(obs_slope_f_per_hr, 2)
                     obs_context["obs_weight"] = round(low_obs_weight, 2)
 

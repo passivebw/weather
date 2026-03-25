@@ -11529,6 +11529,12 @@ def maybe_execute_range_package_live_trades(now_local: datetime) -> int:
         if combined_edge < RANGE_PACKAGE_LIVE_MIN_EDGE_PCT:
             continue
 
+        # Only execute the mu-anchored package (rank 1 = closest to consensus mu).
+        # The global candidate list is sorted by edge, so without this guard we'd
+        # pick a high-edge fringe package instead of the one centered on the model forecast.
+        if int(pkg.get("package_rank_in_city_side", 999)) != 1:
+            continue
+
         city = str(pkg.get("city", ""))
         temp_side = str(pkg.get("temp_side", "high"))
         city_side_key = (city, temp_side)

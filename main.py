@@ -203,6 +203,7 @@ LIVE_PASSIVE_RESCAN_MODE_ENABLED = env_bool("LIVE_PASSIVE_RESCAN_MODE_ENABLED", 
 LIVE_PASSIVE_RESCAN_SECONDS = int(os.getenv("LIVE_PASSIVE_RESCAN_SECONDS", "60"))
 LIVE_PASSIVE_ONE_TICK_FROM_ASK = env_bool("LIVE_PASSIVE_ONE_TICK_FROM_ASK", default=True)
 LIVE_PASSIVE_CANCEL_IF_ASK_AWAY_CENTS = int(os.getenv("LIVE_PASSIVE_CANCEL_IF_ASK_AWAY_CENTS", "10"))
+LIVE_PASSIVE_ESCALATE_AFTER_SECONDS = int(os.getenv("LIVE_PASSIVE_ESCALATE_AFTER_SECONDS", "7200"))  # 2 hours default
 LIVE_PASSIVE_TIME_IN_FORCE = sanitize_time_in_force_for_order(
     os.getenv("LIVE_PASSIVE_TIME_IN_FORCE", "fill_or_kill"),
     default=("good_till_canceled" if LIVE_PASSIVE_ALLOW_RESTING_LIMITS else LIVE_ORDER_TIME_IN_FORCE),
@@ -6764,11 +6765,17 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
                         if desired_passive_count > 0 and requested_count > 0 and int(desired_passive_count) != int(requested_count):
                             _cancel_pending_passive_if_possible(sig, pending_order_id, reason="desired_size_changed")
                             continue
-                        # Conservative resting-order mode: keep exactly one live resting
-                        # order on the book while the edge still qualifies. We do not
-                        # cancel/reprice active resting orders intra-day, because losing
-                        # track during cancel/replace can stack duplicates.
-                        continue
+                        # Escalate to aggressive if resting order has been unfilled too long
+                        if LIVE_PASSIVE_ESCALATE_AFTER_SECONDS > 0:
+                            created_ts = float(row.get("pending_passive_created_ts_epoch", 0) or 0)
+                            age_seconds = (time.time() - created_ts) if created_ts > 0 else 0
+                            if age_seconds >= LIVE_PASSIVE_ESCALATE_AFTER_SECONDS:
+                                _cancel_pending_passive_if_possible(sig, pending_order_id, reason="resting_timeout_escalate")
+                                # fall through to place aggressive order below
+                            else:
+                                continue
+                        else:
+                            continue
                 else:
                     snap_err = str(snapshot.get("error", "") or "snapshot failed")
                     if ("404" in snap_err) or ("not found" in snap_err.lower()):
@@ -9709,6 +9716,7 @@ def health():
         "live_passive_rescan_seconds": LIVE_PASSIVE_RESCAN_SECONDS,
         "live_passive_one_tick_from_ask": LIVE_PASSIVE_ONE_TICK_FROM_ASK,
         "live_passive_cancel_if_ask_away_cents": LIVE_PASSIVE_CANCEL_IF_ASK_AWAY_CENTS,
+        "live_passive_escalate_after_seconds": LIVE_PASSIVE_ESCALATE_AFTER_SECONDS,
         "live_passive_time_in_force": LIVE_PASSIVE_TIME_IN_FORCE,
         "live_always_passive_first": LIVE_ALWAYS_PASSIVE_FIRST,
         "live_passive_reprice_step_cents": LIVE_PASSIVE_REPRICE_STEP_CENTS,

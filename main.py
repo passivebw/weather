@@ -170,6 +170,7 @@ PAPER_TRADE_MIN_MINUTES_BETWEEN_RE_ALERTS = int(os.getenv("PAPER_TRADE_MIN_MINUT
 RANGE_PACKAGE_PAPER_ENABLED = env_bool("RANGE_PACKAGE_PAPER_ENABLED", default=False)
 RANGE_PACKAGE_PAPER_MIN_EDGE_PCT = float(os.getenv("RANGE_PACKAGE_PAPER_MIN_EDGE_PCT", "2.0"))
 RANGE_PACKAGE_PAPER_BUCKET_COUNT = int(os.getenv("RANGE_PACKAGE_PAPER_BUCKET_COUNT", "2"))
+RANGE_PACKAGE_MIN_COMBINED_PROB_PCT = float(os.getenv("RANGE_PACKAGE_MIN_COMBINED_PROB_PCT", "45.0"))
 RANGE_PACKAGE_LIVE_ENABLED = env_bool("RANGE_PACKAGE_LIVE_ENABLED", default=True)
 RANGE_PACKAGE_LIVE_MIN_EDGE_PCT = float(os.getenv("RANGE_PACKAGE_LIVE_MIN_EDGE_PCT", "15.0"))
 RANGE_PACKAGE_LIVE_MAX_YES_PRICE_CENTS = float(os.getenv("RANGE_PACKAGE_LIVE_MAX_YES_PRICE_CENTS", "89.0"))
@@ -9669,6 +9670,7 @@ def health():
         "range_package_paper_enabled": RANGE_PACKAGE_PAPER_ENABLED,
         "range_package_paper_min_edge_pct": RANGE_PACKAGE_PAPER_MIN_EDGE_PCT,
         "range_package_paper_bucket_count": RANGE_PACKAGE_PAPER_BUCKET_COUNT,
+        "range_package_min_combined_prob_pct": RANGE_PACKAGE_MIN_COMBINED_PROB_PCT,
         "range_package_live_enabled": RANGE_PACKAGE_LIVE_ENABLED,
         "range_package_live_min_edge_pct": RANGE_PACKAGE_LIVE_MIN_EDGE_PCT,
         "range_package_live_max_yes_price_cents": RANGE_PACKAGE_LIVE_MAX_YES_PRICE_CENTS,
@@ -11141,6 +11143,7 @@ def build_range_package_paper_candidates(now_local: datetime, market_day: str = 
             if len(buckets) < 2:
                 continue
             buckets.sort(key=lambda r: (float(r.get("lo", 0.0)), float(r.get("hi", 0.0))))
+            consensus_mu = _to_float(comparison.get("consensus_mu_f"))
             city_packages: List[dict] = []
             for idx in range(len(buckets) - 1):
                 a = buckets[idx]
@@ -11166,6 +11169,12 @@ def build_range_package_paper_candidates(now_local: datetime, market_day: str = 
                 combined_edge_pct = combined_model_yes_prob_pct - combined_entry_cost_cents
                 if combined_edge_pct < float(RANGE_PACKAGE_PAPER_MIN_EDGE_PCT):
                     continue
+                # Minimum combined probability gate — avoids fringe bets with fake edge
+                if combined_model_yes_prob_pct < float(RANGE_PACKAGE_MIN_COMBINED_PROB_PCT):
+                    continue
+                # Distance of this pair's midpoint from consensus mu (for mu-anchoring sort)
+                pair_mid = (float(a.get("lo", 0.0)) + float(b.get("hi", 0.0))) / 2.0
+                mu_distance = abs(pair_mid - float(consensus_mu)) if consensus_mu is not None else 999.0
                 city_packages.append({
                     "ts_est": fmt_est(now_local),
                     "date": selected_date or "",
@@ -11178,6 +11187,7 @@ def build_range_package_paper_candidates(now_local: datetime, market_day: str = 
                     "combined_model_yes_prob_pct": round(combined_model_yes_prob_pct, 2),
                     "combined_entry_cost_cents": round(combined_entry_cost_cents, 2),
                     "combined_edge_pct": round(combined_edge_pct, 2),
+                    "mu_distance_f": round(mu_distance, 2),
                     "leg1_line": a.get("bucket_label"),
                     "leg1_ticker": a.get("ticker"),
                     "leg1_yes_ask": a.get("yes_ask"),
@@ -11190,7 +11200,8 @@ def build_range_package_paper_candidates(now_local: datetime, market_day: str = 
                     "max_spread_cents": max(spread_a, spread_b),
                     "source_values_json": json.dumps((comparison.get("source_values_map") or {}), sort_keys=True),
                 })
-            city_packages.sort(key=lambda r: float(r.get("combined_edge_pct", -1e9)), reverse=True)
+            # Sort by mu proximity first, then edge as tiebreaker
+            city_packages.sort(key=lambda r: (float(r.get("mu_distance_f", 999.0)), -float(r.get("combined_edge_pct", -1e9))))
             for rank, pkg in enumerate(city_packages, start=1):
                 pkg["package_rank_in_city_side"] = rank
             out.extend(city_packages)

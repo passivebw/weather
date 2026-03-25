@@ -10713,7 +10713,7 @@ def paper_trade_text(now_local: datetime, bets: List[dict]) -> str:
         thin_book = bool(b.get("thin_book_resting", False))
         obs_traj = b.get("obs_trajectory") or ""
 
-        day_label = "Day+1" if day_offset > 0 else "Today"
+        day_label = "Tomorrow" if day_offset > 0 else "Today"
         lock_label = " · 🔒 Locked" if trajectory_locked else ""
         traj_label = f" ({obs_traj})" if obs_traj and not trajectory_locked else ""
         order_label = "Resting Limit" if thin_book else "Market Order"
@@ -13711,9 +13711,14 @@ def scan():
         # Paper trade alerts run on tomorrow's markets — forward-looking signal preview
         try:
             tomorrow_board_payload = build_odds_board(now_local, market_day="tomorrow")
+            tomorrow_date = (now_local.date() + timedelta(days=1)).isoformat()
+            # Only use tomorrow's board if it actually contains tomorrow's markets
+            tomorrow_rows = tomorrow_board_payload.get("rows", [])
+            if not any(r.get("selected_market_date", "") >= tomorrow_date for r in tomorrow_rows):
+                tomorrow_board_payload = None
         except Exception:
-            tomorrow_board_payload = board_payload
-        paper_trade_posted_count = maybe_post_paper_trades(now_local, tomorrow_board_payload, live_board_payload=board_payload)
+            tomorrow_board_payload = None
+        paper_trade_posted_count = maybe_post_paper_trades(now_local, tomorrow_board_payload, live_board_payload=board_payload) if tomorrow_board_payload else 0
         range_package_paper_logged_count = maybe_log_range_package_paper_trades(now_local, market_day="tomorrow")
         try:
             maybe_log_next_day_paper_trades(now_local)

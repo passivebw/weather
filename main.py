@@ -192,6 +192,8 @@ LIVE_CITY_BLACKLIST: set = {c.strip() for c in _LIVE_CITY_BLACKLIST_RAW.split(",
 LIVE_HIGH_TRADE_START_HOUR_LOCAL = float(os.getenv("LIVE_HIGH_TRADE_START_HOUR_LOCAL", "8.0"))
 # LOW markets: don't trade after this hour (low is likely already set by then)
 LIVE_LOW_TRADE_END_HOUR_LOCAL = float(os.getenv("LIVE_LOW_TRADE_END_HOUR_LOCAL", "10.0"))
+# Range packages: suppress before this local hour — overnight cold-biased models corrupt packages
+RANGE_PACKAGE_START_HOUR_LOCAL = float(os.getenv("RANGE_PACKAGE_START_HOUR_LOCAL", "8.0"))
 
 LIVE_MAX_ORDERS_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_DAY", "25"))
 LIVE_MAX_ORDERS_PER_MARKET_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_MARKET_PER_DAY", "1"))
@@ -11284,6 +11286,15 @@ def build_range_package_paper_candidates(now_local: datetime, market_day: str = 
         for temp_side in ("high", "low"):
             if temp_side == "low" and not LOW_SIGNALS_ENABLED:
                 continue
+            # Block range packages before morning model updates to avoid overnight cold bias
+            if market_day == "today":
+                try:
+                    city_tz = city_lst_tz(city)
+                    city_hour_now = now_local.astimezone(city_tz).hour + now_local.astimezone(city_tz).minute / 60.0
+                    if city_hour_now < RANGE_PACKAGE_START_HOUR_LOCAL:
+                        continue
+                except Exception:
+                    pass
             city_markets = [m for m in grouped.get(city, []) if normalize_temp_side(getattr(m, "temp_side", "high")) == temp_side]
             if not city_markets:
                 continue

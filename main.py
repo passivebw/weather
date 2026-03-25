@@ -182,9 +182,9 @@ MANUAL_MARKET_BLOCK_ENABLED = env_bool("MANUAL_MARKET_BLOCK_ENABLED", default=Tr
 MANUAL_AUTO_SYNC_ENABLED = env_bool("MANUAL_AUTO_SYNC_ENABLED", default=True)
 MANUAL_AUTO_SYNC_INTERVAL_MINUTES = int(os.getenv("MANUAL_AUTO_SYNC_INTERVAL_MINUTES", "30"))
 LIVE_MAX_ORDERS_PER_SCAN = int(os.getenv("LIVE_MAX_ORDERS_PER_SCAN", "3"))
-# Cities paused from live trading due to poor historical win rate.
-# Comma-separated city names, e.g. "Houston,Los Angeles,Philadelphia"
-_LIVE_CITY_BLACKLIST_RAW = os.getenv("LIVE_CITY_BLACKLIST", "Houston,Los Angeles,Philadelphia,Oklahoma City")
+# Cities paused from live trading (empty by default — let model learn from all cities).
+# Set LIVE_CITY_BLACKLIST env var to pause specific cities, e.g. "Houston,Los Angeles"
+_LIVE_CITY_BLACKLIST_RAW = os.getenv("LIVE_CITY_BLACKLIST", "")
 LIVE_CITY_BLACKLIST: set = {c.strip() for c in _LIVE_CITY_BLACKLIST_RAW.split(",") if c.strip()}
 
 # Trading time restrictions (local city time)

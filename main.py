@@ -11023,16 +11023,22 @@ def maybe_log_next_day_paper_trades(now_local: datetime) -> int:
         logged += 1
     return logged
 
-def maybe_post_paper_trades(now_local: datetime, board_payload: dict) -> int:
+def maybe_post_paper_trades(now_local: datetime, board_payload: dict, live_board_payload: Optional[dict] = None) -> int:
     bets, _ = build_policy_bets_from_board_payload(
         board_payload,
+        top_n=max(1, PAPER_TRADE_POST_TOP_N),
+        min_edge_pct=POLICY_MIN_NET_EDGE_PCT,
+    )
+    # Live execution always uses today's board, not tomorrow's paper board
+    live_bets, _ = build_policy_bets_from_board_payload(
+        live_board_payload if live_board_payload is not None else board_payload,
         top_n=max(1, PAPER_TRADE_POST_TOP_N),
         min_edge_pct=POLICY_MIN_NET_EDGE_PCT,
     )
     # Live execution should evaluate current qualifying bets every scan,
     # not only newly-posted Discord alerts.
     try:
-        maybe_execute_live_trades(now_local, bets)
+        maybe_execute_live_trades(now_local, live_bets)
     except Exception:
         pass
     try:
@@ -13702,8 +13708,13 @@ def scan():
                 edge_tracking = track_edge_lifecycles(now_local, board_payload)
             except Exception:
                 edge_tracking = {"active_count": 0, "closed_count": 0}
-        paper_trade_posted_count = maybe_post_paper_trades(now_local, board_payload)
-        range_package_paper_logged_count = maybe_log_range_package_paper_trades(now_local, market_day="today")
+        # Paper trade alerts run on tomorrow's markets — forward-looking signal preview
+        try:
+            tomorrow_board_payload = build_odds_board(now_local, market_day="tomorrow")
+        except Exception:
+            tomorrow_board_payload = board_payload
+        paper_trade_posted_count = maybe_post_paper_trades(now_local, tomorrow_board_payload, live_board_payload=board_payload)
+        range_package_paper_logged_count = maybe_log_range_package_paper_trades(now_local, market_day="tomorrow")
         try:
             maybe_log_next_day_paper_trades(now_local)
         except Exception:

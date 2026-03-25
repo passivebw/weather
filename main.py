@@ -182,6 +182,17 @@ MANUAL_MARKET_BLOCK_ENABLED = env_bool("MANUAL_MARKET_BLOCK_ENABLED", default=Tr
 MANUAL_AUTO_SYNC_ENABLED = env_bool("MANUAL_AUTO_SYNC_ENABLED", default=True)
 MANUAL_AUTO_SYNC_INTERVAL_MINUTES = int(os.getenv("MANUAL_AUTO_SYNC_INTERVAL_MINUTES", "30"))
 LIVE_MAX_ORDERS_PER_SCAN = int(os.getenv("LIVE_MAX_ORDERS_PER_SCAN", "3"))
+# Cities paused from live trading due to poor historical win rate.
+# Comma-separated city names, e.g. "Houston,Los Angeles,Philadelphia"
+_LIVE_CITY_BLACKLIST_RAW = os.getenv("LIVE_CITY_BLACKLIST", "Houston,Los Angeles,Philadelphia,Oklahoma City")
+LIVE_CITY_BLACKLIST: set = {c.strip() for c in _LIVE_CITY_BLACKLIST_RAW.split(",") if c.strip()}
+
+# Trading time restrictions (local city time)
+# HIGH markets: don't trade before this hour (too much overnight uncertainty)
+LIVE_HIGH_TRADE_START_HOUR_LOCAL = float(os.getenv("LIVE_HIGH_TRADE_START_HOUR_LOCAL", "8.0"))
+# LOW markets: don't trade after this hour (low is likely already set by then)
+LIVE_LOW_TRADE_END_HOUR_LOCAL = float(os.getenv("LIVE_LOW_TRADE_END_HOUR_LOCAL", "10.0"))
+
 LIVE_MAX_ORDERS_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_DAY", "25"))
 LIVE_MAX_ORDERS_PER_MARKET_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_MARKET_PER_DAY", "1"))
 LIVE_MAX_ORDERS_PER_CITY_SIDE_PER_DAY = int(os.getenv("LIVE_MAX_ORDERS_PER_CITY_SIDE_PER_DAY", "2"))
@@ -1069,6 +1080,61 @@ def nws_get_afd_excerpt(lat: float, lon: float, temp_side: str = "high") -> Opti
     except Exception as e:
         logging.debug(f"AFD fetch failed for {lat},{lon}: {e}")
         return None
+
+def _afd_mu_adjustment(afd_text: str, temp_side: str) -> Tuple[float, str]:
+    """Parse AFD for warm/cold anomaly language and return (mu_delta_f, label).
+    Positive = boost mu upward (warmer than models), negative = push mu down.
+    """
+    if not afd_text:
+        return 0.0, ""
+    t = afd_text.lower()
+    adj = 0.0
+    signals = []
+    if temp_side == "high":
+        warm_phrases = [
+            "well above normal", "much above normal", "above normal", "above average",
+            "record high", "near record", "record warmth", "record temperatures",
+            "exceptionally warm", "unseasonably warm", "very warm", "heat dome",
+            "ridge", "strong ridge", "building ridge", "heat advisory",
+            "temperatures soaring", "soaring temperatures", "soar into",
+        ]
+        for phrase in warm_phrases:
+            if phrase in t:
+                adj += 2.0
+                signals.append(f"warm anomaly ({phrase})")
+                break
+        cold_phrases = [
+            "well below normal", "much below normal", "below normal", "below average",
+            "record cold", "near record cold", "unseasonably cold", "very cold",
+            "arctic air", "cold snap",
+        ]
+        for phrase in cold_phrases:
+            if phrase in t:
+                adj -= 2.0
+                signals.append(f"cold anomaly ({phrase})")
+                break
+    else:
+        warm_phrases = [
+            "well above normal", "above normal", "above average", "unseasonably warm",
+            "mild overnight", "warm overnight", "elevated overnight lows",
+        ]
+        for phrase in warm_phrases:
+            if phrase in t:
+                adj += 1.5
+                signals.append(f"warm anomaly ({phrase})")
+                break
+        cold_phrases = [
+            "well below normal", "below normal", "below average", "unseasonably cold",
+            "cold overnight", "hard freeze", "freeze", "arctic",
+        ]
+        for phrase in cold_phrases:
+            if phrase in t:
+                adj -= 1.5
+                signals.append(f"cold anomaly ({phrase})")
+                break
+    label = ", ".join(signals) if signals else ""
+    return adj, label
+
 
 def _afd_sigma_adjustment(afd_text: str, temp_side: str) -> Tuple[float, str]:
     """Parse AFD excerpt for meteorologist confidence signals.
@@ -2950,14 +3016,23 @@ def build_expert_consensus(
         except Exception:
             pass
 
-    # AFD-based sigma adjustment — professional meteorologist confidence signals
+    # AFD-based sigma and mu adjustments — professional meteorologist confidence signals
     afd_sigma_adj = 0.0
+    afd_mu_adj = 0.0
     afd_signal_label = ""
     afd_excerpt: Optional[str] = None
     try:
         afd_excerpt = nws_get_afd_excerpt(lat, lon, temp_side=side)
         if afd_excerpt:
             afd_sigma_adj, afd_signal_label = _afd_sigma_adjustment(afd_excerpt, side)
+            afd_mu_delta, afd_mu_label = _afd_mu_adjustment(afd_excerpt, side)
+            if afd_mu_delta != 0.0:
+                afd_mu_adj = afd_mu_delta
+                if afd_mu_label:
+                    afd_signal_label = (afd_signal_label + ", " + afd_mu_label).strip(", ")
+                logging.info(
+                    f"AFD mu adj {afd_mu_adj:+.1f}°F for {city} {side} ({afd_mu_label})"
+                )
             if afd_sigma_adj != 0.0:
                 logging.info(
                     f"AFD sigma adj {afd_sigma_adj:+.2f}°F for {city} {side} "
@@ -2965,6 +3040,8 @@ def build_expert_consensus(
                 )
     except Exception:
         pass
+    if afd_mu_adj != 0.0:
+        mu = mu + afd_mu_adj
 
     _sigma_raw = (
         CONSENSUS_BASE_SIGMA_F
@@ -6582,6 +6659,21 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             continue
         if city_k and per_city_side.get((city_k, side_k), 0) >= max(1, LIVE_MAX_ORDERS_PER_CITY_SIDE_PER_DAY):
             continue
+
+        # City blacklist — pause trading on historically poor performers
+        if city_k in LIVE_CITY_BLACKLIST:
+            continue
+
+        # Trading time restrictions based on local city time
+        if city_k:
+            city_tz = city_lst_tz(city_k)
+            city_hour_now = now_local.astimezone(city_tz).hour + now_local.astimezone(city_tz).minute / 60.0
+            if side_k == "high" and city_hour_now < LIVE_HIGH_TRADE_START_HOUR_LOCAL:
+                logging.info(f"[{city_k}] HIGH trade blocked: city hour {city_hour_now:.1f} < {LIVE_HIGH_TRADE_START_HOUR_LOCAL}")
+                continue
+            if side_k == "low" and city_hour_now > LIVE_LOW_TRADE_END_HOUR_LOCAL:
+                logging.info(f"[{city_k}] LOW trade blocked: city hour {city_hour_now:.1f} > {LIVE_LOW_TRADE_END_HOUR_LOCAL}")
+                continue
 
         bet_side = str(b.get("bet", "")).strip().upper()
         order_side, price_field = _bet_side_and_price_field(bet_side)

@@ -616,6 +616,9 @@ def _has_overlapping_city_side_exposure(
 ) -> bool:
     if not LIVE_CITY_SIDE_OVERLAP_GUARD_ENABLED:
         return False
+    # Range package legs are intentionally adjacent — skip overlap guard
+    if str(bet.get("trade_mode", "")).strip().lower() == "range_package":
+        return False
     date_iso = str(bet.get("date", "")).strip()
     city = str(bet.get("city", "")).strip()
     side = normalize_temp_side(str(bet.get("temp_type", "high")))

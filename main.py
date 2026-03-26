@@ -14044,8 +14044,8 @@ async def salmon_slack_webhook(request: Request):
         return {"ok": True, "note": "skipped subtype"}
 
     text = str(event.get("text", "")).strip()
-    signal = _parse_salmon_slack_message(text)
-    if not signal:
+    signals = _parse_salmon_slack_signals(text)
+    if not signals:
         return {"ok": True, "note": "no signal parsed"}
 
     now_local = datetime.now(tz=LOCAL_TZ)
@@ -14058,50 +14058,50 @@ async def salmon_slack_webhook(request: Request):
             logging.warning(f"[Salmon Slack] stale signal ({age_seconds:.0f}s old): {text}")
             return {"ok": True, "note": "signal too old", "age_seconds": age_seconds}
 
-    # Log the signal regardless of execution
-    try:
-        _append_salmon_position_log({
-            "ts_est": fmt_est(now_local),
-            "date": now_local.date().isoformat(),
-            "city": signal["city"],
-            "temp_side": "high",
-            "setup_type": f"slack_{signal['direction'].lower()}",
-            "confidence": "",
-            "tickers": "",
-            "contract_counts": "",
-            "entry_prices_cents": str(signal["entry_cents"] or ""),
-            "notes": f"auto-parsed: {signal['raw_text']}",
-        })
-    except Exception:
-        pass
-
-    # Alert Discord so you know a signal was received
-    try:
-        discord_send(
-            f"🐟 **Salmon Slack Signal**\n"
-            f"`{text}`\n"
-            f"Parsed → **{signal['city']}** {signal['direction']} {signal['bucket_raw']}"
-            + (f" @ {signal['entry_cents']}¢" if signal['entry_cents'] else "")
-            + ("\n⚡ Auto-execute: ON" if SLACK_AUTO_EXECUTE_ENABLED else "\n📋 Logging only (auto-execute off)")
-        )
-    except Exception:
-        pass
-
-    result = {
-        "ok": True,
-        "signal": signal,
-        "auto_execute": SLACK_AUTO_EXECUTE_ENABLED,
-    }
-
-    # Auto-execute if enabled (off by default until validated)
-    if SLACK_AUTO_EXECUTE_ENABLED and LIVE_TRADING_ENABLED:
+    executions = []
+    for signal in signals:
+        # Log the signal regardless of execution
         try:
-            exec_result = _execute_salmon_signal(signal, now_local)
-            result["execution"] = exec_result
-        except Exception as e:
-            result["execution_error"] = str(e)
+            _append_salmon_position_log({
+                "ts_est": fmt_est(now_local),
+                "date": now_local.date().isoformat(),
+                "city": signal["city"],
+                "temp_side": signal.get("temp_side", "high"),
+                "setup_type": f"slack_{signal['direction'].lower()}",
+                "confidence": "",
+                "tickers": "",
+                "contract_counts": "",
+                "entry_prices_cents": str(signal.get("entry_cents") or ""),
+                "notes": f"auto-parsed: {signal['raw_text'][:120]}",
+            })
+        except Exception:
+            pass
 
-    return result
+        # Alert Discord
+        try:
+            discord_send(
+                f"🐟 **Salmon Signal**\n"
+                f"**{signal['city']}** {signal['direction']} {signal['bucket_raw']}"
+                + (f" @ {signal['entry_cents']}¢" if signal.get('entry_cents') else "")
+                + (f" (max {signal['max_price_cents']}¢)" if signal.get('max_price_cents') else "")
+                + ("\n⚡ Auto-execute: ON" if SLACK_AUTO_EXECUTE_ENABLED else "\n📋 Logging only")
+            )
+        except Exception:
+            pass
+
+        if SLACK_AUTO_EXECUTE_ENABLED and LIVE_TRADING_ENABLED:
+            try:
+                exec_result = _execute_salmon_signal(signal, now_local)
+                executions.append(exec_result)
+            except Exception as e:
+                executions.append({"ok": False, "error": str(e)})
+
+    return {
+        "ok": True,
+        "signals": signals,
+        "auto_execute": SLACK_AUTO_EXECUTE_ENABLED,
+        "executions": executions,
+    }
 
 
 def _execute_salmon_signal(signal: dict, now_local: datetime) -> dict:
@@ -14165,7 +14165,17 @@ def _execute_salmon_signal(signal: dict, now_local: datetime) -> dict:
     if current_price is None:
         return {"ok": False, "reason": "no current price"}
 
-    # Price slippage check
+    # Hard max price ceiling — never pay more than Salmon's stated max
+    max_price_cents = signal.get("max_price_cents")
+    if max_price_cents is not None and current_price > max_price_cents:
+        return {
+            "ok": False,
+            "reason": "above max price",
+            "max_price_cents": max_price_cents,
+            "current_price": current_price,
+        }
+
+    # Price slippage check vs individual leg entry price
     if entry_cents is not None and SLACK_MAX_PRICE_SLIPPAGE_CENTS > 0:
         slippage = abs(current_price - entry_cents)
         if slippage > SLACK_MAX_PRICE_SLIPPAGE_CENTS:

@@ -327,6 +327,13 @@ CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER = float(os.getenv("CONSENSUS_SOURCE_RANG
 CONSENSUS_SOURCE_RANGE_FREE_F = float(os.getenv("CONSENSUS_SOURCE_RANGE_FREE_F", "1.0"))
 CONSENSUS_MIN_SIGMA_F = float(os.getenv("CONSENSUS_MIN_SIGMA_F", "2.0"))
 CONSENSUS_MAX_SOURCE_RANGE_TRADE_F = float(os.getenv("CONSENSUS_MAX_SOURCE_RANGE_TRADE_F", "7.0"))
+# Source agreement gate: require at least this many sources within the agreement band
+CONSENSUS_MIN_SOURCES_IN_BAND = int(os.getenv("CONSENSUS_MIN_SOURCES_IN_BAND", "3"))
+CONSENSUS_SOURCE_AGREEMENT_BAND_F = float(os.getenv("CONSENSUS_SOURCE_AGREEMENT_BAND_F", "4.0"))
+# Forecast trend gate: skip bets where forecast is moving against the bet direction
+FORECAST_TREND_GATE_F_PER_HR = float(os.getenv("FORECAST_TREND_GATE_F_PER_HR", "1.5"))
+# Range packages require tighter source agreement than single-bucket bets (directional YES bet needs higher confidence)
+RANGE_PACKAGE_MAX_SOURCE_RANGE_F = float(os.getenv("RANGE_PACKAGE_MAX_SOURCE_RANGE_F", "5.0"))
 CONSENSUS_NWS_OUTLIER_TRIGGER_F = float(os.getenv("CONSENSUS_NWS_OUTLIER_TRIGGER_F", "4.0"))
 CONSENSUS_NWS_OUTLIER_SIGMA_ADD_F = float(os.getenv("CONSENSUS_NWS_OUTLIER_SIGMA_ADD_F", "0.6"))
 BOUNDARY_PENALTY_ENABLED = env_bool("BOUNDARY_PENALTY_ENABLED", default=True)
@@ -2862,6 +2869,11 @@ _source_mae_cache_ts: float = 0.0
 _SOURCE_MAE_CACHE_TTL_S: float = 3600.0
 _SOURCE_MAE_MIN_SAMPLES: int = 5
 
+# Forecast trend tracking: rolling mu history per city/side for detecting warm/cold drift
+_mu_history: Dict[str, List[Tuple[float, float]]] = {}  # key=city|side -> [(ts, mu), ...]
+_MU_HISTORY_WINDOW_HOURS: float = 2.0
+_MU_HISTORY_MIN_SAMPLES: int = 3
+
 def _load_dynamic_source_weights() -> dict:
     """Return {source_name: weight} using weight = 1/(mae+0.5). Falls back to {} if insufficient history."""
     global _source_mae_cache, _source_mae_cache_ts
@@ -2999,6 +3011,14 @@ def build_expert_consensus(
     # reliably estimate mu. Return None so no edge is computed for this market.
     if source_range_f > CONSENSUS_MAX_SOURCE_RANGE_TRADE_F:
         return None
+    # Source agreement gate: require min N sources clustered within the agreement band.
+    # Prevents trading when a minority of sources agree and the rest are scattered.
+    _sorted_vals = sorted(source_only_values)
+    _median_val = _sorted_vals[len(_sorted_vals) // 2]
+    _half_band = CONSENSUS_SOURCE_AGREEMENT_BAND_F / 2.0
+    _source_agreement_count = sum(1 for v in source_only_values if abs(v - _median_val) <= _half_band)
+    if len(source_only_values) >= CONSENSUS_MIN_SOURCES_IN_BAND and _source_agreement_count < CONSENSUS_MIN_SOURCES_IN_BAND:
+        return None
     nws_outlier_f, nws_outlier_sigma_add = _consensus_nws_outlier_metrics(source_values)
 
     # Fetch meteorological conditions to adjust sigma for low temp markets
@@ -3062,6 +3082,21 @@ def build_expert_consensus(
         mu = mu - bias_f
         logging.info(f"[{city}] {side} bias correction: {bias_f:+.1f}°F → mu={mu:.1f}°F")
 
+    # Forecast trend: track rolling mu history to detect warming/cooling drift
+    _city_side_key = f"{city}|{side}"
+    _now_ts = now_local.timestamp()
+    _hist = _mu_history.setdefault(_city_side_key, [])
+    _hist.append((_now_ts, mu))
+    _cutoff_ts = _now_ts - _MU_HISTORY_WINDOW_HOURS * 3600.0
+    _hist[:] = [(t, v) for t, v in _hist if t >= _cutoff_ts]
+    _forecast_trend_f_per_hr = 0.0
+    if len(_hist) >= _MU_HISTORY_MIN_SAMPLES:
+        _t0, _v0 = _hist[0]
+        _t1, _v1 = _hist[-1]
+        _dt_hrs = (_t1 - _t0) / 3600.0
+        if _dt_hrs >= 0.05:  # need at least 3 minutes of history
+            _forecast_trend_f_per_hr = round((_v1 - _v0) / _dt_hrs, 2)
+
     return {
         "mu": mu,
         "sigma": sigma,
@@ -3072,9 +3107,12 @@ def build_expert_consensus(
         "conditions": conditions,
         "conditions_sigma_adj_f": conditions_sigma_adj,
         "afd_sigma_adj_f": afd_sigma_adj,
+        "afd_mu_adj_f": afd_mu_adj,
         "afd_signal_label": afd_signal_label,
         "bias_correction_f": bias_f,
         "spread_inflation_multiplier": _spread_inflation,
+        "source_agreement_count": _source_agreement_count,
+        "forecast_trend_f_per_hr": _forecast_trend_f_per_hr,
         "sources": [{"name": name, "high_f": temp, "weight": w} for name, temp, w in source_values],
     }
 
@@ -3501,6 +3539,9 @@ def build_city_bucket_comparison(
         "consensus_nws_outlier_f": float(consensus.get("nws_outlier_f", 0.0) or 0.0),
         "consensus_nws_outlier_sigma_add_f": float(consensus.get("nws_outlier_sigma_add_f", 0.0) or 0.0),
         "afd_signal_label": str(consensus.get("afd_signal_label", "") or ""),
+        "afd_mu_adj_f": float(consensus.get("afd_mu_adj_f", 0.0) or 0.0),
+        "forecast_trend_f_per_hr": float(consensus.get("forecast_trend_f_per_hr", 0.0) or 0.0),
+        "source_agreement_count": int(consensus.get("source_agreement_count", 0) or 0),
         "source_count": len(consensus.get("sources", [])),
         "city_hour_lst": city_hour_lst,
         "forecast_ceiling_f": forecast_ceiling_f,
@@ -4112,6 +4153,9 @@ def range_package_paper_state_path() -> str:
 def range_package_paper_trades_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "range_package_paper_trades.csv")
 
+def bet_calibration_log_path() -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, "bet_calibration_log.csv")
+
 def salmon_positions_path() -> str:
     return os.path.join(SNAPSHOT_LOG_DIR, "salmon_positions.csv")
 
@@ -4274,6 +4318,14 @@ RANGE_PACKAGE_PAPER_FIELDS = [
     "min_top_size", "max_spread_cents", "source_values_json",
 ]
 
+BET_CALIBRATION_FIELDS = [
+    "ts_est", "date", "city", "temp_side", "ticker", "bet_direction",
+    "model_yes_prob_pct", "market_implied_prob_pct", "net_edge_pct",
+    "source_range_f", "source_agreement_count", "afd_mu_adj_f",
+    "forecast_trend_f_per_hr", "afd_signal_label", "trade_mode",
+    "settlement_result", "actual_win",
+]
+
 SALMON_POSITION_FIELDS = [
     "ts_est", "date", "city", "temp_side", "setup_type", "confidence",
     "tickers", "contract_counts", "entry_prices_cents", "notes",
@@ -4349,6 +4401,36 @@ def _append_range_package_paper_log(row: dict) -> None:
     with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=RANGE_PACKAGE_PAPER_FIELDS)
         w.writerow({k: row.get(k, "") for k in RANGE_PACKAGE_PAPER_FIELDS})
+
+def ensure_bet_calibration_header() -> None:
+    _ensure_csv_header_contains(bet_calibration_log_path(), BET_CALIBRATION_FIELDS)
+
+def _append_bet_calibration_log(bet: dict, trade_mode: str = "normal") -> None:
+    """Log a qualifying bet prediction for later calibration analysis."""
+    ensure_bet_calibration_header()
+    row = {
+        "ts_est": fmt_est(datetime.now(TZ_EST)),
+        "date": bet.get("date", ""),
+        "city": bet.get("city", ""),
+        "temp_side": bet.get("temp_type", ""),
+        "ticker": bet.get("ticker", ""),
+        "bet_direction": bet.get("bet", ""),
+        "model_yes_prob_pct": round(float(bet.get("model_yes_prob_pct", 0.0)), 2),
+        "market_implied_prob_pct": round(float(bet.get("market_implied_win_prob_pct", 0.0)), 2),
+        "net_edge_pct": round(float(bet.get("net_edge_pct", 0.0)), 2),
+        "source_range_f": round(float(bet.get("source_range_f", 0.0)), 2),
+        "source_agreement_count": int(bet.get("source_agreement_count", 0)),
+        "afd_mu_adj_f": round(float(bet.get("afd_mu_adj_f", 0.0)), 2),
+        "forecast_trend_f_per_hr": round(float(bet.get("forecast_trend_f_per_hr", 0.0)), 2),
+        "afd_signal_label": bet.get("afd_signal_label", ""),
+        "trade_mode": trade_mode,
+        "settlement_result": "",
+        "actual_win": "",
+    }
+    path = bet_calibration_log_path()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=BET_CALIBRATION_FIELDS)
+        w.writerow({k: row.get(k, "") for k in BET_CALIBRATION_FIELDS})
 
 def ensure_salmon_positions_header() -> None:
     _ensure_csv_header_contains(salmon_positions_path(), SALMON_POSITION_FIELDS)
@@ -10556,6 +10638,25 @@ def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_ed
                         "min_buffer_f": CONSENSUS_MIN_BUFFER_F,
                     })
                     continue
+        # Forecast trend gate: skip if forecast is moving strongly against the bet direction.
+        # Cooling fast (< -1.5°F/hr) while buying YES = chasing a falling target.
+        # Warming fast (> +1.5°F/hr) while buying NO = shorting a rising target.
+        if not locked_allowed:
+            _trend = float(r.get("forecast_trend_f_per_hr", 0.0) or 0.0)
+            _bet_dir = str(r.get("best_side", ""))
+            if _trend <= -FORECAST_TREND_GATE_F_PER_HR and _bet_dir == "BUY YES":
+                excluded.append({"city": r.get("city"), "temp_type": r.get("temp_side"),
+                    "date": r.get("market_date_selected"), "line": r.get("bucket_label"),
+                    "ticker": r.get("ticker"), "reason": "cooling_trend",
+                    "net_edge_pct": round(net_edge_pct, 2), "trend_f_per_hr": round(_trend, 2)})
+                continue
+            if _trend >= FORECAST_TREND_GATE_F_PER_HR and _bet_dir == "BUY NO":
+                excluded.append({"city": r.get("city"), "temp_type": r.get("temp_side"),
+                    "date": r.get("market_date_selected"), "line": r.get("bucket_label"),
+                    "ticker": r.get("ticker"), "reason": "warming_trend",
+                    "net_edge_pct": round(net_edge_pct, 2), "trend_f_per_hr": round(_trend, 2)})
+                continue
+
         suggested_units = suggested_units_from_net_edge(net_edge_pct)
         if locked_allowed:
             suggested_units = min(float(suggested_units), float(LIVE_LOCKED_OUTCOME_MAX_UNITS))
@@ -10580,6 +10681,9 @@ def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_ed
             "top_size": r.get("top_size"),
             "source_count": r.get("source_count", 0),
             "source_range_f": round(float(r.get("consensus_source_range_f") or 0.0), 2),
+            "source_agreement_count": int(r.get("source_agreement_count", 0) or 0),
+            "forecast_trend_f_per_hr": round(float(r.get("forecast_trend_f_per_hr", 0.0) or 0.0), 2),
+            "afd_mu_adj_f": round(float(r.get("afd_mu_adj_f", 0.0) or 0.0), 2),
             "afd_signal_label": r.get("afd_signal_label", ""),
             "nws_obs_time_est": r.get("nws_obs_time_est"),
             "nws_obs_age_minutes": r.get("nws_obs_age_minutes"),
@@ -10596,6 +10700,12 @@ def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_ed
             "best_structure_kind": r.get("best_structure_kind"),
             "source_values_key": json.dumps((r.get("source_values_map") or {}), sort_keys=True, separators=(",", ":")),
         })
+    # Log each qualifying bet for calibration tracking (predicted prob vs eventual outcome)
+    for b in executable:
+        try:
+            _append_bet_calibration_log(b, trade_mode=str(b.get("trade_mode", "normal")))
+        except Exception:
+            pass
     executable.sort(key=lambda x: x.get("net_edge_pct", -1e9), reverse=True)
     return executable[:max_rows], excluded
 
@@ -11319,6 +11429,16 @@ def build_range_package_paper_candidates(now_local: datetime, market_day: str = 
                 continue
             buckets.sort(key=lambda r: (float(r.get("lo", 0.0)), float(r.get("hi", 0.0))))
             consensus_mu = _to_float(comparison.get("consensus_mu_f"))
+            # AFD direction gate: don't place BUY YES range packages when AFD signals cold.
+            # If AFD mu adjustment is negative (cold language), the professional forecast
+            # contradicts a warm bet — skip this city/side entirely.
+            _afd_mu_adj = float(comparison.get("afd_mu_adj_f", 0.0) or 0.0)
+            if _afd_mu_adj < -1.0:
+                continue
+            # Source spread gate: range packages need tighter source agreement than single bets
+            _pkg_source_range = float(comparison.get("consensus_source_range_f", 0.0) or 0.0)
+            if _pkg_source_range > RANGE_PACKAGE_MAX_SOURCE_RANGE_F:
+                continue
             city_packages: List[dict] = []
             for idx in range(len(buckets) - 1):
                 a = buckets[idx]
@@ -12998,6 +13118,45 @@ def analytics_loss_postmortems(
 ):
     return build_loss_postmortems(start=start, end=end)
 
+
+@app.get("/analytics/calibration")
+def analytics_calibration():
+    """Return per-city bet calibration: predicted edge vs actual win rate, grouped by edge bucket."""
+    path = bet_calibration_log_path()
+    if not os.path.exists(path):
+        return {"ok": False, "note": "No calibration data yet.", "path": path}
+    _, rows = _read_csv_rows_with_header(path)
+    settled = [r for r in rows if r.get("actual_win") in ("true", "false", "True", "False", "1", "0")]
+    if not settled:
+        return {"ok": True, "note": "No settled bets yet — outcomes populate after market settlement.", "total_logged": len(rows)}
+    from collections import defaultdict as _dd
+    buckets = _dd(lambda: {"wins": 0, "total": 0, "edges": []})
+    city_stats = _dd(lambda: {"wins": 0, "total": 0})
+    for r in settled:
+        edge = _to_float(r.get("net_edge_pct")) or 0.0
+        won = str(r.get("actual_win", "")).lower() in ("true", "1")
+        city = r.get("city", "unknown")
+        b = int(edge // 10) * 10
+        bucket_key = f"{b}-{b+10}%"
+        buckets[bucket_key]["wins"] += int(won)
+        buckets[bucket_key]["total"] += 1
+        buckets[bucket_key]["edges"].append(edge)
+        city_stats[city]["wins"] += int(won)
+        city_stats[city]["total"] += 1
+    edge_buckets = []
+    for k in sorted(buckets.keys()):
+        v = buckets[k]
+        avg_edge = round(sum(v["edges"]) / len(v["edges"]), 1) if v["edges"] else 0.0
+        win_rate = round(v["wins"] / v["total"] * 100, 1) if v["total"] else 0.0
+        edge_buckets.append({"edge_bucket": k, "count": v["total"], "wins": v["wins"],
+                              "win_rate_pct": win_rate, "avg_edge_pct": avg_edge})
+    city_rows = []
+    for city, v in sorted(city_stats.items()):
+        win_rate = round(v["wins"] / v["total"] * 100, 1) if v["total"] else 0.0
+        city_rows.append({"city": city, "total": v["total"], "wins": v["wins"], "win_rate_pct": win_rate})
+    city_rows.sort(key=lambda x: x["total"], reverse=True)
+    return {"ok": True, "total_logged": len(rows), "total_settled": len(settled),
+            "edge_buckets": edge_buckets, "city_stats": city_rows}
 
 @app.get("/analytics/source-accuracy")
 def analytics_source_accuracy():

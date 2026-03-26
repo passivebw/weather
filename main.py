@@ -239,6 +239,16 @@ LIVE_STABILITY_GATE_EDGE_MIN_PCT = float(os.getenv("LIVE_STABILITY_GATE_EDGE_MIN
 LIVE_STABILITY_GATE_EDGE_MAX_PCT = float(os.getenv("LIVE_STABILITY_GATE_EDGE_MAX_PCT", "30.0"))
 LIVE_STABILITY_GATE_MIN_SCANS_MID = int(os.getenv("LIVE_STABILITY_GATE_MIN_SCANS_MID", "2"))
 LIVE_STABILITY_REQUIRE_CHANGE_MID = env_bool("LIVE_STABILITY_REQUIRE_CHANGE_MID", default=True)
+# Universal scan confirmation: ALL trades require at least this many scans before execution.
+# Prevents one-off data glitches from firing a trade (Phoenix YES at 10¢ example).
+LIVE_MIN_SCANS_ALL = int(os.getenv("LIVE_MIN_SCANS_ALL", "2"))
+# Model-vs-market sanity: if model probability > this multiple of market price, data is suspect.
+# e.g. model=50%, market=10% → ratio=5x → block. Real edges don't look like this.
+LIVE_MODEL_MARKET_MAX_RATIO = float(os.getenv("LIVE_MODEL_MARKET_MAX_RATIO", "4.0"))
+# Edge consistency: block if edge dropped more than this many pct points between scan 1 and scan 2.
+LIVE_EDGE_CONSISTENCY_MAX_DROP_PCT = float(os.getenv("LIVE_EDGE_CONSISTENCY_MAX_DROP_PCT", "15.0"))
+# Hard cap: claimed edge above this is almost certainly a data/model error, not a real opportunity.
+LIVE_MAX_BELIEVABLE_EDGE_PCT = float(os.getenv("LIVE_MAX_BELIEVABLE_EDGE_PCT", "60.0"))
 LIVE_EARLY_SESSION_ENABLED = env_bool("LIVE_EARLY_SESSION_ENABLED", default=True)
 LIVE_EARLY_SESSION_START_HOUR_ET = int(os.getenv("LIVE_EARLY_SESSION_START_HOUR_ET", "10"))
 LIVE_EARLY_SESSION_END_HOUR_ET = int(os.getenv("LIVE_EARLY_SESSION_END_HOUR_ET", "16"))
@@ -5375,6 +5385,7 @@ def track_edge_lifecycles(now_local: datetime, board_payload: dict) -> dict:
                 "first_seen_est": fmt_est(now_local),
                 "last_seen_est": fmt_est(now_local),
                 "scan_count": 1,
+                "first_edge_pct": edge,
                 "max_edge_pct": edge,
                 "last_edge_pct": edge,
                 "first_market_key": market_key,
@@ -6817,6 +6828,38 @@ def maybe_execute_live_trades(now_local: datetime, bets: List[dict]) -> int:
             edge_pct = float(b.get("net_edge_pct", 0.0))
             sig_entry = (edge_entries.get(sig, {}) or {})
             sig_scans = int(sig_entry.get("scan_count", 1))
+
+            # ── Sanity gate 1: hard edge cap ──────────────────────────────
+            # Edges above 60% are almost always a data/model error, not real.
+            if edge_pct > LIVE_MAX_BELIEVABLE_EDGE_PCT:
+                logging.warning(f"[{city_k}] edge cap block: edge={edge_pct:.1f}% > {LIVE_MAX_BELIEVABLE_EDGE_PCT}% max believable")
+                continue
+
+            # ── Sanity gate 2: model-vs-market ratio ──────────────────────
+            # If our model probability is >4x the market price the signal is
+            # likely a data glitch (e.g. model=50%, market=10% → 5x ratio).
+            if LIVE_MODEL_MARKET_MAX_RATIO > 0:
+                _model_prob = float(b.get("model_yes_prob_pct", 0.0))
+                _mkt_prob   = float(b.get("market_implied_win_prob_pct", 0.0))
+                if _mkt_prob > 0 and (_model_prob / _mkt_prob) > LIVE_MODEL_MARKET_MAX_RATIO:
+                    logging.warning(f"[{city_k}] model/market ratio block: model={_model_prob:.1f}% market={_mkt_prob:.1f}% ratio={_model_prob/_mkt_prob:.1f}x")
+                    continue
+
+            # ── Sanity gate 3: universal scan minimum ─────────────────────
+            # Every trade must be seen in at least LIVE_MIN_SCANS_ALL scans
+            # before execution — prevents one-scan data glitches from firing.
+            if sig_scans < max(1, LIVE_MIN_SCANS_ALL):
+                continue
+
+            # ── Sanity gate 4: edge consistency between scans ─────────────
+            # If edge dropped more than 15 pct points since first seen, the
+            # signal is unstable — data is moving around, don't trade it.
+            if LIVE_EDGE_CONSISTENCY_MAX_DROP_PCT > 0 and sig_scans >= 2:
+                _first_edge = float(sig_entry.get("first_edge_pct", edge_pct))
+                if (_first_edge - edge_pct) > LIVE_EDGE_CONSISTENCY_MAX_DROP_PCT:
+                    logging.info(f"[{city_k}] edge consistency block: first={_first_edge:.1f}% now={edge_pct:.1f}% drop={_first_edge - edge_pct:.1f}pts")
+                    continue
+
             if early_session and (
                 (not LIVE_EARLY_SESSION_APPLY_TO_HIGH_ONLY) or (side_k == "high")
             ):

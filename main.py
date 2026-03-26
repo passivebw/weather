@@ -14146,102 +14146,62 @@ def _execute_salmon_signals_group(signals: List[dict], now_local: datetime) -> L
 
 def _resolve_salmon_price(signal: dict, now_local: datetime) -> Optional[float]:
     """Fetch the current market price for a signal without placing an order. Returns None on failure."""
-    city = signal["city"]
-    direction = signal["direction"]
-    bucket_raw = signal["bucket_raw"]
-    temp_side = signal.get("temp_side", "high")
-
-    grouped = refresh_markets_cache()
-    city_markets = grouped.get(city, [])
-    if not city_markets:
-        return None
-
-    selected_markets, _, _ = select_markets_for_day(
-        [m for m in city_markets if normalize_temp_side(getattr(m, "temp_side", "high")) == temp_side],
-        now_local, "today", city=city,
-    )
-    if not selected_markets:
-        return None
-
-    lo_target = hi_target = None
-    range_match = re.match(r"(\d+)-(\d+)", bucket_raw)
-    if range_match:
-        lo_target = int(range_match.group(1))
-        hi_target = int(range_match.group(2))
-
-    best_market = None
-    for m in selected_markets:
-        if lo_target is not None:
-            mlo = getattr(m, "lo", None)
-            mhi = getattr(m, "hi", None)
-            if mlo is not None and mhi is not None:
-                if abs(float(mlo) - lo_target) <= 1 and abs(float(mhi) - hi_target) <= 1:
-                    best_market = m
-                    break
-    if not best_market:
-        return None
-
-    ticker = getattr(best_market, "ticker", "")
+    ticker = _find_salmon_ticker(signal, now_local)
     if not ticker:
         return None
-
     try:
         ob = kalshi_get_orderbook(ticker)
         yes_bid, yes_ask, _ = best_bid_and_ask_from_orderbook(ob)
     except Exception:
         return None
-
-    if direction == "YES":
+    if signal["direction"] == "YES":
         return yes_ask
     else:
         return (100 - yes_bid) if yes_bid is not None else None
 
 
-def _execute_salmon_signal(signal: dict, now_local: datetime) -> dict:
-    """Find the matching Kalshi ticker for a Salmon signal and submit an order."""
+def _find_salmon_ticker(signal: dict, now_local: datetime) -> Optional[str]:
+    """Find the Kalshi ticker matching a Salmon signal's city/bucket. Tries today then tomorrow."""
     city = signal["city"]
-    direction = signal["direction"]   # "YES" or "NO"
-    bucket_raw = signal["bucket_raw"] # e.g. "96-99", "84-85"
-    entry_cents = signal.get("entry_cents")
+    bucket_raw = signal["bucket_raw"]
+    temp_side = signal.get("temp_side", "high")
 
-    grouped = refresh_markets_cache()
-    city_markets = grouped.get(city, [])
-    if not city_markets:
-        return {"ok": False, "reason": "city not found", "city": city}
-
-    selected_markets, selected_date, _ = select_markets_for_day(
-        [m for m in city_markets if normalize_temp_side(getattr(m, "temp_side", "high")) == "high"],
-        now_local, "today", city=city,
-    )
-    if not selected_markets:
-        return {"ok": False, "reason": "no markets for today"}
-
-    # Match bucket by parsing the range in bucket_raw vs market bucket labels
     lo_target = hi_target = None
     range_match = re.match(r"(\d+)-(\d+)", bucket_raw)
     if range_match:
         lo_target = int(range_match.group(1))
         hi_target = int(range_match.group(2))
+    if lo_target is None:
+        return None
 
-    best_market = None
-    for m in selected_markets:
-        label = str(getattr(m, "bucket_label", "") or "").lower()
-        if lo_target is not None:
-            mlo = getattr(m, "lo", None)
-            mhi = getattr(m, "hi", None)
-            if mlo is not None and mhi is not None:
-                if abs(float(mlo) - lo_target) <= 1 and abs(float(mhi) - hi_target) <= 1:
-                    best_market = m
-                    break
-        if "or above" in label or "or below" in label:
-            pass  # handle terminal buckets if needed
+    grouped = refresh_markets_cache()
+    city_markets = [m for m in grouped.get(city, [])
+                    if normalize_temp_side(getattr(m, "temp_side", "high")) == temp_side]
+    if not city_markets:
+        return None
 
-    if not best_market:
-        return {"ok": False, "reason": "no matching bucket", "bucket_raw": bucket_raw}
+    # Try today first, then tomorrow as fallback
+    for day in ("today", "tomorrow"):
+        selected, _, _ = select_markets_for_day(city_markets, now_local, day, city=city)
+        for m in selected:
+            parsed = parse_bucket_from_title(getattr(m, "title", ""))
+            if parsed is None:
+                continue
+            mlo, mhi = parsed
+            if abs(mlo - lo_target) <= 1 and abs(mhi - hi_target) <= 1:
+                return getattr(m, "ticker", "") or None
+    return None
 
-    ticker = getattr(best_market, "ticker", "")
+
+def _execute_salmon_signal(signal: dict, now_local: datetime) -> dict:
+    """Find the matching Kalshi ticker for a Salmon signal and submit an order."""
+    direction = signal["direction"]   # "YES" or "NO"
+    bucket_raw = signal["bucket_raw"]
+    entry_cents = signal.get("entry_cents")
+
+    ticker = _find_salmon_ticker(signal, now_local)
     if not ticker:
-        return {"ok": False, "reason": "no ticker"}
+        return {"ok": False, "reason": "no matching bucket", "bucket_raw": bucket_raw, "city": signal["city"]}
 
     # Get current orderbook price
     try:

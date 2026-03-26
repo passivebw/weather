@@ -4405,8 +4405,22 @@ def _append_range_package_paper_log(row: dict) -> None:
 def ensure_bet_calibration_header() -> None:
     _ensure_csv_header_contains(bet_calibration_log_path(), BET_CALIBRATION_FIELDS)
 
+_calibration_logged_today: set = set()
+_calibration_logged_date: str = ""
+
 def _append_bet_calibration_log(bet: dict, trade_mode: str = "normal") -> None:
-    """Log a qualifying bet prediction for later calibration analysis."""
+    """Log a qualifying bet prediction once per ticker per day for calibration analysis."""
+    global _calibration_logged_today, _calibration_logged_date
+    today = datetime.now(TZ_EST).date().isoformat()
+    if _calibration_logged_date != today:
+        _calibration_logged_today = set()
+        _calibration_logged_date = today
+    ticker = str(bet.get("ticker", ""))
+    bet_dir = str(bet.get("bet", ""))
+    dedup_key = f"{ticker}|{bet_dir}"
+    if dedup_key in _calibration_logged_today:
+        return
+    _calibration_logged_today.add(dedup_key)
     ensure_bet_calibration_header()
     row = {
         "ts_est": fmt_est(datetime.now(TZ_EST)),

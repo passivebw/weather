@@ -11539,6 +11539,415 @@ def maybe_log_range_package_paper_trades(now_local: datetime, market_day: str = 
     return new_rows
 
 
+# ── Multi-profile paper trading ────────────────────────────────────────────────
+# Five concurrent paper portfolios with different risk/quality tolerances.
+# Each logs to its own CSV so we can compare win rates and edge accuracy over time.
+
+@dataclass
+class PaperTradingProfile:
+    name: str           # CSV slug: "conservative", "standard", etc.
+    label: str          # Human-readable label for Discord/analytics
+    # Single-bucket bet filters
+    min_edge_pct: float
+    min_sources: int                   # Min sources in agreement band (0 = off)
+    source_band_f: float               # Agreement band width °F
+    min_buffer_f: float                # Min µ-distance from bucket boundary
+    trend_gate_f_per_hr: float         # Block if trend > this against bet direction (0=off)
+    afd_min_adj_f: float               # Block if AFD µ adj < this (-99 = off)
+    max_source_range_f: float          # Block if source spread > this (0 = off)
+    allowed_bet_types: List[str]       # ["BUY YES"], ["BUY NO"], or both
+    contrarian_min_mkt_prob_pct: float # For NO-only: require market prob > this (0=off)
+    # Range package filters
+    pkg_enabled: bool
+    pkg_min_edge_pct: float
+    pkg_min_combined_prob_pct: float
+    pkg_max_source_range_f: float
+    pkg_afd_min_adj_f: float
+    pkg_allow_non_adjacent: bool
+
+
+PAPER_PROFILES: List[PaperTradingProfile] = [
+    # 1. Conservative — high edge bar, tight source agreement, AFD must confirm warm
+    PaperTradingProfile(
+        name="conservative",
+        label="Conservative",
+        min_edge_pct=20.0,
+        min_sources=4,
+        source_band_f=3.0,
+        min_buffer_f=4.0,
+        trend_gate_f_per_hr=1.0,
+        afd_min_adj_f=0.0,
+        max_source_range_f=4.0,
+        allowed_bet_types=["BUY YES", "BUY NO"],
+        contrarian_min_mkt_prob_pct=0.0,
+        pkg_enabled=True,
+        pkg_min_edge_pct=5.0,
+        pkg_min_combined_prob_pct=52.0,
+        pkg_max_source_range_f=4.0,
+        pkg_afd_min_adj_f=0.0,
+        pkg_allow_non_adjacent=False,
+    ),
+    # 2. Standard — mirrors current live production settings (control group)
+    PaperTradingProfile(
+        name="standard",
+        label="Standard",
+        min_edge_pct=POLICY_MIN_NET_EDGE_PCT,
+        min_sources=CONSENSUS_MIN_SOURCES_IN_BAND,
+        source_band_f=CONSENSUS_SOURCE_AGREEMENT_BAND_F,
+        min_buffer_f=CONSENSUS_MIN_BUFFER_F,
+        trend_gate_f_per_hr=FORECAST_TREND_GATE_F_PER_HR,
+        afd_min_adj_f=-1.0,
+        max_source_range_f=RANGE_PACKAGE_MAX_SOURCE_RANGE_F,
+        allowed_bet_types=["BUY YES", "BUY NO"],
+        contrarian_min_mkt_prob_pct=0.0,
+        pkg_enabled=True,
+        pkg_min_edge_pct=float(RANGE_PACKAGE_PAPER_MIN_EDGE_PCT),
+        pkg_min_combined_prob_pct=float(RANGE_PACKAGE_MIN_COMBINED_PROB_PCT),
+        pkg_max_source_range_f=RANGE_PACKAGE_MAX_SOURCE_RANGE_F,
+        pkg_afd_min_adj_f=-1.0,
+        pkg_allow_non_adjacent=False,
+    ),
+    # 3. Aggressive — low edge bar, loose gates, learns what we're leaving on the table
+    PaperTradingProfile(
+        name="aggressive",
+        label="Aggressive",
+        min_edge_pct=10.0,
+        min_sources=2,
+        source_band_f=6.0,
+        min_buffer_f=1.5,
+        trend_gate_f_per_hr=3.0,
+        afd_min_adj_f=-99.0,
+        max_source_range_f=8.0,
+        allowed_bet_types=["BUY YES", "BUY NO"],
+        contrarian_min_mkt_prob_pct=0.0,
+        pkg_enabled=True,
+        pkg_min_edge_pct=1.0,
+        pkg_min_combined_prob_pct=35.0,
+        pkg_max_source_range_f=8.0,
+        pkg_afd_min_adj_f=-99.0,
+        pkg_allow_non_adjacent=True,
+    ),
+    # 4. Salmon-mimic — tight source agreement, AFD confirmed, skewed toward YES like Salmon
+    PaperTradingProfile(
+        name="salmon",
+        label="Salmon-Mimic",
+        min_edge_pct=15.0,
+        min_sources=4,
+        source_band_f=2.0,
+        min_buffer_f=3.0,
+        trend_gate_f_per_hr=1.5,
+        afd_min_adj_f=0.0,
+        max_source_range_f=4.0,
+        allowed_bet_types=["BUY YES"],
+        contrarian_min_mkt_prob_pct=0.0,
+        pkg_enabled=True,
+        pkg_min_edge_pct=3.0,
+        pkg_min_combined_prob_pct=48.0,
+        pkg_max_source_range_f=4.0,
+        pkg_afd_min_adj_f=0.0,
+        pkg_allow_non_adjacent=True,
+    ),
+    # 5. Contrarian-NO — hunts buckets the market is overpricing: YES market prob > 60%, model says NO
+    PaperTradingProfile(
+        name="contrarian_no",
+        label="Contrarian-NO",
+        min_edge_pct=12.0,
+        min_sources=3,
+        source_band_f=5.0,
+        min_buffer_f=2.0,
+        trend_gate_f_per_hr=0.0,
+        afd_min_adj_f=-99.0,
+        max_source_range_f=6.0,
+        allowed_bet_types=["BUY NO"],
+        contrarian_min_mkt_prob_pct=60.0,
+        pkg_enabled=False,
+        pkg_min_edge_pct=0.0,
+        pkg_min_combined_prob_pct=0.0,
+        pkg_max_source_range_f=0.0,
+        pkg_afd_min_adj_f=-99.0,
+        pkg_allow_non_adjacent=False,
+    ),
+]
+
+MULTI_PROFILE_PAPER_FIELDS = [
+    "ts_est", "profile", "date", "city", "temp_type", "ticker", "bet", "line",
+    "net_edge_pct", "model_yes_prob_pct", "market_implied_win_prob_pct",
+    "source_count", "source_range_f", "source_agreement_count",
+    "forecast_trend_f_per_hr", "afd_mu_adj_f", "afd_signal_label",
+]
+
+
+def multi_profile_paper_log_path(profile_name: str) -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, f"multi_profile_{profile_name}.csv")
+
+
+def _append_multi_profile_paper_log(row: dict, profile_name: str) -> None:
+    path = multi_profile_paper_log_path(profile_name)
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    _ensure_csv_header_contains(path, MULTI_PROFILE_PAPER_FIELDS)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=MULTI_PROFILE_PAPER_FIELDS)
+        w.writerow({k: row.get(k, "") for k in MULTI_PROFILE_PAPER_FIELDS})
+
+
+def build_profile_bets_from_board_payload(board_payload: dict, profile: PaperTradingProfile) -> List[dict]:
+    """Apply profile-specific gates to the board and return qualifying bets."""
+    executable: List[dict] = []
+    for r in board_payload.get("rows", []):
+        net_edge_pct = float(r.get("net_calibrated_edge_pct", r.get("edge_pct", 0.0)))
+        best_side = str(r.get("best_side", ""))
+
+        if net_edge_pct < profile.min_edge_pct:
+            continue
+        if best_side not in profile.allowed_bet_types:
+            continue
+
+        # Contrarian-NO: market must be overpricing YES (high win prob for YES)
+        if profile.contrarian_min_mkt_prob_pct > 0 and best_side == "BUY NO":
+            mkt_yes_prob = float(r.get("market_win_prob_pct", 0.0))
+            if mkt_yes_prob < profile.contrarian_min_mkt_prob_pct:
+                continue
+
+        # Buffer gate
+        if profile.min_buffer_f > 0:
+            mu = float(r.get("consensus_mu_f") or 0.0)
+            lo = r.get("best_lo")
+            hi = r.get("best_hi")
+            if lo is not None and hi is not None:
+                buf = _bucket_boundary_distance_f(mu, float(lo), float(hi))
+                if buf < profile.min_buffer_f:
+                    continue
+
+        # Source agreement gate
+        if profile.min_sources > 0:
+            agree_count = int(r.get("source_agreement_count", 0) or 0)
+            source_count = int(r.get("source_count", 0) or 0)
+            if source_count >= profile.min_sources and agree_count < profile.min_sources:
+                continue
+
+        # Source range gate
+        if profile.max_source_range_f > 0:
+            src_range = float(r.get("consensus_source_range_f", 0.0) or 0.0)
+            if src_range > profile.max_source_range_f:
+                continue
+
+        # Trend gate
+        if profile.trend_gate_f_per_hr > 0:
+            trend = float(r.get("forecast_trend_f_per_hr", 0.0) or 0.0)
+            if trend <= -profile.trend_gate_f_per_hr and best_side == "BUY YES":
+                continue
+            if trend >= profile.trend_gate_f_per_hr and best_side == "BUY NO":
+                continue
+
+        # AFD gate
+        if profile.afd_min_adj_f > -90:
+            afd = float(r.get("afd_mu_adj_f", 0.0) or 0.0)
+            if afd < profile.afd_min_adj_f:
+                continue
+
+        executable.append({
+            "profile": profile.name,
+            "ts_est": "",
+            "date": r.get("market_date_selected"),
+            "city": r.get("city"),
+            "temp_type": r.get("temp_side"),
+            "bet": best_side,
+            "line": r.get("bucket_label"),
+            "ticker": r.get("ticker"),
+            "net_edge_pct": round(net_edge_pct, 2),
+            "model_yes_prob_pct": round(float(r.get("model_yes_prob_pct", 0.0)), 2),
+            "market_implied_win_prob_pct": round(float(r.get("market_win_prob_pct", 0.0)), 2),
+            "source_count": int(r.get("source_count", 0) or 0),
+            "source_range_f": round(float(r.get("consensus_source_range_f") or 0.0), 2),
+            "source_agreement_count": int(r.get("source_agreement_count", 0) or 0),
+            "forecast_trend_f_per_hr": round(float(r.get("forecast_trend_f_per_hr", 0.0) or 0.0), 2),
+            "afd_mu_adj_f": round(float(r.get("afd_mu_adj_f", 0.0) or 0.0), 2),
+            "afd_signal_label": r.get("afd_signal_label", ""),
+        })
+    executable.sort(key=lambda x: x.get("net_edge_pct", -1e9), reverse=True)
+    return executable
+
+
+def build_range_package_profile_candidates(now_local: datetime, profile: PaperTradingProfile) -> List[dict]:
+    """Range package candidates filtered by profile-specific gates."""
+    if not profile.pkg_enabled:
+        return []
+    if int(RANGE_PACKAGE_PAPER_BUCKET_COUNT) != 2:
+        return []
+    grouped = refresh_markets_cache()
+    out: List[dict] = []
+    for city in sorted(CITY_CONFIG.keys()):
+        for temp_side in ("high", "low"):
+            if temp_side == "low" and not LOW_SIGNALS_ENABLED:
+                continue
+            if True:  # always apply 8 AM gate for today's packages
+                try:
+                    city_tz = city_lst_tz(city)
+                    city_hour_now = now_local.astimezone(city_tz).hour + now_local.astimezone(city_tz).minute / 60.0
+                    if city_hour_now < RANGE_PACKAGE_START_HOUR_LOCAL:
+                        continue
+                except Exception:
+                    pass
+            city_markets = [m for m in grouped.get(city, []) if normalize_temp_side(getattr(m, "temp_side", "high")) == temp_side]
+            if not city_markets:
+                continue
+            selected_markets, selected_date, _ = select_markets_for_day(city_markets, now_local, "today", city=city)
+            if not selected_markets:
+                continue
+            comparison = build_city_bucket_comparison(city, selected_markets, now_local, temp_side=temp_side)
+            if not comparison:
+                continue
+            buckets = list(comparison.get("buckets", []) or [])
+            if len(buckets) < 2:
+                continue
+            buckets.sort(key=lambda r: (float(r.get("lo", 0.0)), float(r.get("hi", 0.0))))
+            consensus_mu = _to_float(comparison.get("consensus_mu_f"))
+            # AFD gate
+            if profile.pkg_afd_min_adj_f > -90:
+                _afd_mu_adj = float(comparison.get("afd_mu_adj_f", 0.0) or 0.0)
+                if _afd_mu_adj < profile.pkg_afd_min_adj_f:
+                    continue
+            # Source spread gate
+            if profile.pkg_max_source_range_f > 0:
+                _pkg_source_range = float(comparison.get("consensus_source_range_f", 0.0) or 0.0)
+                if _pkg_source_range > profile.pkg_max_source_range_f:
+                    continue
+            city_packages: List[dict] = []
+            for idx in range(len(buckets) - 1):
+                a = buckets[idx]
+                b = buckets[idx + 1]
+                if float(a.get("lo", -999.0)) <= -900 or float(a.get("hi", 999.0)) >= 900:
+                    continue
+                if float(b.get("lo", -999.0)) <= -900 or float(b.get("hi", 999.0)) >= 900:
+                    continue
+                if not profile.pkg_allow_non_adjacent and not _range_package_buckets_adjacent(a, b):
+                    continue
+                yes_ask_a = _to_float(a.get("yes_ask"))
+                yes_ask_b = _to_float(b.get("yes_ask"))
+                model_yes_a = _to_float(a.get("source_yes_prob"))
+                model_yes_b = _to_float(b.get("source_yes_prob"))
+                if yes_ask_a is None or yes_ask_b is None or model_yes_a is None or model_yes_b is None:
+                    continue
+                combined_model_yes_prob_pct = (float(model_yes_a) + float(model_yes_b)) * 100.0
+                combined_entry_cost_cents = float(yes_ask_a) + float(yes_ask_b)
+                combined_edge_pct = combined_model_yes_prob_pct - combined_entry_cost_cents
+                if combined_edge_pct < profile.pkg_min_edge_pct:
+                    continue
+                if combined_model_yes_prob_pct < profile.pkg_min_combined_prob_pct:
+                    continue
+                pair_mid = (float(a.get("lo", 0.0)) + float(b.get("hi", 0.0))) / 2.0
+                mu_distance = abs(pair_mid - float(consensus_mu)) if consensus_mu is not None else 999.0
+                city_packages.append({
+                    "profile": profile.name,
+                    "ts_est": fmt_est(now_local),
+                    "date": selected_date or "",
+                    "city": city,
+                    "temp_side": temp_side,
+                    "package_bet": "BUY YES",
+                    "combined_line": f"{a.get('bucket_label')} + {b.get('bucket_label')}",
+                    "combined_tickers": f"{a.get('ticker')}|{b.get('ticker')}",
+                    "combined_model_yes_prob_pct": round(combined_model_yes_prob_pct, 2),
+                    "combined_entry_cost_cents": round(combined_entry_cost_cents, 2),
+                    "combined_edge_pct": round(combined_edge_pct, 2),
+                    "mu_distance_f": round(mu_distance, 2),
+                    "adjacent": _range_package_buckets_adjacent(a, b),
+                })
+            city_packages.sort(key=lambda r: (float(r.get("mu_distance_f", 999.0)), -float(r.get("combined_edge_pct", -1e9))))
+            out.extend(city_packages)
+    out.sort(key=lambda r: float(r.get("combined_edge_pct", -1e9)), reverse=True)
+    return out
+
+
+MULTI_PROFILE_PKG_FIELDS = [
+    "ts_est", "profile", "date", "city", "temp_side", "package_bet",
+    "combined_line", "combined_tickers", "combined_model_yes_prob_pct",
+    "combined_entry_cost_cents", "combined_edge_pct", "mu_distance_f", "adjacent",
+]
+
+
+def multi_profile_pkg_log_path(profile_name: str) -> str:
+    return os.path.join(SNAPSHOT_LOG_DIR, f"multi_profile_{profile_name}_packages.csv")
+
+
+def _append_multi_profile_pkg_log(row: dict, profile_name: str) -> None:
+    path = multi_profile_pkg_log_path(profile_name)
+    os.makedirs(SNAPSHOT_LOG_DIR, exist_ok=True)
+    _ensure_csv_header_contains(path, MULTI_PROFILE_PKG_FIELDS)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=MULTI_PROFILE_PKG_FIELDS)
+        w.writerow({k: row.get(k, "") for k in MULTI_PROFILE_PKG_FIELDS})
+
+
+# Dedup state: {profile_name: {"date": str, "logged": set, "pkg_logged": set}}
+_multi_profile_state: dict = {}
+
+
+def maybe_log_multi_profile_paper_trades(now_local: datetime, board_payload: dict) -> dict:
+    """Run all profiles against the board and log new qualifying bets/packages to per-profile CSVs.
+    Returns dict of {profile_name: {"bets": N, "pkgs": N}}."""
+    global _multi_profile_state
+    today = now_local.date().isoformat()
+    counts: dict = {}
+
+    for profile in PAPER_PROFILES:
+        # Init / reset daily dedup sets
+        ps = _multi_profile_state.setdefault(profile.name, {})
+        if ps.get("date") != today:
+            ps["date"] = today
+            ps["logged"] = set()
+            ps["pkg_logged"] = set()
+        logged = ps["logged"]
+        pkg_logged = ps["pkg_logged"]
+
+        # Single-bucket bets
+        bets = build_profile_bets_from_board_payload(board_payload, profile)
+        bet_count = 0
+        for bet in bets:
+            key = f"{bet.get('ticker','')}|{bet.get('bet','')}"
+            if key in logged:
+                continue
+            logged.add(key)
+            row = dict(bet)
+            row["ts_est"] = fmt_est(now_local)
+            _append_multi_profile_paper_log(row, profile.name)
+            bet_count += 1
+
+        # Range packages
+        pkg_count = 0
+        if profile.pkg_enabled:
+            try:
+                pkgs = build_range_package_profile_candidates(now_local, profile)
+                for pkg in pkgs:
+                    key = f"{pkg.get('combined_tickers','')}"
+                    if key in pkg_logged:
+                        continue
+                    pkg_logged.add(key)
+                    _append_multi_profile_pkg_log(pkg, profile.name)
+                    pkg_count += 1
+            except Exception:
+                pass
+
+        counts[profile.name] = {"bets": bet_count, "pkgs": pkg_count}
+
+    return counts
+
+
+def load_multi_profile_rows(profile_name: str) -> List[dict]:
+    path = multi_profile_paper_log_path(profile_name)
+    if not os.path.exists(path):
+        return []
+    _, rows = _read_csv_rows_with_header(path)
+    return rows
+
+
+def load_multi_profile_pkg_rows(profile_name: str) -> List[dict]:
+    path = multi_profile_pkg_log_path(profile_name)
+    if not os.path.exists(path):
+        return []
+    _, rows = _read_csv_rows_with_header(path)
+    return rows
+
+
 def maybe_execute_locked_outcome_scan(now_local: datetime) -> int:
     """Scan ALL buckets for any city/side where trajectory is locked.
 
@@ -13307,6 +13716,100 @@ def analytics_salmon_positions(
     }
 
 
+@app.get("/analytics/profiles")
+def analytics_profiles(
+    profile: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+):
+    """Compare paper trading performance across all 5 profiles.
+    Optional ?profile=name to filter to one profile.
+    Optional ?start=YYYY-MM-DD&end=YYYY-MM-DD date filters.
+    """
+    d0 = None
+    d1 = None
+    try:
+        if start:
+            d0 = datetime.fromisoformat(str(start)).date()
+    except Exception:
+        pass
+    try:
+        if end:
+            d1 = datetime.fromisoformat(str(end)).date()
+    except Exception:
+        pass
+
+    profiles_to_show = [p for p in PAPER_PROFILES if not profile or p.name == profile]
+    summary = []
+
+    for prof in profiles_to_show:
+        rows = load_multi_profile_rows(prof.name)
+        pkg_rows = load_multi_profile_pkg_rows(prof.name)
+
+        # Date filter
+        def in_range(r: dict) -> bool:
+            date_iso = str(r.get("date", r.get("ts_est", ""))).strip()[:10]
+            try:
+                dd = datetime.fromisoformat(date_iso).date()
+            except Exception:
+                return True
+            if d0 and dd < d0:
+                return False
+            if d1 and dd > d1:
+                return False
+            return True
+
+        rows = [r for r in rows if in_range(r)]
+        pkg_rows = [r for r in pkg_rows if in_range(r)]
+
+        # Breakdown by bet type
+        yes_bets = [r for r in rows if str(r.get("bet", "")).upper() == "BUY YES"]
+        no_bets  = [r for r in rows if str(r.get("bet", "")).upper() == "BUY NO"]
+
+        def avg(lst: List[dict], key: str) -> Optional[float]:
+            vals = [float(r[key]) for r in lst if r.get(key) not in (None, "")]
+            return round(sum(vals) / len(vals), 2) if vals else None
+
+        summary.append({
+            "profile": prof.name,
+            "label": prof.label,
+            "config": {
+                "min_edge_pct": prof.min_edge_pct,
+                "min_sources": prof.min_sources,
+                "source_band_f": prof.source_band_f,
+                "afd_min_adj_f": prof.afd_min_adj_f,
+                "trend_gate": prof.trend_gate_f_per_hr,
+                "max_source_range_f": prof.max_source_range_f,
+                "allowed_bet_types": prof.allowed_bet_types,
+                "contrarian_min_mkt_prob_pct": prof.contrarian_min_mkt_prob_pct,
+            },
+            "bets": {
+                "total": len(rows),
+                "yes": len(yes_bets),
+                "no": len(no_bets),
+                "avg_edge_pct": avg(rows, "net_edge_pct"),
+                "avg_yes_edge_pct": avg(yes_bets, "net_edge_pct"),
+                "avg_no_edge_pct": avg(no_bets, "net_edge_pct"),
+                "avg_source_range_f": avg(rows, "source_range_f"),
+                "avg_afd_adj": avg(rows, "afd_mu_adj_f"),
+            },
+            "packages": {
+                "total": len(pkg_rows),
+                "avg_edge_pct": avg(pkg_rows, "combined_edge_pct"),
+            },
+            "log_path": multi_profile_paper_log_path(prof.name),
+            "pkg_log_path": multi_profile_pkg_log_path(prof.name),
+            "recent_bets": rows[-10:] if rows else [],
+        })
+
+    return {
+        "ok": True,
+        "profiles_shown": len(summary),
+        "date_range": {"start": str(d0) if d0 else None, "end": str(d1) if d1 else None},
+        "profiles": summary,
+    }
+
+
 @app.get("/analytics/account-reconciliation")
 def analytics_account_reconciliation():
     now_local = datetime.now(tz=LOCAL_TZ)
@@ -14076,6 +14579,10 @@ def scan():
             maybe_reconcile_live_trade_outcomes()
         except Exception:
             pass
+        try:
+            maybe_log_multi_profile_paper_trades(now_local, board_payload)
+        except Exception:
+            pass
     except Exception:
         paper_trade_posted_count = 0
         range_package_paper_logged_count = 0
@@ -14403,6 +14910,10 @@ def background_loop():
                     track_edge_lifecycles(now_local, board_payload)
                 maybe_post_paper_trades(now_local, board_payload)
                 maybe_log_range_package_paper_trades(now_local, market_day="today")
+                try:
+                    maybe_log_multi_profile_paper_trades(now_local, board_payload)
+                except Exception:
+                    pass
             except Exception:
                 pass
             try:

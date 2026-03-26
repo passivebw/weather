@@ -14270,14 +14270,54 @@ def _execute_salmon_signal(signal: dict, now_local: datetime) -> dict:
                 "slippage": slippage,
             }
 
-    # Submit 1 contract at current price
     order_side = "yes" if direction == "YES" else "no"
-    price_int = int(round(current_price))
+    max_price_cents = signal.get("max_price_cents")
+
+    # Place limit order 1¢ below entry (maker price, lower fee).
+    # A background thread escalates to fill-or-kill after 90s if unfilled.
+    limit_price = int(round(entry_cents - 1)) if entry_cents is not None else int(round(current_price - 1))
+    limit_price = max(1, limit_price)
+
     try:
-        result = kalshi_place_order(ticker, side=order_side, count=1, price=price_int, tif="fill_or_kill")
-        return {"ok": True, "ticker": ticker, "side": order_side, "price": price_int, "result": result}
+        limit_result = kalshi_place_order(ticker, side=order_side, count=1, price=limit_price, tif="good_till_canceled")
+        order_id = (limit_result or {}).get("order", {}).get("order_id") or (limit_result or {}).get("order_id")
     except Exception as e:
-        return {"ok": False, "reason": "order failed", "error": str(e)}
+        return {"ok": False, "reason": "limit order failed", "error": str(e)}
+
+    if not order_id:
+        return {"ok": False, "reason": "no order_id returned", "result": limit_result}
+
+    # Background thread: wait 90s then cancel + go aggressive if still open
+    def _escalate(oid, tkr, side, mkt_price, max_p):
+        time.sleep(90)
+        canceled, _ = kalshi_cancel_order(oid)
+        if not canceled:
+            return  # already filled — nothing to do
+        # Re-check combined budget before going aggressive
+        try:
+            current_ask = _resolve_salmon_price(signal, datetime.now(tz=LOCAL_TZ))
+            if current_ask is None:
+                return
+            if max_p is not None and current_ask > max_p:
+                discord_send(f"🐟 **Salmon escalation skipped** — {tkr} market now {current_ask}¢ > max {max_p}¢")
+                return
+            agg_result = kalshi_place_order(tkr, side=side, count=1, price=int(round(current_ask)), tif="fill_or_kill")
+            filled = (agg_result or {}).get("order", {}).get("status") == "filled"
+            discord_send(
+                f"🐟 **Salmon escalated → {'filled' if filled else 'missed'}** "
+                f"{tkr} {side.upper()} @ {int(round(current_ask))}¢"
+            )
+        except Exception as ex:
+            logging.warning(f"[Salmon escalate] {tkr}: {ex}")
+
+    threading.Thread(target=_escalate, args=(order_id, ticker, order_side, current_price, max_price_cents), daemon=True).start()
+
+    discord_send(
+        f"🐟 **Salmon limit placed** — {ticker} {order_side.upper()} @ {limit_price}¢ "
+        f"(entry {entry_cents}¢ - 1¢ maker). Escalates in 90s."
+    )
+    return {"ok": True, "ticker": ticker, "side": order_side, "limit_price": limit_price,
+            "order_id": order_id, "escalate_in": "90s"}
 
 
 @app.post("/admin/log-salmon-position")

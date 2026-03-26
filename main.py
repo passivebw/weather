@@ -13717,9 +13717,19 @@ def manual_sync_kalshi(
 
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "").strip()
 SLACK_SALMON_CHANNEL_ID = os.getenv("SLACK_SALMON_CHANNEL_ID", "").strip()
+SLACK_USER_TOKEN = os.getenv("SLACK_USER_TOKEN", "").strip()          # xoxp- personal user token (polling)
 SLACK_AUTO_EXECUTE_ENABLED = env_bool("SLACK_AUTO_EXECUTE_ENABLED", default=False)
 SLACK_MAX_SIGNAL_AGE_SECONDS = int(os.getenv("SLACK_MAX_SIGNAL_AGE_SECONDS", "300"))
 SLACK_MAX_PRICE_SLIPPAGE_CENTS = float(os.getenv("SLACK_MAX_PRICE_SLIPPAGE_CENTS", "5.0"))
+SLACK_POLL_INTERVAL_SECONDS = int(os.getenv("SLACK_POLL_INTERVAL_SECONDS", "60"))
+
+# Tracks the Slack message timestamp of the last message we processed so we
+# never replay an old signal after a restart.  Persisted in memory only —
+# restarting the bot will re-scan the most recent message but the age-gate
+# (SLACK_MAX_SIGNAL_AGE_SECONDS) prevents duplicate execution.
+_salmon_poll_last_ts: str = "0"
+_salmon_poll_lock = threading.Lock()
+_salmon_last_poll_time: float = 0.0
 
 _SALMON_CITY_ALIASES = {
     "lv": "Las Vegas", "las vegas": "Las Vegas",
@@ -13745,61 +13755,251 @@ _SALMON_CITY_ALIASES = {
 }
 
 def _parse_salmon_slack_message(text: str) -> Optional[dict]:
-    """Parse a Purple Salmon Slack signal into a structured trade dict.
-    Handles formats like:
-      'LV YES 96-99'  'Dallas YES 86-89 entered at 12c'
-      'Miami NO 84-85'  'PHX YES 101+'
-    Returns None if message doesn't look like a trade signal.
+    """Legacy single-signal parser — kept for backward compat. Use _parse_salmon_slack_signals."""
+    results = _parse_salmon_slack_signals(text)
+    return results[0] if results else None
+
+
+def _parse_salmon_slack_signals(text: str) -> List[dict]:
+    """Parse a Purple Salmon Slack message into a list of trade signals.
+
+    Handles the multi-line block format posted in #purple-salmon-weather:
+      Locked Position:
+      Dallas High
+      Yes - 86 to 87
+      30 contracts
+      Limit Order: 49 cents (filled)
+      Yes - 88 to 89
+      30 contracts
+      Limit Order: 19 cents (filled)
+      Max Price: 73 cents
+
+    Also handles compact single-line formats:
+      'LV YES 96-99'  'Dallas YES 86-89 entered at 12c'  'PHX YES 101+'
     """
     if not text:
-        return None
-    text = text.strip()
-    # Must contain YES or NO
+        return []
+
+    signals: List[dict] = []
+    lines = [l.strip() for l in text.replace("\\n", "\n").split("\n") if l.strip()]
     upper = text.upper()
+
+    # Quick bail if no YES/NO anywhere
     if "YES" not in upper and "NO" not in upper:
-        return None
-    # Tokenize
-    tokens = re.split(r"[\s,]+", text.strip())
-    if len(tokens) < 3:
-        return None
-    # City: first token(s) before YES/NO
-    direction = None
-    dir_idx = None
-    for i, t in enumerate(tokens):
-        if t.upper() in ("YES", "NO"):
-            direction = t.upper()
-            dir_idx = i
-            break
-    if direction is None or dir_idx == 0:
-        return None
-    city_raw = " ".join(tokens[:dir_idx]).lower().strip()
-    city = _SALMON_CITY_ALIASES.get(city_raw)
-    if not city:
-        # try partial match
-        for alias, full in _SALMON_CITY_ALIASES.items():
-            if alias in city_raw:
-                city = full
-                break
-    if not city:
-        return None
-    # Bucket: token after YES/NO — e.g. "96-99", "84-85", "101+"
-    if dir_idx + 1 >= len(tokens):
-        return None
-    bucket_raw = tokens[dir_idx + 1]
-    # Entry price: look for pattern like "12c" or "at 12" or "12¢"
-    entry_cents = None
-    price_match = re.search(r"(?:at\s+)?(\d+)[c¢]", text, re.IGNORECASE)
-    if not price_match:
-        price_match = re.search(r"@\s*(\d+)", text)
-    if price_match:
-        entry_cents = int(price_match.group(1))
-    return {
-        "city": city,
-        "direction": direction,
-        "bucket_raw": bucket_raw,
-        "entry_cents": entry_cents,
-        "raw_text": text,
-    }
+        return []
+
+    # ── Multi-line block parser ──────────────────────────────────────────────
+    # Extract global max price (applies to all signals in the message)
+    max_price: Optional[int] = None
+    mp_match = re.search(r"max\s+price[:\s]+(\d+)\s*cents?", text, re.IGNORECASE)
+    if mp_match:
+        max_price = int(mp_match.group(1))
+
+    city: Optional[str] = None
+    temp_side: str = "high"
+    pending_dir: Optional[str] = None
+    pending_lo: Optional[int] = None
+    pending_hi: Optional[int] = None
+    pending_entry: Optional[int] = None
+
+    def _flush():
+        if city and pending_dir and pending_lo is not None and pending_hi is not None:
+            signals.append({
+                "city": city,
+                "direction": pending_dir,
+                "bucket_raw": f"{pending_lo}-{pending_hi}",
+                "entry_cents": pending_entry if pending_entry is not None else max_price,
+                "max_price_cents": max_price,
+                "temp_side": temp_side,
+                "raw_text": text,
+            })
+
+    for line in lines:
+        ll = line.lower()
+
+        # City + temp_side: "Dallas High", "Las Vegas Low"
+        # Only set city when we see "high" or "low" qualifier to avoid false matches
+        if ("high" in ll or "low" in ll) and city is None:
+            for alias, full_city in _SALMON_CITY_ALIASES.items():
+                # skip short aliases that appear in common words ("no", "sf", etc.)
+                if len(alias) < 3 and alias not in ll.split():
+                    continue
+                if alias in ll:
+                    city = full_city
+                    temp_side = "low" if "low" in ll else "high"
+                    break
+
+        # Direction + range: "Yes - 86 to 87" or "No - 84 to 85"
+        dir_match = re.match(r"^(yes|no)\s*[-–]\s*(\d+)\s+to\s+(\d+)", line, re.IGNORECASE)
+        if dir_match:
+            _flush()  # save previous leg before starting new one
+            pending_dir = dir_match.group(1).upper()
+            pending_lo = int(dir_match.group(2))
+            pending_hi = int(dir_match.group(3))
+            pending_entry = None
+            continue
+
+        # Limit Order price: "Limit Order: 49 cents (filled)"
+        lim_match = re.search(r"limit\s+order[:\s]+(\d+)\s*cents?", line, re.IGNORECASE)
+        if lim_match and pending_dir:
+            pending_entry = int(lim_match.group(1))
+            continue
+
+    _flush()  # save last pending leg
+
+    # ── Compact single-line fallback ─────────────────────────────────────────
+    if not signals:
+        for line in lines:
+            upper_line = line.upper()
+            if "YES" not in upper_line and "NO" not in upper_line:
+                continue
+            tokens = re.split(r"[\s,]+", line.strip())
+            if len(tokens) < 3:
+                continue
+            direction = None
+            dir_idx = None
+            for i, t in enumerate(tokens):
+                if t.upper() in ("YES", "NO"):
+                    direction = t.upper()
+                    dir_idx = i
+                    break
+            if direction is None or dir_idx == 0:
+                continue
+            city_raw = " ".join(tokens[:dir_idx]).lower().strip()
+            matched_city = _SALMON_CITY_ALIASES.get(city_raw)
+            if not matched_city:
+                for alias, full in _SALMON_CITY_ALIASES.items():
+                    if len(alias) >= 3 and alias in city_raw:
+                        matched_city = full
+                        break
+            if not matched_city:
+                continue
+            if dir_idx + 1 >= len(tokens):
+                continue
+            bucket_raw = tokens[dir_idx + 1]
+            entry_cents: Optional[int] = None
+            price_match = re.search(r"(?:at\s+)?(\d+)[c¢]", line, re.IGNORECASE)
+            if not price_match:
+                price_match = re.search(r"@\s*(\d+)", line)
+            if price_match:
+                entry_cents = int(price_match.group(1))
+            signals.append({
+                "city": matched_city,
+                "direction": direction,
+                "bucket_raw": bucket_raw,
+                "entry_cents": entry_cents,
+                "max_price_cents": None,
+                "temp_side": "high",
+                "raw_text": line,
+            })
+
+    return signals
+
+
+def _poll_salmon_slack() -> None:
+    """Poll Slack conversations.history for new Purple Salmon signals using personal user token.
+    Called from the background loop every SLACK_POLL_INTERVAL_SECONDS seconds.
+    Uses the user's own xoxp- token — completely invisible, no bot invite needed.
+    """
+    global _salmon_poll_last_ts, _salmon_last_poll_time
+
+    if not SLACK_USER_TOKEN or not SLACK_SALMON_CHANNEL_ID:
+        return
+
+    now_ts = time.time()
+    if now_ts - _salmon_last_poll_time < SLACK_POLL_INTERVAL_SECONDS:
+        return
+    _salmon_last_poll_time = now_ts
+
+    with _salmon_poll_lock:
+        oldest = _salmon_poll_last_ts
+
+    try:
+        params: dict = {"channel": SLACK_SALMON_CHANNEL_ID, "limit": 20}
+        if oldest and oldest != "0":
+            params["oldest"] = oldest
+
+        resp = requests.get(
+            "https://slack.com/api/conversations.history",
+            headers={"Authorization": f"Bearer {SLACK_USER_TOKEN}"},
+            params=params,
+            timeout=10,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            logging.warning(f"[Salmon Poll] Slack API error: {data.get('error')}")
+            return
+
+        messages = list(reversed(data.get("messages", [])))  # oldest first
+        if not messages:
+            return
+
+        now_local = datetime.now(tz=LOCAL_TZ)
+        new_last_ts = oldest
+
+        for msg in messages:
+            ts = msg.get("ts", "0")
+            # Skip bots and edits
+            if msg.get("subtype") or msg.get("bot_id"):
+                new_last_ts = ts
+                continue
+
+            # Age gate — ignore messages older than SLACK_MAX_SIGNAL_AGE_SECONDS
+            msg_age = now_local.timestamp() - float(ts)
+            if msg_age > SLACK_MAX_SIGNAL_AGE_SECONDS:
+                new_last_ts = ts
+                continue
+
+            text = str(msg.get("text", "")).strip()
+            # Expand Slack mrkdwn line breaks
+            text = text.replace("\\n", "\n")
+            signals = _parse_salmon_slack_signals(text)
+
+            for sig in signals:
+                # Log to CSV
+                try:
+                    _append_salmon_position_log({
+                        "ts_est": fmt_est(now_local),
+                        "date": now_local.date().isoformat(),
+                        "city": sig["city"],
+                        "temp_side": sig.get("temp_side", "high"),
+                        "setup_type": f"slack_{sig['direction'].lower()}",
+                        "confidence": "",
+                        "tickers": "",
+                        "contract_counts": "",
+                        "entry_prices_cents": str(sig.get("entry_cents") or ""),
+                        "notes": f"polled: {sig['raw_text'][:120]}",
+                    })
+                except Exception:
+                    pass
+
+                # Discord alert
+                try:
+                    discord_send(
+                        f"🐟 **Salmon Signal**\n"
+                        f"**{sig['city']}** {sig['direction']} {sig['bucket_raw']}"
+                        + (f" @ {sig['entry_cents']}¢" if sig.get('entry_cents') else "")
+                        + (f" (max {sig['max_price_cents']}¢)" if sig.get('max_price_cents') else "")
+                        + ("\n⚡ Auto-execute: ON" if SLACK_AUTO_EXECUTE_ENABLED else "\n📋 Logging only")
+                    )
+                except Exception:
+                    pass
+
+                if SLACK_AUTO_EXECUTE_ENABLED and LIVE_TRADING_ENABLED:
+                    try:
+                        exec_result = _execute_salmon_signal(sig, now_local)
+                        logging.info(f"[Salmon Poll] execute result: {exec_result}")
+                    except Exception as e:
+                        logging.error(f"[Salmon Poll] execute error: {e}")
+
+            new_last_ts = ts
+
+        if new_last_ts and new_last_ts != "0":
+            with _salmon_poll_lock:
+                _salmon_poll_last_ts = new_last_ts
+
+    except Exception as e:
+        logging.warning(f"[Salmon Poll] error: {e}")
 
 
 @app.post("/salmon-slack")
@@ -15285,6 +15485,10 @@ def background_loop():
                 pass
             try:
                 maybe_auto_sync_manual_positions(now_local)
+            except Exception:
+                pass
+            try:
+                _poll_salmon_slack()
             except Exception:
                 pass
         except Exception:

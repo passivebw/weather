@@ -13985,7 +13985,7 @@ def _poll_salmon_slack() -> None:
                 except Exception:
                     pass
 
-                if SLACK_AUTO_EXECUTE_ENABLED and LIVE_TRADING_ENABLED and sig is signals[-1]:
+                if SLACK_AUTO_EXECUTE_ENABLED and sig is signals[-1]:
                     # Execute the whole group together after all Discord alerts are sent
                     try:
                         exec_results = _execute_salmon_signals_group(signals, now_local)
@@ -14090,7 +14090,7 @@ async def salmon_slack_webhook(request: Request):
         except Exception:
             pass
 
-    if SLACK_AUTO_EXECUTE_ENABLED and LIVE_TRADING_ENABLED:
+    if SLACK_AUTO_EXECUTE_ENABLED:
         try:
             executions = _execute_salmon_signals_group(signals, now_local)
         except Exception as e:

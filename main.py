@@ -13985,10 +13985,11 @@ def _poll_salmon_slack() -> None:
                 except Exception:
                     pass
 
-                if SLACK_AUTO_EXECUTE_ENABLED and LIVE_TRADING_ENABLED:
+                if SLACK_AUTO_EXECUTE_ENABLED and LIVE_TRADING_ENABLED and sig is signals[-1]:
+                    # Execute the whole group together after all Discord alerts are sent
                     try:
-                        exec_result = _execute_salmon_signal(sig, now_local)
-                        logging.info(f"[Salmon Poll] execute result: {exec_result}")
+                        exec_results = _execute_salmon_signals_group(signals, now_local)
+                        logging.info(f"[Salmon Poll] execute results: {exec_results}")
                     except Exception as e:
                         logging.error(f"[Salmon Poll] execute error: {e}")
 
@@ -14089,12 +14090,11 @@ async def salmon_slack_webhook(request: Request):
         except Exception:
             pass
 
-        if SLACK_AUTO_EXECUTE_ENABLED and LIVE_TRADING_ENABLED:
-            try:
-                exec_result = _execute_salmon_signal(signal, now_local)
-                executions.append(exec_result)
-            except Exception as e:
-                executions.append({"ok": False, "error": str(e)})
+    if SLACK_AUTO_EXECUTE_ENABLED and LIVE_TRADING_ENABLED:
+        try:
+            executions = _execute_salmon_signals_group(signals, now_local)
+        except Exception as e:
+            executions = [{"ok": False, "error": str(e)}]
 
     return {
         "ok": True,
@@ -14102,6 +14102,99 @@ async def salmon_slack_webhook(request: Request):
         "auto_execute": SLACK_AUTO_EXECUTE_ENABLED,
         "executions": executions,
     }
+
+
+def _execute_salmon_signals_group(signals: List[dict], now_local: datetime) -> List[dict]:
+    """Execute a group of signals from one Salmon message.
+    Checks combined current price across all legs against max_price_cents before
+    placing any orders — if the total exceeds the budget, all legs are skipped.
+    """
+    if not signals:
+        return []
+
+    # Pull max_price_cents from any leg that has it (all legs in a message share it)
+    max_price_cents = next((s.get("max_price_cents") for s in signals if s.get("max_price_cents")), None)
+
+    # If there's a combined budget, look up all current prices first
+    if max_price_cents is not None and len(signals) > 1:
+        prices = {}
+        for sig in signals:
+            try:
+                _result = _resolve_salmon_price(sig, now_local)
+                if _result is None:
+                    prices[sig["bucket_raw"]] = None
+                else:
+                    prices[sig["bucket_raw"]] = _result
+            except Exception:
+                prices[sig["bucket_raw"]] = None
+
+        valid_prices = [p for p in prices.values() if p is not None]
+        if valid_prices:
+            combined = sum(valid_prices)
+            if combined > max_price_cents:
+                msg = (f"🐟 **Salmon: combined price too high** — "
+                       f"{' + '.join(str(p) for p in valid_prices)}¢ = {combined}¢ > max {max_price_cents}¢. Skipping all legs.")
+                try:
+                    discord_send(msg)
+                except Exception:
+                    pass
+                return [{"ok": False, "reason": "combined price exceeds max",
+                         "combined_price": combined, "max_price_cents": max_price_cents}]
+
+    return [_execute_salmon_signal(sig, now_local) for sig in signals]
+
+
+def _resolve_salmon_price(signal: dict, now_local: datetime) -> Optional[float]:
+    """Fetch the current market price for a signal without placing an order. Returns None on failure."""
+    city = signal["city"]
+    direction = signal["direction"]
+    bucket_raw = signal["bucket_raw"]
+    temp_side = signal.get("temp_side", "high")
+
+    grouped = refresh_markets_cache()
+    city_markets = grouped.get(city, [])
+    if not city_markets:
+        return None
+
+    selected_markets, _, _ = select_markets_for_day(
+        [m for m in city_markets if normalize_temp_side(getattr(m, "temp_side", "high")) == temp_side],
+        now_local, "today", city=city,
+    )
+    if not selected_markets:
+        return None
+
+    lo_target = hi_target = None
+    range_match = re.match(r"(\d+)-(\d+)", bucket_raw)
+    if range_match:
+        lo_target = int(range_match.group(1))
+        hi_target = int(range_match.group(2))
+
+    best_market = None
+    for m in selected_markets:
+        if lo_target is not None:
+            mlo = getattr(m, "lo", None)
+            mhi = getattr(m, "hi", None)
+            if mlo is not None and mhi is not None:
+                if abs(float(mlo) - lo_target) <= 1 and abs(float(mhi) - hi_target) <= 1:
+                    best_market = m
+                    break
+    if not best_market:
+        return None
+
+    ticker = getattr(best_market, "ticker", "")
+    if not ticker:
+        return None
+
+    try:
+        ob = kalshi_get_orderbook(ticker)
+        yes_bid, yes_ask, _ = best_bid_and_ask_from_orderbook(ob)
+    except Exception:
+        return None
+
+    if direction == "YES":
+        return yes_ask
+    else:
+        return (100 - yes_bid) if yes_bid is not None else None
 
 
 def _execute_salmon_signal(signal: dict, now_local: datetime) -> dict:
@@ -14164,16 +14257,6 @@ def _execute_salmon_signal(signal: dict, now_local: datetime) -> dict:
 
     if current_price is None:
         return {"ok": False, "reason": "no current price"}
-
-    # Hard max price ceiling — never pay more than Salmon's stated max
-    max_price_cents = signal.get("max_price_cents")
-    if max_price_cents is not None and current_price > max_price_cents:
-        return {
-            "ok": False,
-            "reason": "above max price",
-            "max_price_cents": max_price_cents,
-            "current_price": current_price,
-        }
 
     # Price slippage check vs individual leg entry price
     if entry_cents is not None and SLACK_MAX_PRICE_SLIPPAGE_CENTS > 0:

@@ -293,14 +293,33 @@ try:
         CITY_BIAS_CORRECTIONS = json.loads(_CITY_BIAS_RAW)
 except Exception:
     pass
-# Default observed biases (high side only; override via env var JSON)
+# Default observed biases derived from source accuracy data (Mar 2026).
+# Sign convention: positive = sources run WARM (subtract from mu); negative = sources run COLD (add to mu).
+# HIGH biases — most cities run cold on highs in spring warm-ridge events
 _DEFAULT_HIGH_BIASES: Dict[str, float] = {
-    "Denver": 2.5,
-    "Austin": 2.5,
-    "Washington DC": 1.0,
+    "Dallas":        -2.0,   # observed -3.0°F cold bias
+    "Chicago":       -1.5,   # observed -2.3°F cold bias
+    "Austin":        -1.0,   # observed -1.6°F cold (was +2.5 — that was making it worse)
+    "Oklahoma City": -1.0,   # observed -1.6°F cold bias
+    "New York City": -1.0,   # observed -1.5°F cold bias
+    "Miami":         -1.0,   # observed -1.5°F cold bias
+    "Boston":        -1.0,   # observed -1.5°F cold bias
+    "Atlanta":       -0.5,   # observed -1.1°F cold bias
+    "Phoenix":       -0.5,   # observed -1.1°F cold bias
+    "Washington DC":  1.0,   # observed +1.1°F warm bias — keep
+    "Las Vegas":      1.0,   # observed +1.1°F warm bias
+    "Minneapolis":    1.0,   # observed +1.2°F warm bias
+}
+# LOW biases — models tend to run warm on overnight lows in spring
+_DEFAULT_LOW_BIASES: Dict[str, float] = {
+    "Chicago":       3.0,   # observed +4.0°F warm bias on lows
+    "Denver":        2.0,   # observed +3.0°F warm bias on lows
+    "New York City": 1.5,   # observed +1.7°F warm bias on lows
 }
 for _c, _b in _DEFAULT_HIGH_BIASES.items():
     CITY_BIAS_CORRECTIONS.setdefault(_c, {}).setdefault("high", _b)
+for _c, _b in _DEFAULT_LOW_BIASES.items():
+    CITY_BIAS_CORRECTIONS.setdefault(_c, {}).setdefault("low", _b)
 LIVE_EDGE_DROP_EXIT_ENABLED = env_bool("LIVE_EDGE_DROP_EXIT_ENABLED", default=True)
 LIVE_EDGE_DROP_TRIGGER_PCT_POINTS = float(os.getenv("LIVE_EDGE_DROP_TRIGGER_PCT_POINTS", "25.0"))
 LIVE_EDGE_DROP_SMALL_GREEN_MAX_PCT_OF_STAKE = float(os.getenv("LIVE_EDGE_DROP_SMALL_GREEN_MAX_PCT_OF_STAKE", "10.0"))
@@ -325,13 +344,16 @@ CONSENSUS_BASE_SIGMA_F = float(os.getenv("CONSENSUS_BASE_SIGMA_F", "3.0"))
 CONSENSUS_DISAGREEMENT_SIGMA_MULTIPLIER = float(os.getenv("CONSENSUS_DISAGREEMENT_SIGMA_MULTIPLIER", "1.0"))
 CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER = float(os.getenv("CONSENSUS_SOURCE_RANGE_SIGMA_MULTIPLIER", "0.35"))
 CONSENSUS_SOURCE_RANGE_FREE_F = float(os.getenv("CONSENSUS_SOURCE_RANGE_FREE_F", "1.0"))
-CONSENSUS_MIN_SIGMA_F = float(os.getenv("CONSENSUS_MIN_SIGMA_F", "2.0"))
+CONSENSUS_MIN_SIGMA_F = float(os.getenv("CONSENSUS_MIN_SIGMA_F", "3.5"))  # raised from 2.0 — observed MAE is 2-5°F, 2°F floor was overconfident
 CONSENSUS_MAX_SOURCE_RANGE_TRADE_F = float(os.getenv("CONSENSUS_MAX_SOURCE_RANGE_TRADE_F", "7.0"))
 # Source agreement gate: require at least this many sources within the agreement band
 CONSENSUS_MIN_SOURCES_IN_BAND = int(os.getenv("CONSENSUS_MIN_SOURCES_IN_BAND", "3"))
 CONSENSUS_SOURCE_AGREEMENT_BAND_F = float(os.getenv("CONSENSUS_SOURCE_AGREEMENT_BAND_F", "4.0"))
 # Forecast trend gate: skip bets where forecast is moving against the bet direction
 FORECAST_TREND_GATE_F_PER_HR = float(os.getenv("FORECAST_TREND_GATE_F_PER_HR", "1.5"))
+# BUY YES quality gates: sub-30¢ YES entries win only 18% of the time; interior buckets win ~33%
+BUY_YES_MIN_ENTRY_CENTS = float(os.getenv("BUY_YES_MIN_ENTRY_CENTS", "30.0"))
+BUY_YES_TERMINAL_ONLY = env_bool("BUY_YES_TERMINAL_ONLY", default=True)
 # Range packages require tighter source agreement than single-bucket bets (directional YES bet needs higher confidence)
 RANGE_PACKAGE_MAX_SOURCE_RANGE_F = float(os.getenv("RANGE_PACKAGE_MAX_SOURCE_RANGE_F", "5.0"))
 CONSENSUS_NWS_OUTLIER_TRIGGER_F = float(os.getenv("CONSENSUS_NWS_OUTLIER_TRIGGER_F", "4.0"))
@@ -10670,6 +10692,28 @@ def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_ed
                     "ticker": r.get("ticker"), "reason": "warming_trend",
                     "net_edge_pct": round(net_edge_pct, 2), "trend_f_per_hr": round(_trend, 2)})
                 continue
+
+        # BUY YES quality gates — data shows YES bets lose at high rates in two scenarios:
+        # 1. Cheap entries (<30¢): 18% win rate — market is right that these are unlikely
+        # 2. Interior buckets (e.g. "69F to 70F"): require extreme precision, ~33% win rate
+        #    Terminal buckets ("or above" / "or below") are more binary and more reliable
+        if not locked_allowed and str(r.get("best_side", "")) == "BUY YES":
+            _yes_ask = float(r.get("yes_ask") or 0.0)
+            if _yes_ask < BUY_YES_MIN_ENTRY_CENTS:
+                excluded.append({"city": r.get("city"), "temp_type": r.get("temp_side"),
+                    "date": r.get("market_date_selected"), "line": r.get("bucket_label"),
+                    "ticker": r.get("ticker"), "reason": "yes_entry_too_cheap",
+                    "net_edge_pct": round(net_edge_pct, 2), "yes_ask": _yes_ask})
+                continue
+            if BUY_YES_TERMINAL_ONLY:
+                _line = str(r.get("bucket_label", "")).lower()
+                _is_terminal = "or above" in _line or "or below" in _line
+                if not _is_terminal:
+                    excluded.append({"city": r.get("city"), "temp_type": r.get("temp_side"),
+                        "date": r.get("market_date_selected"), "line": r.get("bucket_label"),
+                        "ticker": r.get("ticker"), "reason": "yes_interior_bucket",
+                        "net_edge_pct": round(net_edge_pct, 2)})
+                    continue
 
         suggested_units = suggested_units_from_net_edge(net_edge_pct)
         if locked_allowed:

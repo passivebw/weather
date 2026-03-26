@@ -13715,6 +13715,278 @@ def manual_sync_kalshi(
         dry_run=dry_run,
     )
 
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "").strip()
+SLACK_SALMON_CHANNEL_ID = os.getenv("SLACK_SALMON_CHANNEL_ID", "").strip()
+SLACK_AUTO_EXECUTE_ENABLED = env_bool("SLACK_AUTO_EXECUTE_ENABLED", default=False)
+SLACK_MAX_SIGNAL_AGE_SECONDS = int(os.getenv("SLACK_MAX_SIGNAL_AGE_SECONDS", "300"))
+SLACK_MAX_PRICE_SLIPPAGE_CENTS = float(os.getenv("SLACK_MAX_PRICE_SLIPPAGE_CENTS", "5.0"))
+
+_SALMON_CITY_ALIASES = {
+    "lv": "Las Vegas", "las vegas": "Las Vegas",
+    "phx": "Phoenix", "phoenix": "Phoenix",
+    "dal": "Dallas", "dallas": "Dallas",
+    "hou": "Houston", "houston": "Houston",
+    "mia": "Miami", "miami": "Miami",
+    "chi": "Chicago", "chicago": "Chicago",
+    "nyc": "New York City", "new york": "New York City",
+    "la": "Los Angeles", "los angeles": "Los Angeles",
+    "atl": "Atlanta", "atlanta": "Atlanta",
+    "dc": "Washington DC", "washington": "Washington DC",
+    "sea": "Seattle", "seattle": "Seattle",
+    "den": "Denver", "denver": "Denver",
+    "bos": "Boston", "boston": "Boston",
+    "sat": "San Antonio", "san antonio": "San Antonio",
+    "okc": "Oklahoma City", "oklahoma": "Oklahoma City",
+    "sf": "San Francisco", "san francisco": "San Francisco",
+    "min": "Minneapolis", "minneapolis": "Minneapolis",
+    "no": "New Orleans", "new orleans": "New Orleans",
+    "aus": "Austin", "austin": "Austin",
+    "phi": "Philadelphia", "philadelphia": "Philadelphia",
+}
+
+def _parse_salmon_slack_message(text: str) -> Optional[dict]:
+    """Parse a Purple Salmon Slack signal into a structured trade dict.
+    Handles formats like:
+      'LV YES 96-99'  'Dallas YES 86-89 entered at 12c'
+      'Miami NO 84-85'  'PHX YES 101+'
+    Returns None if message doesn't look like a trade signal.
+    """
+    if not text:
+        return None
+    text = text.strip()
+    # Must contain YES or NO
+    upper = text.upper()
+    if "YES" not in upper and "NO" not in upper:
+        return None
+    # Tokenize
+    tokens = re.split(r"[\s,]+", text.strip())
+    if len(tokens) < 3:
+        return None
+    # City: first token(s) before YES/NO
+    direction = None
+    dir_idx = None
+    for i, t in enumerate(tokens):
+        if t.upper() in ("YES", "NO"):
+            direction = t.upper()
+            dir_idx = i
+            break
+    if direction is None or dir_idx == 0:
+        return None
+    city_raw = " ".join(tokens[:dir_idx]).lower().strip()
+    city = _SALMON_CITY_ALIASES.get(city_raw)
+    if not city:
+        # try partial match
+        for alias, full in _SALMON_CITY_ALIASES.items():
+            if alias in city_raw:
+                city = full
+                break
+    if not city:
+        return None
+    # Bucket: token after YES/NO — e.g. "96-99", "84-85", "101+"
+    if dir_idx + 1 >= len(tokens):
+        return None
+    bucket_raw = tokens[dir_idx + 1]
+    # Entry price: look for pattern like "12c" or "at 12" or "12¢"
+    entry_cents = None
+    price_match = re.search(r"(?:at\s+)?(\d+)[c¢]", text, re.IGNORECASE)
+    if not price_match:
+        price_match = re.search(r"@\s*(\d+)", text)
+    if price_match:
+        entry_cents = int(price_match.group(1))
+    return {
+        "city": city,
+        "direction": direction,
+        "bucket_raw": bucket_raw,
+        "entry_cents": entry_cents,
+        "raw_text": text,
+    }
+
+
+@app.post("/salmon-slack")
+async def salmon_slack_webhook(request: Request):
+    """Receive Slack event subscription messages from Purple Salmon's channel.
+    Handles Slack URL verification challenge and message events.
+    """
+    import hmac as _hmac, hashlib as _hashlib
+    body_bytes = await request.body()
+    body_str = body_bytes.decode("utf-8")
+
+    # Verify Slack signature to ensure request is genuine
+    if SLACK_SIGNING_SECRET:
+        ts = request.headers.get("X-Slack-Request-Timestamp", "")
+        slack_sig = request.headers.get("X-Slack-Signature", "")
+        basestring = f"v0:{ts}:{body_str}"
+        computed = "v0=" + _hmac.new(
+            SLACK_SIGNING_SECRET.encode(),
+            basestring.encode(),
+            _hashlib.sha256,
+        ).hexdigest()
+        if not _hmac.compare_digest(computed, slack_sig):
+            return {"error": "invalid signature"}, 403
+
+    try:
+        payload = json.loads(body_str)
+    except Exception:
+        return {"ok": False, "error": "bad json"}
+
+    # Slack URL verification handshake (one-time when setting up)
+    if payload.get("type") == "url_verification":
+        return {"challenge": payload.get("challenge")}
+
+    event = payload.get("event", {})
+    if event.get("type") != "message":
+        return {"ok": True, "note": "ignored"}
+    # Only process messages from the designated channel
+    if SLACK_SALMON_CHANNEL_ID and event.get("channel") != SLACK_SALMON_CHANNEL_ID:
+        return {"ok": True, "note": "wrong channel"}
+    # Skip bot/edited messages
+    if event.get("subtype") or event.get("bot_id"):
+        return {"ok": True, "note": "skipped subtype"}
+
+    text = str(event.get("text", "")).strip()
+    signal = _parse_salmon_slack_message(text)
+    if not signal:
+        return {"ok": True, "note": "no signal parsed"}
+
+    now_local = datetime.now(tz=LOCAL_TZ)
+
+    # Check signal age (Slack event_time vs now)
+    event_ts = float(event.get("ts", 0) or 0)
+    if event_ts > 0 and SLACK_MAX_SIGNAL_AGE_SECONDS > 0:
+        age_seconds = now_local.timestamp() - event_ts
+        if age_seconds > SLACK_MAX_SIGNAL_AGE_SECONDS:
+            logging.warning(f"[Salmon Slack] stale signal ({age_seconds:.0f}s old): {text}")
+            return {"ok": True, "note": "signal too old", "age_seconds": age_seconds}
+
+    # Log the signal regardless of execution
+    try:
+        _append_salmon_position_log({
+            "ts_est": fmt_est(now_local),
+            "date": now_local.date().isoformat(),
+            "city": signal["city"],
+            "temp_side": "high",
+            "setup_type": f"slack_{signal['direction'].lower()}",
+            "confidence": "",
+            "tickers": "",
+            "contract_counts": "",
+            "entry_prices_cents": str(signal["entry_cents"] or ""),
+            "notes": f"auto-parsed: {signal['raw_text']}",
+        })
+    except Exception:
+        pass
+
+    # Alert Discord so you know a signal was received
+    try:
+        discord_send(
+            f"🐟 **Salmon Slack Signal**\n"
+            f"`{text}`\n"
+            f"Parsed → **{signal['city']}** {signal['direction']} {signal['bucket_raw']}"
+            + (f" @ {signal['entry_cents']}¢" if signal['entry_cents'] else "")
+            + ("\n⚡ Auto-execute: ON" if SLACK_AUTO_EXECUTE_ENABLED else "\n📋 Logging only (auto-execute off)")
+        )
+    except Exception:
+        pass
+
+    result = {
+        "ok": True,
+        "signal": signal,
+        "auto_execute": SLACK_AUTO_EXECUTE_ENABLED,
+    }
+
+    # Auto-execute if enabled (off by default until validated)
+    if SLACK_AUTO_EXECUTE_ENABLED and LIVE_TRADING_ENABLED:
+        try:
+            exec_result = _execute_salmon_signal(signal, now_local)
+            result["execution"] = exec_result
+        except Exception as e:
+            result["execution_error"] = str(e)
+
+    return result
+
+
+def _execute_salmon_signal(signal: dict, now_local: datetime) -> dict:
+    """Find the matching Kalshi ticker for a Salmon signal and submit an order."""
+    city = signal["city"]
+    direction = signal["direction"]   # "YES" or "NO"
+    bucket_raw = signal["bucket_raw"] # e.g. "96-99", "84-85"
+    entry_cents = signal.get("entry_cents")
+
+    grouped = refresh_markets_cache()
+    city_markets = grouped.get(city, [])
+    if not city_markets:
+        return {"ok": False, "reason": "city not found", "city": city}
+
+    selected_markets, selected_date, _ = select_markets_for_day(
+        [m for m in city_markets if normalize_temp_side(getattr(m, "temp_side", "high")) == "high"],
+        now_local, "today", city=city,
+    )
+    if not selected_markets:
+        return {"ok": False, "reason": "no markets for today"}
+
+    # Match bucket by parsing the range in bucket_raw vs market bucket labels
+    lo_target = hi_target = None
+    range_match = re.match(r"(\d+)-(\d+)", bucket_raw)
+    if range_match:
+        lo_target = int(range_match.group(1))
+        hi_target = int(range_match.group(2))
+
+    best_market = None
+    for m in selected_markets:
+        label = str(getattr(m, "bucket_label", "") or "").lower()
+        if lo_target is not None:
+            mlo = getattr(m, "lo", None)
+            mhi = getattr(m, "hi", None)
+            if mlo is not None and mhi is not None:
+                if abs(float(mlo) - lo_target) <= 1 and abs(float(mhi) - hi_target) <= 1:
+                    best_market = m
+                    break
+        if "or above" in label or "or below" in label:
+            pass  # handle terminal buckets if needed
+
+    if not best_market:
+        return {"ok": False, "reason": "no matching bucket", "bucket_raw": bucket_raw}
+
+    ticker = getattr(best_market, "ticker", "")
+    if not ticker:
+        return {"ok": False, "reason": "no ticker"}
+
+    # Get current orderbook price
+    try:
+        ob = kalshi_get_orderbook(ticker)
+        yes_bid, yes_ask, _ = best_bid_and_ask_from_orderbook(ob)
+    except Exception:
+        return {"ok": False, "reason": "orderbook fetch failed"}
+
+    if direction == "YES":
+        current_price = yes_ask
+    else:
+        current_price = (100 - yes_bid) if yes_bid is not None else None
+
+    if current_price is None:
+        return {"ok": False, "reason": "no current price"}
+
+    # Price slippage check
+    if entry_cents is not None and SLACK_MAX_PRICE_SLIPPAGE_CENTS > 0:
+        slippage = abs(current_price - entry_cents)
+        if slippage > SLACK_MAX_PRICE_SLIPPAGE_CENTS:
+            return {
+                "ok": False,
+                "reason": "price slippage too high",
+                "entry_cents": entry_cents,
+                "current_price": current_price,
+                "slippage": slippage,
+            }
+
+    # Submit 1 contract at current price
+    order_side = "yes" if direction == "YES" else "no"
+    price_int = int(round(current_price))
+    try:
+        result = kalshi_place_order(ticker, side=order_side, count=1, price=price_int, tif="fill_or_kill")
+        return {"ok": True, "ticker": ticker, "side": order_side, "price": price_int, "result": result}
+    except Exception as e:
+        return {"ok": False, "reason": "order failed", "error": str(e)}
+
+
 @app.post("/admin/log-salmon-position")
 def log_salmon_position(payload: dict = Body(...)):
     """

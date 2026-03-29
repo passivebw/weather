@@ -11107,6 +11107,8 @@ _settlement_cache_lock = threading.Lock()
 SETTLEMENT_CACHE_TTL_SECONDS = 300            # refresh settlements every 5 min
 _last_reconcile_ts: float = 0.0
 SETTLEMENT_RECONCILE_INTERVAL_SECONDS = 1800  # run reconcile every 30 min
+_last_settlement_backfill_ts: float = 0.0
+SETTLEMENT_BACKFILL_INTERVAL_SECONDS = 3600   # auto-backfill missing dates every 1 hr
 
 
 def _get_cached_settlements() -> Dict[str, dict]:
@@ -11210,6 +11212,72 @@ def maybe_reconcile_live_trade_outcomes() -> int:
     except Exception as exc:
         logging.warning(f"reconcile_live_trade_outcomes error: {exc}")
         return 0
+
+
+def maybe_backfill_settlements(now_local: datetime) -> int:
+    """Throttled — runs at most every hour. Backfills any dates missing from
+    final_settlements.csv for the past 14 days using NWS CLI + obs_proxy."""
+    global _last_settlement_backfill_ts
+    now_ts = time.time()
+    if now_ts - _last_settlement_backfill_ts < SETTLEMENT_BACKFILL_INTERVAL_SECONDS:
+        return 0
+    _last_settlement_backfill_ts = now_ts
+    existing = load_final_settlement_map()
+    filled = 0
+    for days_ago in range(1, 15):
+        target = (now_local.date() - timedelta(days=days_ago)).isoformat()
+        # Check if all cities already have high+low settled for this date
+        cities_settled = sum(
+            1 for city in CITY_CONFIG
+            for side in ("high", "low")
+            if (target, city, side) in existing
+        )
+        if cities_settled >= len(CITY_CONFIG) * 2:
+            continue
+        try:
+            rows: list = []
+            for city, cfg in CITY_CONFIG.items():
+                station = cfg["station"]
+                cli_hit = None
+                try:
+                    cli_hit = nws_cli_final_for_date(cfg.get("cli", ""), target)
+                except Exception:
+                    pass
+                if cli_hit:
+                    for side in ("high", "low"):
+                        key = "high_f" if side == "high" else "low_f"
+                        v = _to_float(cli_hit.get(key))
+                        if v is None:
+                            continue
+                        rows.append({
+                            "date": target,
+                            "city": city,
+                            "temp_side": side,
+                            "station": station,
+                            "outcome_f": round(float(v), 3),
+                            "source": "cli_final",
+                            "updated_ts_est": fmt_est(now_local),
+                        })
+                    continue
+                for side in ("high", "low"):
+                    v = nws_day_outcome_f(station, target, side)
+                    if v is None:
+                        continue
+                    rows.append({
+                        "date": target,
+                        "city": city,
+                        "temp_side": side,
+                        "station": station,
+                        "outcome_f": round(float(v), 3),
+                        "source": "obs_proxy",
+                        "updated_ts_est": fmt_est(now_local),
+                    })
+            if rows:
+                upsert_final_settlements(rows)
+                filled += len(rows)
+        except Exception as exc:
+            logging.warning(f"settlement auto-backfill error for {target}: {exc}")
+    return filled
 
 
 # -----------------------------------------------------------------------
@@ -13801,30 +13869,33 @@ def _parse_salmon_slack_signals(text: str) -> List[dict]:
     pending_lo: Optional[int] = None
     pending_hi: Optional[int] = None
     pending_entry: Optional[int] = None
+    pending_bucket_label: Optional[str] = None
+    pending_already_filled: bool = False
 
     def _flush():
+        nonlocal pending_already_filled
         if city and pending_dir and pending_lo is not None and pending_hi is not None:
+            bucket = pending_bucket_label if pending_bucket_label else f"{pending_lo}-{pending_hi}"
             signals.append({
                 "city": city,
                 "direction": pending_dir,
-                "bucket_raw": f"{pending_lo}-{pending_hi}",
+                "bucket_raw": bucket,
                 "entry_cents": pending_entry if pending_entry is not None else max_price,
                 "max_price_cents": max_price,
                 "temp_side": temp_side,
+                "already_filled": pending_already_filled,
                 "raw_text": text,
             })
+        pending_already_filled = False
 
     for line in lines:
         ll = line.lower()
 
         # City + temp_side: "Dallas High", "Las Vegas Low"
-        # Only set city when we see "high" or "low" qualifier to avoid false matches
+        # Alias must start the line to avoid false matches like "NO play" → New Orleans
         if ("high" in ll or "low" in ll) and city is None:
             for alias, full_city in _SALMON_CITY_ALIASES.items():
-                # skip short aliases that appear in common words ("no", "sf", etc.)
-                if len(alias) < 3 and alias not in ll.split():
-                    continue
-                if alias in ll:
+                if ll.startswith(alias + " ") or ll.startswith(alias + ":") or ll == alias:
                     city = full_city
                     temp_side = "low" if "low" in ll else "high"
                     break
@@ -13837,12 +13908,51 @@ def _parse_salmon_slack_signals(text: str) -> List[dict]:
             pending_lo = int(dir_match.group(2))
             pending_hi = int(dir_match.group(3))
             pending_entry = None
+            pending_bucket_label = None
+            pending_already_filled = False
+            continue
+
+        # Boundary buckets: "Yes - 14 or Above" / "Yes - 83 or Below"
+        boundary_match = re.match(r"^(yes|no)\s*[-–]\s*(\d+)\s+or\s+(above|below)", line, re.IGNORECASE)
+        if boundary_match:
+            _flush()
+            pending_dir = boundary_match.group(1).upper()
+            val = int(boundary_match.group(2))
+            direction_word = boundary_match.group(3).lower()
+            pending_lo = val
+            pending_hi = val
+            pending_bucket_label = f"{val}+" if direction_word == "above" else f"{val}-"
+            pending_entry = None
+            pending_already_filled = False
+            continue
+
+        # Alternate direction format: "Buy YES on 95-96° at 44¢" / "Buy NO on 76-77° at 50¢"
+        buy_on_match = re.match(
+            r"^buy\s+(yes|no)\s+on\s+(\d+)[-–](\d+)[°f]?\s+at\s+(\d+)[¢c]",
+            line, re.IGNORECASE
+        )
+        if buy_on_match:
+            _flush()
+            pending_dir = buy_on_match.group(1).upper()
+            pending_lo = int(buy_on_match.group(2))
+            pending_hi = int(buy_on_match.group(3))
+            pending_entry = int(buy_on_match.group(4))
+            pending_bucket_label = None
+            pending_already_filled = False
             continue
 
         # Limit Order price: "Limit Order: 49 cents (filled)"
         lim_match = re.search(r"limit\s+order[:\s]+(\d+)\s*cents?", line, re.IGNORECASE)
         if lim_match and pending_dir:
             pending_entry = int(lim_match.group(1))
+            if "filled" in line.lower():
+                pending_already_filled = True
+            continue
+
+        # Bare price line: "40 cents" on its own — treated as entry when direction is pending
+        bare_price_match = re.match(r"^(\d+)\s*cents?$", line, re.IGNORECASE)
+        if bare_price_match and pending_dir and pending_entry is None:
+            pending_entry = int(bare_price_match.group(1))
             continue
 
     _flush()  # save last pending leg
@@ -13896,6 +14006,245 @@ def _parse_salmon_slack_signals(text: str) -> List[dict]:
     return signals
 
 
+def _is_salmon_pass_message(text: str) -> bool:
+    """Return True if Salmon explicitly says he's NOT taking these positions.
+
+    Catches phrases like:
+      "I will not be taking these positions"
+      "I will not be taking this position"
+      "POTENTIAL PASS"
+      "simply because I can't watch"
+      "I won't be taking"
+      "not taking these"
+    """
+    lower = text.lower()
+    pass_phrases = [
+        "will not be taking these positions",
+        "will not be taking this position",
+        "i won't be taking",
+        "i will not be taking",
+        "not taking these positions",
+        "simply because i can't watch",
+        "(potential pass)",
+        "potential pass",
+    ]
+    return any(p in lower for p in pass_phrases)
+
+
+def _parse_salmon_sell_signals(text: str) -> List[dict]:
+    """Parse Purple Salmon exit/sell signals. Returns non-empty list only for exit messages.
+
+    Formats handled:
+      Out of Dallas High:
+        Sell: Yes - 65 to 66
+        All contracts
+        Limit Order: 44 cents
+
+    A message is treated as a sell signal if it contains "out of", "sell:",
+    "stop loss", or "exit:" trigger keywords.
+    """
+    if not text:
+        return []
+    lower = text.lower()
+    is_exit = any(kw in lower for kw in ("out of ", "sell:", "stop loss", "exit:"))
+    if not is_exit:
+        return []
+
+    # Try to extract city + temp_side from "Out of Dallas High" pattern
+    city_override: Optional[str] = None
+    temp_side_override = "high"
+    out_match = re.search(
+        r"out\s+of\s+([\w\s]+?)(?:\s+(high|low))?\s*(?::|$)",
+        text, re.IGNORECASE | re.MULTILINE
+    )
+    if out_match:
+        city_raw = out_match.group(1).strip().lower()
+        side_word = (out_match.group(2) or "").lower()
+        for alias, full in _SALMON_CITY_ALIASES.items():
+            if city_raw == alias or city_raw.startswith(alias + " "):
+                city_override = full
+                break
+        temp_side_override = "low" if side_word == "low" else "high"
+
+    # Re-use buy parser to get direction/bucket/price from the same multi-line format
+    buy_sigs = _parse_salmon_slack_signals(text)
+    if not buy_sigs:
+        return []
+
+    sell_signals = []
+    for s in buy_sigs:
+        sell = dict(s)
+        sell["action"] = "sell"
+        if city_override:
+            sell["city"] = city_override
+            sell["temp_side"] = temp_side_override
+        sell_signals.append(sell)
+    return sell_signals
+
+
+def _execute_salmon_sell_signal(signal: dict, now_local: datetime) -> dict:
+    """Find the matching Kalshi position and place a GTC limit sell order."""
+    direction = signal["direction"]  # "YES" or "NO"
+    bucket_raw = signal["bucket_raw"]
+    entry_cents = signal.get("entry_cents")
+
+    ticker = _find_salmon_ticker(signal, now_local)
+    if not ticker:
+        return {"ok": False, "reason": "no matching bucket", "bucket_raw": bucket_raw, "city": signal["city"]}
+
+    # Verify we hold a position in this ticker
+    try:
+        positions = kalshi_get_market_positions(limit=500, max_pages=2)
+        pos = next((p for p in positions if p.get("ticker") == ticker), None)
+        if pos is None:
+            return {"ok": False, "reason": "no open position", "ticker": ticker}
+        yes_pos = int(pos.get("position", 0))
+        if direction == "YES" and yes_pos <= 0:
+            return {"ok": False, "reason": f"no YES position (have {yes_pos})", "ticker": ticker}
+        if direction == "NO" and yes_pos >= 0:
+            return {"ok": False, "reason": f"no NO position (have {yes_pos})", "ticker": ticker}
+        contracts_to_sell = abs(yes_pos)
+    except Exception as e:
+        return {"ok": False, "reason": f"position lookup failed: {e}"}
+
+    # Get current orderbook for fallback pricing
+    try:
+        ob = kalshi_get_orderbook(ticker)
+        yes_bid, yes_ask, _ = best_bid_and_ask_from_orderbook(ob)
+    except Exception:
+        return {"ok": False, "reason": "orderbook fetch failed"}
+
+    order_side = "yes" if direction == "YES" else "no"
+    if entry_cents is not None:
+        limit_price = entry_cents
+    elif direction == "YES" and yes_bid is not None:
+        limit_price = int(round(yes_bid))
+    elif direction == "NO" and yes_ask is not None:
+        limit_price = int(round(100 - yes_ask))
+    else:
+        return {"ok": False, "reason": "no current price for sell order"}
+
+    limit_price = max(1, min(99, limit_price))
+
+    try:
+        sell_result = kalshi_post("/portfolio/orders", {
+            "ticker": ticker,
+            "client_order_id": f"salmon-sell-{uuid.uuid4().hex[:10]}",
+            "action": "sell",
+            "side": order_side,
+            "count": contracts_to_sell,
+            "yes_price" if order_side == "yes" else "no_price": limit_price,
+            "time_in_force": "good_till_canceled",
+        }, timeout=20, max_retries=2)
+        order_id = str((sell_result or {}).get("order", {}).get("order_id") or "")
+        if (sell_result or {}).get("error"):
+            return {"ok": False, "reason": "sell order rejected", "error": str(sell_result.get("error"))}
+    except Exception as e:
+        return {"ok": False, "reason": f"sell order failed: {e}"}
+
+    if not order_id:
+        return {"ok": False, "reason": "no order_id returned", "result": sell_result}
+
+    order_status = str((sell_result or {}).get("order", {}).get("status") or "submitted")
+    return {
+        "ok": True, "ticker": ticker, "side": order_side,
+        "limit_price": limit_price, "order_id": order_id,
+        "order_status": order_status, "contracts": contracts_to_sell,
+        "escalate_in": "90s",
+    }
+
+
+def _execute_salmon_sell_group(signals: List[dict], now_local: datetime) -> List[dict]:
+    """Execute a group of sell signals, send Discord confirmation, spawn escalation thread."""
+    if not signals:
+        return []
+
+    results = [_execute_salmon_sell_signal(sig, now_local) for sig in signals]
+
+    # Grouped Discord confirmation
+    try:
+        city = signals[0]["city"] if signals else ""
+        lines = []
+        for i, r in enumerate(results):
+            sig = signals[i]
+            leg = f"{sig['direction']} {sig['bucket_raw']}"
+            if r.get("ok"):
+                lines.append(
+                    f"🔴 {leg} — sell limit @ {r['limit_price']}¢ "
+                    f"({r['contracts']} contract{'s' if r['contracts'] != 1 else ''})"
+                )
+            else:
+                lines.append(f"❌ {leg} — {r.get('reason', 'failed')}")
+        discord_send(
+            f"🐟 **Salmon EXIT — {city}**\n"
+            + "\n".join(lines)
+            + "\nWill go market in 90s if not filled"
+        )
+    except Exception:
+        pass
+
+    # Escalation thread
+    placed = [(r, signals[i]) for i, r in enumerate(results) if r.get("ok") and r.get("order_id")]
+    if placed:
+        def _escalate_sell_group(placed_legs, group_signals, nl):
+            time.sleep(90)
+            now2 = datetime.now(tz=LOCAL_TZ)
+            city = group_signals[0]["city"] if group_signals else ""
+            outcome_lines = []
+            for r, sig in placed_legs:
+                oid = r["order_id"]
+                tkr = r["ticker"]
+                side = r["side"]
+                contracts = r.get("contracts", 1)
+                leg = f"{sig['direction']} {sig['bucket_raw']}"
+                canceled, _ = kalshi_cancel_order(oid)
+                if not canceled:
+                    # Already filled at limit
+                    outcome_lines.append(f"✅ {leg} — sold @ limit {r['limit_price']}¢")
+                    continue
+                # Escalate to market sell (FoK at current bid)
+                try:
+                    ob2 = kalshi_get_orderbook(tkr)
+                    yes_bid2, yes_ask2, _ = best_bid_and_ask_from_orderbook(ob2)
+                    if side == "yes":
+                        market_price = int(round(yes_bid2)) if yes_bid2 is not None else 1
+                    else:
+                        market_price = int(round(100 - yes_ask2)) if yes_ask2 is not None else 1
+                    market_price = max(1, min(99, market_price))
+                    agg = kalshi_post("/portfolio/orders", {
+                        "ticker": tkr,
+                        "client_order_id": f"salmon-sell-esc-{uuid.uuid4().hex[:8]}",
+                        "action": "sell",
+                        "side": side,
+                        "count": contracts,
+                        "yes_price" if side == "yes" else "no_price": market_price,
+                        "time_in_force": "fill_or_kill",
+                    }, timeout=20, max_retries=2)
+                    filled = (agg or {}).get("order", {}).get("status") in ("filled", "executed")
+                    if filled:
+                        outcome_lines.append(f"✅ {leg} — sold at market @ {market_price}¢")
+                    else:
+                        outcome_lines.append(f"❌ {leg} — market sell missed @ {market_price}¢")
+                except Exception as ex:
+                    outcome_lines.append(f"❌ {leg} — sell error: {ex}")
+                    logging.warning(f"[Salmon sell escalate] {tkr}: {ex}")
+            try:
+                discord_send(
+                    f"🐟 **Salmon Exit Result — {city}**\n"
+                    + "\n".join(outcome_lines)
+                )
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_escalate_sell_group,
+            args=(placed, signals, now_local),
+            daemon=True,
+        ).start()
+
+    return results
+
+
 def _poll_salmon_slack() -> None:
     """Poll Slack conversations.history for new Purple Salmon signals using personal user token.
     Called from the background loop every SLACK_POLL_INTERVAL_SECONDS seconds.
@@ -13936,6 +14285,7 @@ def _poll_salmon_slack() -> None:
 
         now_local = datetime.now(tz=LOCAL_TZ)
         new_last_ts = oldest
+        logging.info(f"[Salmon Poll] {len(messages)} messages (cursor={oldest})")
 
         for msg in messages:
             ts = msg.get("ts", "0")
@@ -13947,13 +14297,54 @@ def _poll_salmon_slack() -> None:
             # Age gate — ignore messages older than SLACK_MAX_SIGNAL_AGE_SECONDS
             msg_age = now_local.timestamp() - float(ts)
             if msg_age > SLACK_MAX_SIGNAL_AGE_SECONDS:
+                logging.info(f"[Salmon Poll] age-gated msg ts={ts} age={int(msg_age)}s")
                 new_last_ts = ts
                 continue
 
             text = str(msg.get("text", "")).strip()
             # Expand Slack mrkdwn line breaks
             text = text.replace("\\n", "\n")
+
+            # ── Check for exit/sell signal FIRST ────────────────────────────
+            sell_signals = _parse_salmon_sell_signals(text)
+            if sell_signals:
+                sell_city = sell_signals[0]["city"]
+                sell_legs = ", ".join(
+                    f"{s['direction']} {s['bucket_raw']}" + (f" @ {s['entry_cents']}¢" if s.get('entry_cents') else "")
+                    for s in sell_signals
+                )
+                logging.info(f"[Salmon Poll] EXIT msg ts={ts} city={sell_city} legs={sell_legs}")
+                try:
+                    discord_send(
+                        f"🐟 **Salmon Exit Signal — {sell_city}**\n{sell_legs}"
+                        + ("\n⚡ Auto-execute: ON" if SLACK_AUTO_EXECUTE_ENABLED else "\n📋 Logging only")
+                    )
+                except Exception:
+                    pass
+                if SLACK_AUTO_EXECUTE_ENABLED:
+                    try:
+                        sell_results = _execute_salmon_sell_group(sell_signals, now_local)
+                        logging.info(f"[Salmon Poll] sell results: {sell_results}")
+                    except Exception as e:
+                        logging.error(f"[Salmon Poll] sell execute error: {e}")
+                new_last_ts = ts
+                continue
+
+            # ── Buy signal parsing ───────────────────────────────────────────
+            # Detect if Salmon is sharing signals but NOT personally taking them
+            is_pass = _is_salmon_pass_message(text)
             signals = _parse_salmon_slack_signals(text)
+            direction_lines = len(re.findall(r"^(yes|no)\s*[-–]\s*\d+\s+to\s+\d+", text, re.IGNORECASE | re.MULTILINE))
+            logging.info(f"[Salmon Poll] msg ts={ts} age={int(msg_age)}s signals={len(signals)} direction_lines={direction_lines} is_pass={is_pass} text={text[:80]!r}")
+            if direction_lines > len(signals):
+                logging.error(f"[Salmon Poll] PARSE MISMATCH — found {direction_lines} direction lines but only {len(signals)} signals. Full text: {text!r}")
+
+            # Filter already-filled legs (e.g. "Limit Order: 58 cents (filled)")
+            actionable = [s for s in signals if not s.get("already_filled")]
+            already_filled_count = len(signals) - len(actionable)
+            if already_filled_count:
+                logging.info(f"[Salmon Poll] skipping {already_filled_count} already-filled leg(s)")
+            signals = actionable
 
             for sig in signals:
                 # Log to CSV
@@ -13973,20 +14364,34 @@ def _poll_salmon_slack() -> None:
                 except Exception:
                     pass
 
-                # Discord alert
-                try:
-                    discord_send(
-                        f"🐟 **Salmon Signal**\n"
-                        f"**{sig['city']}** {sig['direction']} {sig['bucket_raw']}"
-                        + (f" @ {sig['entry_cents']}¢" if sig.get('entry_cents') else "")
-                        + (f" (max {sig['max_price_cents']}¢)" if sig.get('max_price_cents') else "")
-                        + ("\n⚡ Auto-execute: ON" if SLACK_AUTO_EXECUTE_ENABLED else "\n📋 Logging only")
-                    )
-                except Exception:
-                    pass
+                if sig is signals[-1]:
+                    # Single grouped Discord alert — one message per Salmon post
+                    try:
+                        max_p = signals[0].get("max_price_cents")
+                        city = signals[0]["city"]
+                        legs = ", ".join(
+                            f"{s['direction']} {s['bucket_raw']}" + (f" @ {s['entry_cents']}¢" if s.get('entry_cents') else "")
+                            for s in signals
+                        )
+                        if is_pass:
+                            discord_send(
+                                f"🐟 **Salmon Shared (not taking) — {city}**\n"
+                                f"{legs}"
+                                + (f"\nCombined max: {max_p}¢" if max_p else "")
+                                + "\n📋 Salmon sitting out — no auto-execute"
+                            )
+                        else:
+                            discord_send(
+                                f"🐟 **Salmon Signal — {city}**\n"
+                                f"{legs}"
+                                + (f"\nCombined max: {max_p}¢" if max_p else "")
+                                + ("\n⚡ Auto-execute: ON" if SLACK_AUTO_EXECUTE_ENABLED else "\n📋 Logging only")
+                            )
+                    except Exception:
+                        pass
 
-                if SLACK_AUTO_EXECUTE_ENABLED and sig is signals[-1]:
-                    # Execute the whole group together after all Discord alerts are sent
+                if SLACK_AUTO_EXECUTE_ENABLED and not is_pass and sig is signals[-1]:
+                    # Execute the whole group together after Discord alert is sent
                     try:
                         exec_results = _execute_salmon_signals_group(signals, now_local)
                         logging.info(f"[Salmon Poll] execute results: {exec_results}")
@@ -14143,59 +14548,234 @@ def _execute_salmon_signals_group(signals: List[dict], now_local: datetime) -> L
 
     results = [_execute_salmon_signal(sig, now_local) for sig in signals]
 
+    # Single grouped order confirmation Discord message
+    try:
+        city = signals[0]["city"] if signals else ""
+        lines = []
+        for i, r in enumerate(results):
+            sig = signals[i]
+            leg = f"{sig['direction']} {sig['bucket_raw']}"
+            if r.get("ok"):
+                lines.append(f"✅ {leg} — limit order placed @ {r['limit_price']}¢ (waiting to fill)")
+            else:
+                lines.append(f"❌ {leg} — {r.get('reason','failed')}")
+        max_p = signals[0].get("max_price_cents") if signals else None
+        discord_send(
+            f"🐟 **Salmon Orders — {city}**\n"
+            + "\n".join(lines)
+            + (f"\nCombined max: {max_p}¢" if max_p else "")
+            + "\nChasing limit every 10s, FoK after 90s if needed"
+        )
+    except Exception:
+        pass
+
     # Spawn ONE escalation thread for the whole group so the 90s combined-price
     # re-check uses the actual sum of all legs, not each leg in isolation.
     placed = [(r, signals[i]) for i, r in enumerate(results) if r.get("ok") and r.get("order_id")]
     if placed:
         def _escalate_group(placed_legs, group_signals, max_p, nl):
-            time.sleep(90)
-            now2 = datetime.now(tz=LOCAL_TZ)
-            # Re-fetch combined current prices for all legs
-            if max_p is not None:
-                live_prices = []
-                for _, sig in placed_legs:
-                    p = _resolve_salmon_price(sig, now2)
-                    if p is not None:
-                        live_prices.append(p)
-                if live_prices:
-                    combined_now = sum(live_prices)
-                    if combined_now > max_p:
-                        # Cancel all still-open limit orders and abort
-                        for r, _ in placed_legs:
-                            try:
-                                kalshi_cancel_order(r["order_id"])
-                            except Exception:
-                                pass
-                        try:
-                            discord_send(
-                                f"🐟 **Salmon escalation aborted** — combined price now "
-                                f"{' + '.join(str(round(p)) for p in live_prices)}¢ "
-                                f"= {round(combined_now)}¢ > max {max_p}¢. All limits cancelled."
-                            )
-                        except Exception:
-                            pass
-                        return
+            """Smart limit chasing escalation.
 
-            # Combined price ok — go aggressive on any unfilled legs
+            Every 10s for up to 90s:
+              - Check each unfilled leg's order status
+              - If price moved up and combined budget allows: cancel + re-place limit 1¢ below ask
+              - If combined is within FOK_HEADROOM_CENTS of max: go FoK immediately
+            After 90s: FoK anything still unfilled (if combined allows).
+            """
+            POLL_INTERVAL = 10          # seconds between checks
+            MAX_WAIT = 90               # total seconds before forced FoK
+            FOK_HEADROOM_CENTS = 2      # go FoK when this close to combined max
+
+            city = group_signals[0]["city"] if group_signals else ""
+
+            # Mutable state per leg, keyed by original order_id
+            # Each entry: {order_id, limit_price, ticker, side, sig, filled, fill_price}
+            leg_state = {}
             for r, sig in placed_legs:
-                oid = r["order_id"]
-                tkr = r["ticker"]
-                side = r["side"]
+                leg_state[r["order_id"]] = {
+                    "order_id": r["order_id"],
+                    "limit_price": r["limit_price"],
+                    "ticker": r["ticker"],
+                    "side": r["side"],
+                    "sig": sig,
+                    "filled": False,
+                    "fill_price": None,
+                }
+
+            def _filled_prices():
+                return [s["fill_price"] for s in leg_state.values() if s["filled"] and s["fill_price"] is not None]
+
+            def _unfilled_states():
+                return [s for s in leg_state.values() if not s["filled"]]
+
+            def _go_fok(state, now2, reason_prefix):
+                """Cancel open limit and place FoK at current ask. Returns outcome line."""
+                oid = state["order_id"]
+                tkr = state["ticker"]
+                side = state["side"]
+                sig = state["sig"]
+                leg = f"{sig['direction']} {sig['bucket_raw']}"
                 canceled, _ = kalshi_cancel_order(oid)
                 if not canceled:
-                    continue  # already filled
-                try:
+                    state["filled"] = True
+                    state["fill_price"] = float(state["limit_price"])
+                    return f"✅ {leg} — filled at limit @ {state['limit_price']}¢"
+                current_ask = _resolve_salmon_price(sig, now2)
+                if current_ask is None:
+                    return f"⚠️ {leg} — no market price at {reason_prefix}"
+                fok_price = int(round(current_ask))
+                result = kalshi_post("/portfolio/orders", {
+                    "ticker": tkr,
+                    "client_order_id": f"salmon-fok-{uuid.uuid4().hex[:8]}",
+                    "action": "buy",
+                    "side": side,
+                    "count": 1,
+                    "yes_price" if side == "yes" else "no_price": fok_price,
+                    "time_in_force": "fill_or_kill",
+                }, timeout=20, max_retries=2)
+                filled = (result or {}).get("order", {}).get("status") in ("filled", "executed")
+                if filled:
+                    state["filled"] = True
+                    state["fill_price"] = float(fok_price)
+                    return f"✅ {leg} — FoK filled @ {fok_price}¢ ({reason_prefix})"
+                # Option B: one more attempt at refreshed price
+                retry_ask = _resolve_salmon_price(sig, now2)
+                if retry_ask is not None:
+                    combined_with_retry = sum(_filled_prices()) + retry_ask
+                    if max_p is None or combined_with_retry <= max_p:
+                        r2 = kalshi_post("/portfolio/orders", {
+                            "ticker": tkr,
+                            "client_order_id": f"salmon-b2-{uuid.uuid4().hex[:8]}",
+                            "action": "buy",
+                            "side": side,
+                            "count": 1,
+                            "yes_price" if side == "yes" else "no_price": int(round(retry_ask)),
+                            "time_in_force": "fill_or_kill",
+                        }, timeout=20, max_retries=2)
+                        if (r2 or {}).get("order", {}).get("status") in ("filled", "executed"):
+                            state["filled"] = True
+                            state["fill_price"] = float(retry_ask)
+                            return f"✅ {leg} — retry filled @ {int(round(retry_ask))}¢"
+                return f"❌ {leg} — missed @ {fok_price}¢"
+
+            elapsed = 0
+            while elapsed < MAX_WAIT:
+                time.sleep(POLL_INTERVAL)
+                elapsed += POLL_INTERVAL
+                now2 = datetime.now(tz=LOCAL_TZ)
+
+                for state in list(_unfilled_states()):
+                    oid = state["order_id"]
+                    tkr = state["ticker"]
+                    side = state["side"]
+                    sig = state["sig"]
+                    leg = f"{sig['direction']} {sig['bucket_raw']}"
+
+                    # Check if already filled
+                    try:
+                        snap = kalshi_get_order_snapshot(oid)
+                        if snap.get("status") in ("filled", "executed"):
+                            state["filled"] = True
+                            state["fill_price"] = float(state["limit_price"])
+                            logging.info(f"[Salmon escalate] {leg} filled at limit @ {state['limit_price']}¢")
+                            continue
+                    except Exception:
+                        pass
+
+                    # Get current ask
                     current_ask = _resolve_salmon_price(sig, now2)
                     if current_ask is None:
                         continue
-                    agg = kalshi_place_order(tkr, side=side, count=1, price=int(round(current_ask)), tif="fill_or_kill")
-                    filled = (agg or {}).get("order", {}).get("status") == "filled"
-                    discord_send(
-                        f"🐟 **Salmon escalated → {'filled' if filled else 'missed'}** "
-                        f"{tkr} {side.upper()} @ {int(round(current_ask))}¢"
+
+                    new_limit = int(round(current_ask - 1))
+
+                    # Calculate combined if we move this leg's limit up
+                    other_filled = sum(_filled_prices())
+                    other_unfilled_limits = sum(
+                        s["limit_price"] for s in leg_state.values()
+                        if not s["filled"] and s["order_id"] != oid
                     )
-                except Exception as ex:
-                    logging.warning(f"[Salmon escalate] {tkr}: {ex}")
+                    combined_if_moved = other_filled + other_unfilled_limits + new_limit
+
+                    # If within headroom of max → go FoK now
+                    if max_p is not None and combined_if_moved >= max_p - FOK_HEADROOM_CENTS:
+                        logging.info(f"[Salmon escalate] {leg} near max ({combined_if_moved}¢ vs max {max_p}¢) — going FoK")
+                        outcome = _go_fok(state, now2, "near max")
+                        try:
+                            discord_send(f"🐟 **Salmon — {city}**\n{outcome}")
+                        except Exception:
+                            pass
+                        continue
+
+                    # If price moved up and we have room: chase with updated limit
+                    if new_limit > state["limit_price"] and (max_p is None or combined_if_moved <= max_p):
+                        canceled, _ = kalshi_cancel_order(oid)
+                        if canceled:
+                            try:
+                                repl = kalshi_post("/portfolio/orders", {
+                                    "ticker": tkr,
+                                    "client_order_id": f"salmon-chase-{uuid.uuid4().hex[:8]}",
+                                    "action": "buy",
+                                    "side": side,
+                                    "count": 1,
+                                    "yes_price" if side == "yes" else "no_price": new_limit,
+                                    "time_in_force": "good_till_canceled",
+                                }, timeout=20, max_retries=2)
+                                new_oid = str((repl or {}).get("order", {}).get("order_id") or "")
+                                if new_oid:
+                                    logging.info(f"[Salmon escalate] {leg} chased limit {state['limit_price']}¢ → {new_limit}¢")
+                                    # Re-key state under new order_id
+                                    leg_state[new_oid] = state
+                                    leg_state[new_oid]["order_id"] = new_oid
+                                    leg_state[new_oid]["limit_price"] = new_limit
+                                    del leg_state[oid]
+                            except Exception as ex:
+                                logging.warning(f"[Salmon escalate] chase failed for {leg}: {ex}")
+                        else:
+                            # Cancel failed = filled while we were checking
+                            state["filled"] = True
+                            state["fill_price"] = float(state["limit_price"])
+
+                if not _unfilled_states():
+                    break  # all legs filled, no need to wait further
+
+            # Final FoK pass on anything still open after MAX_WAIT
+            outcome_lines = []
+            now2 = datetime.now(tz=LOCAL_TZ)
+            for state in list(_unfilled_states()):
+                sig = state["sig"]
+                leg = f"{sig['direction']} {sig['bucket_raw']}"
+                if max_p is not None:
+                    current_ask = _resolve_salmon_price(sig, now2)
+                    combined_check = sum(_filled_prices()) + (current_ask or state["limit_price"]) + sum(
+                        s["limit_price"] for s in leg_state.values()
+                        if not s["filled"] and s["order_id"] != state["order_id"]
+                    )
+                    if combined_check > max_p:
+                        outcome_lines.append(
+                            f"❌ {leg} — skipped FoK (combined {int(round(combined_check))}¢ > max {max_p}¢). Limit left open."
+                        )
+                        continue
+                outcome_lines.append(_go_fok(state, now2, "90s timeout"))
+
+            # Add already-filled legs to summary
+            for state in leg_state.values():
+                if state["filled"]:
+                    sig = state["sig"]
+                    leg = f"{sig['direction']} {sig['bucket_raw']}"
+                    fill_p = int(round(state["fill_price"])) if state["fill_price"] else state["limit_price"]
+                    already = f"✅ {leg} — filled @ {fill_p}¢"
+                    if already not in outcome_lines:
+                        outcome_lines.append(already)
+
+            if outcome_lines:
+                try:
+                    discord_send(
+                        f"🐟 **Salmon Result — {city}**\n"
+                        + "\n".join(outcome_lines)
+                    )
+                except Exception:
+                    pass
 
         threading.Thread(
             target=_escalate_group,
@@ -14300,20 +14880,27 @@ def _execute_salmon_signal(signal: dict, now_local: datetime) -> dict:
     limit_price = max(1, limit_price)
 
     try:
-        limit_result = kalshi_place_order(ticker, side=order_side, count=1, price=limit_price, tif="good_till_canceled")
-        order_id = (limit_result or {}).get("order", {}).get("order_id") or (limit_result or {}).get("order_id")
+        limit_result = kalshi_post("/portfolio/orders", {
+            "ticker": ticker,
+            "client_order_id": f"salmon-{uuid.uuid4().hex[:12]}",
+            "action": "buy",
+            "side": order_side,
+            "count": 1,
+            "yes_price" if order_side == "yes" else "no_price": limit_price,
+            "time_in_force": "good_till_canceled",
+        }, timeout=20, max_retries=2)
+        order_id = str((limit_result or {}).get("order", {}).get("order_id") or (limit_result or {}).get("order_id") or "")
+        if (limit_result or {}).get("error"):
+            return {"ok": False, "reason": "limit order rejected", "error": str(limit_result.get("error"))}
     except Exception as e:
         return {"ok": False, "reason": "limit order failed", "error": str(e)}
 
     if not order_id:
         return {"ok": False, "reason": "no order_id returned", "result": limit_result}
 
-    discord_send(
-        f"🐟 **Salmon limit placed** — {ticker} {order_side.upper()} @ {limit_price}¢ "
-        f"(entry {entry_cents}¢ - 1¢ maker). Escalates in 90s if unfilled."
-    )
+    order_status = str((limit_result or {}).get("order", {}).get("status") or "submitted")
     return {"ok": True, "ticker": ticker, "side": order_side, "limit_price": limit_price,
-            "order_id": order_id, "escalate_in": "90s"}
+            "order_id": order_id, "order_status": order_status, "escalate_in": "90s"}
 
 
 @app.post("/admin/log-salmon-position")
@@ -15275,6 +15862,10 @@ def scan():
         paper_trade_posted_count = 0
         range_package_paper_logged_count = 0
     try:
+        maybe_backfill_settlements(now_local)
+    except Exception:
+        pass
+    try:
         daily_update_posted = maybe_post_daily_update(now_local)
     except Exception:
         daily_update_posted = False
@@ -15617,7 +16208,7 @@ def background_loop():
             except Exception:
                 pass
             try:
-                _poll_salmon_slack()
+                maybe_backfill_settlements(now_local)
             except Exception:
                 pass
         except Exception:
@@ -15761,6 +16352,16 @@ async def config_update(request: Request):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+def _salmon_poll_thread():
+    """Dedicated thread: polls Slack every 60s regardless of scan loop sleep."""
+    while True:
+        try:
+            _poll_salmon_slack()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
 @app.on_event("startup")
 def on_startup():
     try:
@@ -15768,4 +16369,5 @@ def on_startup():
     except Exception:
         pass
     threading.Thread(target=background_loop, daemon=True).start()
+    threading.Thread(target=_salmon_poll_thread, daemon=True).start()
 

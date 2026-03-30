@@ -13892,10 +13892,12 @@ def _parse_salmon_slack_signals(text: str) -> List[dict]:
         ll = line.lower()
 
         # City + temp_side: "Dallas High", "Las Vegas Low"
+        # Strip Slack bold/italic markers (*...*) before alias matching
         # Alias must start the line to avoid false matches like "NO play" → New Orleans
+        ll_clean = re.sub(r"[*_~`]", "", ll).strip()
         if ("high" in ll or "low" in ll) and city is None:
             for alias, full_city in _SALMON_CITY_ALIASES.items():
-                if ll.startswith(alias + " ") or ll.startswith(alias + ":") or ll == alias:
+                if ll_clean.startswith(alias + " ") or ll_clean.startswith(alias + ":") or ll_clean == alias:
                     city = full_city
                     temp_side = "low" if "low" in ll else "high"
                     break

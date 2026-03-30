@@ -14625,6 +14625,9 @@ def _execute_salmon_signals_group(signals: List[dict], now_local: datetime) -> L
                 current_ask = _resolve_salmon_price(sig, now2)
                 if current_ask is None:
                     return f"⚠️ {leg} — no market price at {reason_prefix}"
+                per_leg_entry = sig.get("entry_cents")
+                if per_leg_entry is not None and current_ask > per_leg_entry:
+                    return f"❌ {leg} — FoK skipped (market {int(round(current_ask))}¢ > signal entry {per_leg_entry}¢)"
                 fok_price = int(round(current_ask))
                 result = kalshi_post("/portfolio/orders", {
                     "ticker": tkr,
@@ -14709,6 +14712,11 @@ def _execute_salmon_signals_group(signals: List[dict], now_local: datetime) -> L
                             pass
                         continue
 
+                    # Cap per-leg chase at entry_cents when no combined max is set
+                    per_leg_cap = state["sig"].get("entry_cents")
+                    if new_limit > (per_leg_cap or new_limit):
+                        new_limit = per_leg_cap  # never chase above signal price
+
                     # If price moved up and we have room: chase with updated limit
                     if new_limit > state["limit_price"] and (max_p is None or combined_if_moved <= max_p):
                         canceled, _ = kalshi_cancel_order(oid)
@@ -14747,8 +14755,15 @@ def _execute_salmon_signals_group(signals: List[dict], now_local: datetime) -> L
             for state in list(_unfilled_states()):
                 sig = state["sig"]
                 leg = f"{sig['direction']} {sig['bucket_raw']}"
+                per_leg_entry = sig.get("entry_cents")
+                current_ask = _resolve_salmon_price(sig, now2)
+                # Never FoK above entry_cents (the signal price)
+                if per_leg_entry is not None and current_ask is not None and current_ask > per_leg_entry:
+                    outcome_lines.append(
+                        f"❌ {leg} — skipped FoK (market {current_ask}¢ > signal entry {per_leg_entry}¢). Limit left open."
+                    )
+                    continue
                 if max_p is not None:
-                    current_ask = _resolve_salmon_price(sig, now2)
                     combined_check = sum(_filled_prices()) + (current_ask or state["limit_price"]) + sum(
                         s["limit_price"] for s in leg_state.values()
                         if not s["filled"] and s["order_id"] != state["order_id"]

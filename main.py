@@ -16353,13 +16353,13 @@ async def config_update(request: Request):
         return {"ok": False, "error": str(e)}
 
 def _salmon_poll_thread():
-    """Dedicated thread: polls Slack every 60s regardless of scan loop sleep."""
+    """Dedicated thread: polls Slack every SLACK_POLL_INTERVAL_SECONDS."""
     while True:
         try:
             _poll_salmon_slack()
-        except Exception:
-            pass
-        time.sleep(60)
+        except Exception as exc:
+            logging.warning(f"salmon poll error: {exc}")
+        time.sleep(SLACK_POLL_INTERVAL_SECONDS)
 
 
 @app.on_event("startup")

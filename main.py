@@ -2901,6 +2901,11 @@ _source_mae_cache_ts: float = 0.0
 _SOURCE_MAE_CACHE_TTL_S: float = 3600.0
 _SOURCE_MAE_MIN_SAMPLES: int = 5
 
+# --- Per-city per-source bias correction cache ---
+_source_bias_cache: dict = {}   # key: (city, source_name, temp_side) -> mean error_f
+_source_bias_cache_ts: float = 0.0
+_SOURCE_BIAS_MIN_SAMPLES: int = 3  # require at least 3 settled days before applying
+
 # Forecast trend tracking: rolling mu history per city/side for detecting warm/cold drift
 _mu_history: Dict[str, List[Tuple[float, float]]] = {}  # key=city|side -> [(ts, mu), ...]
 _MU_HISTORY_WINDOW_HOURS: float = 2.0
@@ -2935,6 +2940,40 @@ def _load_dynamic_source_weights() -> dict:
     _source_mae_cache_ts = now_ts
     return weights
 
+def _load_source_bias_corrections() -> dict:
+    """Return {(city, source_name, temp_side): mean_error_f} from source_accuracy_log.csv.
+    error_f = forecast - actual, so positive = source runs warm.
+    Correction applied as: corrected_forecast = raw - mean_error_f.
+    Only populated for city/source/side combinations with >= _SOURCE_BIAS_MIN_SAMPLES."""
+    global _source_bias_cache, _source_bias_cache_ts
+    now_ts = time.time()
+    if now_ts - _source_bias_cache_ts < _SOURCE_MAE_CACHE_TTL_S and _source_bias_cache:
+        return _source_bias_cache
+    path = source_accuracy_log_path()
+    if not os.path.exists(path):
+        return {}
+    from collections import defaultdict as _dd
+    buckets: dict = _dd(list)
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                city_r = str(row.get("city", "")).strip()
+                src = str(row.get("source_name", "")).strip()
+                side_r = str(row.get("temp_side", "")).strip()
+                err = _to_float(row.get("error_f"))
+                if city_r and src and side_r and err is not None:
+                    buckets[(city_r, src, side_r)].append(err)
+    except Exception:
+        return {}
+    corrections: dict = {}
+    for key, errors in buckets.items():
+        if len(errors) >= _SOURCE_BIAS_MIN_SAMPLES:
+            corrections[key] = sum(errors) / len(errors)
+    _source_bias_cache = corrections
+    _source_bias_cache_ts = now_ts
+    return corrections
+
+
 def build_expert_consensus(
     city: str,
     now_local: datetime,
@@ -2956,18 +2995,27 @@ def build_expert_consensus(
     def _src_weight(name: str, static_mae: float) -> float:
         return _dyn_weights.get(name) or safe_inverse_mae_weight(static_mae)
 
+    _bias_corrections = _load_source_bias_corrections()
+    def _apply_bias(name: str, value: float) -> float:
+        """Subtract known per-city per-source bias. error_f = forecast - actual,
+        so corrected = raw - mean_error_f removes the systematic over/under-estimate."""
+        bias = _bias_corrections.get((city, name, side))
+        if bias is not None and abs(bias) >= 0.1:
+            return value - bias
+        return value
+
     try:
         om_ecmwf_model = "ecmwf_ifs04" if side == "high" else "best_match"
         om_ecmwf = open_meteo_get_forecast_temp_f(lat, lon, now_local, model=om_ecmwf_model, temp_side=side, city_date_iso=city_date_iso)
         if om_ecmwf is not None:
-            source_values.append(("OpenMeteo-ECMWF", om_ecmwf, _src_weight("OpenMeteo-ECMWF", OPEN_METEO_ECMWF_HIST_MAE_F)))
+            source_values.append(("OpenMeteo-ECMWF", _apply_bias("OpenMeteo-ECMWF", om_ecmwf), _src_weight("OpenMeteo-ECMWF", OPEN_METEO_ECMWF_HIST_MAE_F)))
     except Exception as e:
         logging.warning(f"OpenMeteo-ECMWF failed for {city} {side}: {e}")
 
     try:
         om_gfs = open_meteo_get_forecast_temp_f(lat, lon, now_local, model="gfs_seamless", temp_side=side, city_date_iso=city_date_iso)
         if om_gfs is not None:
-            source_values.append(("OpenMeteo-GFS", om_gfs, _src_weight("OpenMeteo-GFS", OPEN_METEO_GFS_HIST_MAE_F)))
+            source_values.append(("OpenMeteo-GFS", _apply_bias("OpenMeteo-GFS", om_gfs), _src_weight("OpenMeteo-GFS", OPEN_METEO_GFS_HIST_MAE_F)))
     except Exception as e:
         logging.warning(f"OpenMeteo-GFS failed for {city} {side}: {e}")
 
@@ -2975,7 +3023,7 @@ def build_expert_consensus(
         try:
             om_icon = open_meteo_get_forecast_temp_f(lat, lon, now_local, model="icon_seamless", temp_side=side, city_date_iso=city_date_iso)
             if om_icon is not None:
-                source_values.append(("OpenMeteo-ICON", om_icon, _src_weight("OpenMeteo-ICON", OPEN_METEO_ICON_HIST_MAE_F)))
+                source_values.append(("OpenMeteo-ICON", _apply_bias("OpenMeteo-ICON", om_icon), _src_weight("OpenMeteo-ICON", OPEN_METEO_ICON_HIST_MAE_F)))
         except Exception as e:
             logging.warning(f"OpenMeteo-ICON failed for {city} {side}: {e}")
 
@@ -2983,7 +3031,7 @@ def build_expert_consensus(
         try:
             metno_v = metno_get_forecast_temp_f(lat, lon, now_local, temp_side=side, date_tz=city_lst_tz_obj)
             if metno_v is not None:
-                source_values.append(("MET-Norway", metno_v, _src_weight("MET-Norway", METNO_HIST_MAE_F)))
+                source_values.append(("MET-Norway", _apply_bias("MET-Norway", metno_v), _src_weight("MET-Norway", METNO_HIST_MAE_F)))
         except Exception:
             pass
 
@@ -2992,11 +3040,11 @@ def build_expert_consensus(
             if side == "high":
                 nws_high = nws_get_forecast_high_f(lat, lon, now_local)
                 if nws_high is not None:
-                    source_values.append(("NWS", nws_high, _src_weight("NWS", NWS_HIST_MAE_F)))
+                    source_values.append(("NWS", _apply_bias("NWS", nws_high), _src_weight("NWS", NWS_HIST_MAE_F)))
             else:
                 nws_low = nws_get_forecast_low_f(lat, lon, now_local)
                 if nws_low is not None:
-                    source_values.append(("NWS", nws_low, _src_weight("NWS", NWS_LOW_HIST_MAE_F)))
+                    source_values.append(("NWS", _apply_bias("NWS", nws_low), _src_weight("NWS", NWS_LOW_HIST_MAE_F)))
         except Exception:
             pass
 
@@ -3010,7 +3058,7 @@ def build_expert_consensus(
                 force_refresh=force_accuweather_refresh,
             )
             if aw_temp is not None:
-                source_values.append(("AccuWeather", aw_temp, _src_weight("AccuWeather", ACCUWEATHER_HIST_MAE_F)))
+                source_values.append(("AccuWeather", _apply_bias("AccuWeather", aw_temp), _src_weight("AccuWeather", ACCUWEATHER_HIST_MAE_F)))
         except Exception:
             pass
 
@@ -3020,7 +3068,7 @@ def build_expert_consensus(
         try:
             tio_temp = tomorrow_io_get_forecast_temp_f(lat, lon, now_local, temp_side=side, city_date_iso=city_date_iso)
             if tio_temp is not None:
-                source_values.append(("Tomorrow.io", tio_temp, _src_weight("Tomorrow.io", TOMORROW_IO_HIST_MAE_F)))
+                source_values.append(("Tomorrow.io", _apply_bias("Tomorrow.io", tio_temp), _src_weight("Tomorrow.io", TOMORROW_IO_HIST_MAE_F)))
         except Exception as e:
             logging.warning(f"Tomorrow.io failed for {city} {side}: {e}")
 

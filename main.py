@@ -169,6 +169,7 @@ PAPER_TRADE_MIN_EDGE_IMPROVEMENT_PCT = float(os.getenv("PAPER_TRADE_MIN_EDGE_IMP
 PAPER_TRADE_MIN_MINUTES_BETWEEN_RE_ALERTS = int(os.getenv("PAPER_TRADE_MIN_MINUTES_BETWEEN_RE_ALERTS", "90"))
 RANGE_PACKAGE_PAPER_ENABLED = env_bool("RANGE_PACKAGE_PAPER_ENABLED", default=False)
 RANGE_PACKAGE_PAPER_MIN_EDGE_PCT = float(os.getenv("RANGE_PACKAGE_PAPER_MIN_EDGE_PCT", "2.0"))
+RANGE_PACKAGE_PAPER_MIN_COST_CENTS = float(os.getenv("RANGE_PACKAGE_PAPER_MIN_COST_CENTS", "30.0"))
 RANGE_PACKAGE_PAPER_BUCKET_COUNT = int(os.getenv("RANGE_PACKAGE_PAPER_BUCKET_COUNT", "2"))
 RANGE_PACKAGE_MIN_COMBINED_PROB_PCT = float(os.getenv("RANGE_PACKAGE_MIN_COMBINED_PROB_PCT", "45.0"))
 RANGE_PACKAGE_LIVE_ENABLED = env_bool("RANGE_PACKAGE_LIVE_ENABLED", default=True)
@@ -11680,6 +11681,8 @@ def build_range_package_paper_candidates(now_local: datetime, market_day: str = 
                 combined_entry_cost_cents = float(yes_ask_a) + float(yes_ask_b)
                 combined_edge_pct = combined_model_yes_prob_pct - combined_entry_cost_cents
                 if combined_edge_pct < float(RANGE_PACKAGE_PAPER_MIN_EDGE_PCT):
+                    continue
+                if combined_entry_cost_cents < float(RANGE_PACKAGE_PAPER_MIN_COST_CENTS):
                     continue
                 # Minimum combined probability gate — avoids fringe bets with fake edge
                 if combined_model_yes_prob_pct < float(RANGE_PACKAGE_MIN_COMBINED_PROB_PCT):

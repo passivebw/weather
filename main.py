@@ -14391,20 +14391,6 @@ def _poll_salmon_slack() -> None:
                 continue
 
             # ── Buy signal parsing ───────────────────────────────────────────
-            # Skip resting position updates — these are existing orders, not new entries
-            if _is_salmon_resting_position_message(text):
-                signals = _parse_salmon_slack_signals(text)
-                if signals:
-                    city = signals[0]["city"]
-                    legs = ", ".join(f"{s['direction']} {s['bucket_raw']}" + (f" @ {s['entry_cents']}¢" if s.get('entry_cents') else "") for s in signals)
-                    try:
-                        discord_send(f"🐟 **Salmon Resting Position — {city}**\n{legs}\n📋 Existing order — no auto-execute")
-                    except Exception:
-                        pass
-                logging.info(f"[Salmon Poll] resting position msg skipped ts={ts}")
-                new_last_ts = ts
-                continue
-
             # Detect if Salmon is sharing signals but NOT personally taking them
             is_pass = _is_salmon_pass_message(text)
             signals = _parse_salmon_slack_signals(text)

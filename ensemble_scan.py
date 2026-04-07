@@ -388,7 +388,7 @@ print("")
 print("=" * 72)
 from datetime import datetime, timezone, timedelta
 et_now = datetime.now(timezone.utc) + timedelta(hours=-4)
-print(f"ENSEMBLE SCAN — {et_now.strftime('%B %d, %Y').replace(' 0',' ')}  (bias-corrected GFS+ICON, min edge 10%)")
+print(f"BARO — {et_now.strftime('%B %d, %Y').replace(' 0',' ')}  (bias-corrected GFS+ICON, min edge 10%)")
 print("=" * 72)
 print("")
 print(f"As of {et_now.strftime('%I:%M %p')} ET")
@@ -466,7 +466,7 @@ if DISCORD_WEBHOOK and results:
     lines = []
     date_str = et_now.strftime("%b ") + str(et_now.day) + ", " + str(et_now.year)
     time_str = et_now.strftime("%I:%M %p").lstrip("0")
-    lines.append(f"\U0001f321\ufe0f **Ensemble Scan \u2014 {date_str}** | {time_str} ET")
+    lines.append(f"\U0001f321\ufe0f **Baro \u2014 {date_str}** | {time_str} ET")
     lines.append("─────────────────────────────────")
 
     # Tier each result
@@ -512,7 +512,7 @@ if DISCORD_WEBHOOK and results:
             lines.append("  \u23e9 " + fmt_line(r))
 
     lines.append("─────────────────────────────────")
-    lines.append(f"📄 *Paper mode — {len(tier1)} strong | {len(tier2)} consider | {len(tier3)} skip*")
+    lines.append(f"📄 *Baro paper mode — {len(tier1)} strong | {len(tier2)} consider | {len(tier3)} skip*")
 
     payload = {"content": "\n".join(lines)}
     try:

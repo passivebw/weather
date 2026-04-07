@@ -26,14 +26,19 @@ CITIES = {
     "New York City":  (40.7789, -73.9692, "KNYC",  "America/New_York"),
 }
 
+# Bias per city: (gfs, icon, ecmwf_ifs, ecmwf_aifs, gem, bom)
+# ecmwf/gem/bom start at 0 — tune as track record builds
 SPRING_BIAS = {
-    "Washington DC": (-0.55, -1.53), "Atlanta": (-0.8, -1.5), "Austin": (-0.4, -0.9),
-    "Boston": (0.3, -0.2), "Chicago": (-1.0, -1.2), "Denver": (-1.2, -1.0),
-    "Las Vegas": (-0.5, -0.5), "Los Angeles": (0.1, 3.24), "Miami": (0.0, -0.8),
-    "Philadelphia": (-0.1, -0.5), "Seattle": (-1.2, -1.8), "Oklahoma City": (-0.2, -0.4),
-    "San Francisco": (1.48, 0.9), "Houston": (-0.4, -0.6), "Dallas": (-0.2, -0.3),
-    "Phoenix": (-1.0, -2.0), "New Orleans": (-0.6, -0.7), "Minneapolis": (-0.7, -0.8),
-    "San Antonio": (-0.3, -0.8), "New York City": (0.2, -0.7),
+    "Washington DC": (-0.55, -1.53, 0, 0, 0, 0), "Atlanta": (-0.8, -1.5, 0, 0, 0, 0),
+    "Austin": (-0.4, -0.9, 0, 0, 0, 0), "Boston": (0.3, -0.2, 0, 0, 0, 0),
+    "Chicago": (-1.0, -1.2, 0, 0, 0, 0), "Denver": (-1.2, -1.0, 0, 0, 0, 0),
+    "Las Vegas": (-0.5, -0.5, 0, 0, 0, 0), "Los Angeles": (0.1, 3.24, 0, 0, 0, 0),
+    "Miami": (0.0, -0.8, 0, 0, 0, 0), "Philadelphia": (-0.1, -0.5, 0, 0, 0, 0),
+    "Seattle": (-1.2, -1.8, 0, 0, 0, 0), "Oklahoma City": (-0.2, -0.4, 0, 0, 0, 0),
+    "San Francisco": (1.48, 0.9, 0, 0, 0, 0), "Houston": (-0.4, -0.6, 0, 0, 0, 0),
+    "Dallas": (-0.2, -0.3, 0, 0, 0, 0), "Phoenix": (-1.0, -2.0, 0, 0, 0, 0),
+    "New Orleans": (-0.6, -0.7, 0, 0, 0, 0), "Minneapolis": (-0.7, -0.8, 0, 0, 0, 0),
+    "San Antonio": (-0.3, -0.8, 0, 0, 0, 0), "New York City": (0.2, -0.7, 0, 0, 0, 0),
 }
 
 SERIES = {
@@ -79,9 +84,29 @@ def kalshi_get(path, params=None):
     h = {"KALSHI-ACCESS-KEY": key_id, "KALSHI-ACCESS-TIMESTAMP": ts_ms, "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode()}
     return requests.get(BASE + path, headers=h, params=params, timeout=15).json()
 
+ENSEMBLE_MODELS = [
+    "gfs_seamless",       # NOAA GEFS — 31 members
+    "icon_seamless",      # DWD ICON-EPS — 40 members
+    "ecmwf_ifs025",       # ECMWF IFS — 51 members (gold standard, independent physics)
+    "ecmwf_aifs025",      # ECMWF AIFS — 51 members (AI model, different approach)
+    "gem_global",         # Canadian GEM — 21 members
+    "bom_access_global_ensemble",  # Australian BOM ACCESS-GE — 18 members
+]
+
+# Bias corrections per model per city (bias_gfs, bias_icon, bias_ecmwf_ifs, bias_ecmwf_aifs, bias_gem, bias_bom)
+# New models start at 0 — tune over time as Baro builds a track record
+MODEL_BIAS_IDX = {
+    "gfs_seamless": 0,
+    "icon_seamless": 1,
+    "ecmwf_ifs025": 2,
+    "ecmwf_aifs025": 3,
+    "gem_global": 4,
+    "bom_access_global_ensemble": 5,
+}
+
 def get_ensemble(lat, lon, tz, var):
     members = []
-    for model in ["gfs_seamless", "icon_seamless"]:
+    for model in ENSEMBLE_MODELS:
         try:
             r = requests.get(
                 "https://ensemble-api.open-meteo.com/v1/ensemble",
@@ -150,6 +175,57 @@ def get_obs_day_range(station, city_tz):
     return None, None, None
 
 
+# Cache NWS grid points per lat/lon to avoid repeat lookups
+nws_points_cache = {}
+
+def get_nws_forecast(lat, lon):
+    """Return (nws_high, nws_low) from NWS official forecast for today. Returns (None, None) on failure."""
+    from datetime import datetime, timezone, timedelta
+    key = (round(lat, 2), round(lon, 2))
+    if key not in nws_points_cache:
+        try:
+            r = requests.get(
+                f"https://api.weather.gov/points/{lat},{lon}",
+                headers={"User-Agent": "kalshi-weather-bot/1.0"},
+                timeout=10
+            )
+            props = r.json().get("properties", {})
+            nws_points_cache[key] = (
+                props.get("gridId"),
+                props.get("gridX"),
+                props.get("gridY"),
+            )
+        except Exception:
+            nws_points_cache[key] = (None, None, None)
+
+    grid_id, grid_x, grid_y = nws_points_cache[key]
+    if not grid_id:
+        return None, None
+
+    try:
+        r = requests.get(
+            f"https://api.weather.gov/gridpoints/{grid_id}/{grid_x},{grid_y}/forecast",
+            headers={"User-Agent": "kalshi-weather-bot/1.0"},
+            timeout=10
+        )
+        periods = r.json().get("properties", {}).get("periods", [])
+        nws_high, nws_low = None, None
+        for p in periods[:4]:  # only look at next ~2 days
+            temp = p.get("temperature")
+            unit = p.get("temperatureUnit", "F")
+            if unit == "C" and temp is not None:
+                temp = round(temp * 9/5 + 32)
+            if p.get("isDaytime") and nws_high is None:
+                nws_high = temp
+            elif not p.get("isDaytime") and nws_low is None:
+                nws_low = temp
+            if nws_high is not None and nws_low is not None:
+                break
+        return nws_high, nws_low
+    except Exception:
+        return None, None
+
+
 def get_kalshi_prices(series_ticker):
     try:
         mkts = kalshi_get("/markets", {"series_ticker": series_ticker, "limit": 100, "status": "open"}).get("markets", [])
@@ -193,16 +269,21 @@ def get_kalshi_prices(series_ticker):
 
 results = []
 
-# Cache obs per station
+# Cache obs and NWS forecasts per station/city
 obs_cache = {}
+nws_cache = {}
 
 for city, (lat, lon, station, tz) in CITIES.items():
     series_high, series_low = SERIES.get(city, (None, None))
-    bias_gfs, bias_icon = SPRING_BIAS.get(city, (0, 0))
+    city_biases = SPRING_BIAS.get(city, (0, 0, 0, 0, 0, 0))
 
     if station not in obs_cache:
         obs_cache[station] = get_obs_day_range(station, tz)
     obs_low, obs_high, obs_current = obs_cache[station]
+
+    if city not in nws_cache:
+        nws_cache[city] = get_nws_forecast(lat, lon)
+    nws_high, nws_low = nws_cache[city]
 
     for side, series, var in [("HIGH", series_high, "temperature_2m_max"), ("LOW", series_low, "temperature_2m_min")]:
         if series is None:
@@ -214,14 +295,14 @@ for city, (lat, lon, station, tz) in CITIES.items():
 
             corrected = []
             for model, temp in members:
-                if "gfs" in model:
-                    corrected.append(temp - bias_gfs)
-                else:
-                    corrected.append(temp - bias_icon)
+                idx = MODEL_BIAS_IDX.get(model, 0)
+                bias = city_biases[idx] if idx < len(city_biases) else 0
+                corrected.append(temp - bias)
 
             mean_c = round(sum(corrected) / len(corrected), 1)
             n = len(corrected)
-            votes = Counter(int(t) for t in corrected)
+            # Use round() to match Kalshi's settlement rounding
+            votes = Counter(round(t) for t in corrected)
 
             prices = get_kalshi_prices(series)
             if not prices:
@@ -370,6 +451,13 @@ for city, (lat, lon, station, tz) in CITIES.items():
                 if best_ask is None:
                     continue
 
+                nws_val = nws_high if side == "HIGH" else nws_low
+                nws_flag = ""
+                if nws_val is not None:
+                    diff = abs(mean_c - nws_val)
+                    if diff >= 3:
+                        nws_flag = f"⚠️ NWS={nws_val}F (Baro={mean_c}F, diff={round(diff,1)}F)"
+
                 results.append({
                     "city": city, "side": side,
                     "bucket": best_bucket, "ask": best_ask,
@@ -377,6 +465,7 @@ for city, (lat, lon, station, tz) in CITIES.items():
                     "direction": best_dir, "mean": mean_c, "n": n,
                     "obs_low": obs_low, "obs_high": obs_high, "obs_current": obs_current,
                     "buffer": best_buffer, "alt_options": alt_options,
+                    "nws_val": nws_val, "nws_flag": nws_flag,
                 })
                 print(f"  done: {city} {side} edge={best_edge:+.1f}% low={obs_low} high={obs_high} cur={obs_current}")
         except Exception as e:
@@ -495,8 +584,9 @@ if DISCORD_WEBHOOK and results:
             status = f"{dir_prob}% prob {r['direction']}"
         alts = r.get("alt_options", [])
         alt_str = f"  *(alt: {alts[0]['dir']} {alts[0]['bucket']} @ {alts[0]['cost']}¢)*" if alts else ""
+        nws_str = f"\n    {r['nws_flag']}" if r.get("nws_flag") else ""
         return (f"**{r['city']} {r['side'].upper()} {r['direction']} {r['bucket']}** | "
-                f"{r['ask']}¢ | +{round(r['edge'],1)}% | {status}{alt_str}")
+                f"{r['ask']}¢ | +{round(r['edge'],1)}% | {status}{alt_str}{nws_str}")
 
     if tier1:
         lines.append("\U0001f7e2 **TAKE THESE** (locked, high confidence)")

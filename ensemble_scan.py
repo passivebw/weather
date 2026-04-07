@@ -269,13 +269,13 @@ for city, (lat, lon, station, tz) in CITIES.items():
                 if direction == "NO" and side == "LOW" and obs_low is not None:
                     if tail == "lt" and obs_low < thr:
                         continue  # low already below threshold — NO is losing
-                    elif tail is None and lo <= int(obs_low) <= hi:
+                    elif tail is None and lo <= round(obs_low) <= hi:
                         continue  # low already in bucket — NO is losing
                 # Suppress NO on HIGH bucket if day high already sits inside it
                 if direction == "NO" and side == "HIGH" and obs_high is not None:
                     if tail == "gt" and obs_high > thr:
                         continue  # high already above threshold — NO is losing
-                    elif tail is None and lo <= int(obs_high) <= hi:
+                    elif tail is None and lo <= round(obs_high) <= hi:
                         continue  # high already in bucket — NO is losing
 
                 if edge is not None and (best_edge is None or edge > best_edge):
@@ -291,7 +291,7 @@ for city, (lat, lon, station, tz) in CITIES.items():
                 best_buffer = None
                 alt_options = []
 
-                if side == "LOW" and obs_low is not None and obs_low >= blo and obs_low <= bhi:
+                if side == "LOW" and obs_low is not None and blo <= round(obs_low) <= bhi:
                     # Low locked in. Find cheapest equivalent winning position:
                     # Option A: YES on current bucket (loses if temp drops below blo)
                     # Option B: NO on any bucket whose hi < blo (loses if temp drops further into that bucket)
@@ -329,7 +329,7 @@ for city, (lat, lon, station, tz) in CITIES.items():
                     options.sort(key=lambda x: (x["cost"], -x["buffer"]))
                     alt_options = [o for o in options if o["bucket"] != best_opt["bucket"]][:2]
 
-                elif side == "HIGH" and obs_high is not None and obs_high >= blo and obs_high <= bhi and obs_current is not None and obs_current < obs_high:
+                elif side == "HIGH" and obs_high is not None and blo <= round(obs_high) <= bhi and obs_current is not None and obs_current < obs_high:
                     # High locked in. Find cheapest equivalent winning position:
                     # Option A: YES on current bucket (loses if temp rises above bhi)
                     # Option B: NO on any bucket whose lo > bhi (loses if temp rises into that bucket)

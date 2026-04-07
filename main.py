@@ -18,6 +18,10 @@ from urllib.parse import urlparse
 import requests
 from dateutil import tz
 from fastapi import Body, FastAPI, Request
+try:
+    from kalshi_ws import ws_manager as _ws_manager
+except Exception:
+    _ws_manager = None
 from fastapi.responses import HTMLResponse, PlainTextResponse
 try:
     from cryptography.hazmat.primitives import hashes, serialization
@@ -2608,6 +2612,13 @@ def refresh_markets_cache(force: bool = False) -> Dict[str, List[Market]]:
         with _market_cache_lock:
             market_cache["ts"] = now_ts
             market_cache["by_city"] = grouped
+
+        # Subscribe all discovered tickers to the WebSocket for live orderbook updates
+        if _ws_manager is not None:
+            all_tickers = [m.ticker for markets in grouped.values() for m in markets]
+            if all_tickers:
+                _ws_manager.subscribe(all_tickers)
+
         return {city: list(grouped.get(city, [])) for city in CITY_CONFIG.keys()}
     except Exception:
         with _market_cache_lock:
@@ -2618,6 +2629,13 @@ def refresh_markets_cache(force: bool = False) -> Dict[str, List[Market]]:
         raise
 
 def kalshi_get_orderbook(ticker: str) -> dict:
+    # Check live WebSocket cache first — avoids a REST round-trip if fresh
+    if _ws_manager is not None:
+        cached = _ws_manager.get_orderbook(ticker)
+        if cached is not None:
+            return cached
+        # Not in cache yet — subscribe so future calls are served from WS
+        _ws_manager.subscribe([ticker])
     return kalshi_get(f"/markets/{ticker}/orderbook")
 
 def best_quotes_from_orderbook(ob: dict) -> Dict[str, Optional[int]]:
@@ -10710,12 +10728,20 @@ def debug_city_comparison(
 def debug_orderbook(ticker: str):
     ob = kalshi_get_orderbook(ticker)
     quotes = best_quotes_from_orderbook(ob)
+    ws_cached = _ws_manager.get_orderbook(ticker) if _ws_manager else None
     return {
         "ok": True,
         "ticker": ticker,
         "quotes": quotes,
         "raw": ob,
+        "ws_cached": ws_cached is not None,
     }
+
+@app.get("/debug/ws")
+def debug_ws():
+    if _ws_manager is None:
+        return {"ok": False, "error": "WebSocket manager not loaded"}
+    return {"ok": True, **_ws_manager.status()}
 
 def build_policy_bets_from_board_payload(board_payload: dict, top_n: int, min_edge_pct: float) -> Tuple[List[dict], List[dict]]:
     max_rows = max(1, min(200, int(top_n)))
@@ -16437,12 +16463,314 @@ def _salmon_poll_thread():
         time.sleep(SLACK_POLL_INTERVAL_SECONDS)
 
 
+# ── Position monitor ────────────────────────────────────────────────────────
+# Tracks open Kalshi positions every 60s, alerts on bucket breach or price drop.
+
+_pos_monitor_state: Dict[str, dict] = {}   # ticker → {session_high, alerted_breach, alerted_drop, last_obs}
+_pos_monitor_lock = threading.Lock()
+
+POSITION_MONITOR_INTERVAL_SECONDS = int(os.getenv("POSITION_MONITOR_INTERVAL_SECONDS", "60"))
+POSITION_MONITOR_PRICE_DROP_ALERT_CENTS = float(os.getenv("POSITION_MONITOR_PRICE_DROP_ALERT_CENTS", "12"))
+
+
+def _asos_latest_temp_f(station: str) -> Optional[float]:
+    """Fetch the most recent temperature (°F) via NWS /observations/latest — no lag, ~5 min updates."""
+    try:
+        r = requests.get(
+            f"https://api.weather.gov/stations/{station}/observations/latest",
+            headers={"User-Agent": "kalshi-weather-bot/1.0"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        temp_c = r.json().get("properties", {}).get("temperature", {}).get("value")
+        if temp_c is None:
+            return None
+        return round(temp_c * 9 / 5 + 32, 1)
+    except Exception:
+        pass
+    return None
+
+
+def _build_ticker_city_map() -> Dict[str, dict]:
+    """Build reverse lookup: ticker → {city, temp_side, bucket_lo, bucket_hi} from market cache."""
+    result: Dict[str, dict] = {}
+    try:
+        grouped = market_cache.get("by_city", {})
+        for city, markets in grouped.items():
+            for m in markets:
+                bucket = parse_bucket_from_title(m.title)
+                if bucket is None:
+                    continue
+                result[m.ticker] = {
+                    "city": city,
+                    "temp_side": normalize_temp_side(m.temp_side),
+                    "bucket_lo": bucket[0],
+                    "bucket_hi": bucket[1],
+                }
+    except Exception:
+        pass
+    return result
+
+
+def _poll_open_positions() -> List[dict]:
+    """Return all open Kalshi positions with non-zero quantity."""
+    try:
+        data = kalshi_get("/portfolio/positions", params={"limit": 200})
+        return [p for p in data.get("market_positions", []) if (p.get("position") or 0) != 0]
+    except Exception as e:
+        logging.warning(f"[PosMonitor] positions fetch failed: {e}")
+        return []
+
+
+def _position_monitor_loop():
+    """Background thread: monitors open positions every 60s.
+    Detects bucket breaches and price drops for single positions, and
+    identifies range packages (2 adjacent YES buckets same city/side)
+    to recommend exiting the dead leg while holding the live one.
+    """
+    global _pos_monitor_state
+    # Cache obs temp per station per cycle to avoid redundant API calls
+    _obs_cache: Dict[str, Optional[float]] = {}
+
+    while True:
+        try:
+            positions = _poll_open_positions()
+            if not positions:
+                time.sleep(POSITION_MONITOR_INTERVAL_SECONDS)
+                continue
+
+            ticker_map = _build_ticker_city_map()
+            now_local = datetime.now(timezone.utc).astimezone()
+            _obs_cache.clear()
+
+            # ── Step 1: Enrich all positions ────────────────────────────────
+            enriched: List[dict] = []
+            for pos in positions:
+                ticker = pos.get("ticker", "")
+                qty = pos.get("position", 0)
+                bet_side = "yes" if qty > 0 else "no"
+
+                info = ticker_map.get(ticker)
+                if info is None:
+                    try:
+                        mkt = kalshi_get(f"/markets/{ticker}")
+                        title = (mkt.get("market") or mkt).get("title", "")
+                        bucket = parse_bucket_from_title(title)
+                        city_guess = None
+                        for city in CITY_CONFIG:
+                            if city.replace(" ", "").upper()[:3] in ticker.upper():
+                                city_guess = city
+                                break
+                        if bucket and city_guess:
+                            info = {
+                                "city": city_guess,
+                                "temp_side": "high" if "HIGH" in ticker.upper() else "low",
+                                "bucket_lo": bucket[0],
+                                "bucket_hi": bucket[1],
+                            }
+                    except Exception:
+                        pass
+                if info is None:
+                    continue
+
+                city = info["city"]
+                temp_side = info["temp_side"]
+                bucket_lo = info["bucket_lo"]
+                bucket_hi = info["bucket_hi"]
+
+                # Market price
+                current_price: Optional[float] = None
+                try:
+                    ob = kalshi_get_orderbook(ticker)
+                    yes_bid, yes_ask, _ = best_bid_and_ask_from_orderbook(ob)
+                    current_price = yes_bid if bet_side == "yes" else ((100 - yes_ask) if yes_ask is not None else None)
+                except Exception:
+                    pass
+
+                # NWS obs — cached per station per cycle
+                station = CITY_CONFIG.get(city, {}).get("station", "")
+                if station not in _obs_cache:
+                    _obs_cache[station] = _asos_latest_temp_f(station) if station else None
+                obs_temp = _obs_cache[station]
+
+                enriched.append({
+                    "ticker": ticker,
+                    "city": city,
+                    "temp_side": temp_side,
+                    "bucket_lo": bucket_lo,
+                    "bucket_hi": bucket_hi,
+                    "bet_side": bet_side,
+                    "current_price": current_price,
+                    "obs_temp": obs_temp,
+                })
+
+            # ── Step 2: Group by city + temp_side to detect range packages ──
+            from collections import defaultdict
+            groups: Dict[str, List[dict]] = defaultdict(list)
+            for e in enriched:
+                groups[f"{e['city']}|{e['temp_side']}"].append(e)
+
+            all_alerts: List[str] = []
+
+            for group_key, legs in groups.items():
+                city, temp_side = group_key.split("|", 1)
+                obs_temp = legs[0]["obs_temp"]  # same city → same obs
+
+                is_range_package = (
+                    len(legs) == 2
+                    and all(l["bet_side"] == "yes" for l in legs)
+                    and all(l["bucket_hi"] < 900 and l["bucket_lo"] > -900 for l in legs)
+                )
+
+                if is_range_package:
+                    # Sort by bucket floor so leg_lo is the lower bucket
+                    leg_lo, leg_hi = sorted(legs, key=lambda l: l["bucket_lo"])
+                    pkg_key = f"pkg|{leg_lo['ticker']}|{leg_hi['ticker']}"
+
+                    with _pos_monitor_lock:
+                        pkg_state = _pos_monitor_state.setdefault(pkg_key, {
+                            "alerted_exit_lo": False,
+                            "alerted_exit_hi": False,
+                            "alerted_drop_lo": False,
+                            "alerted_drop_hi": False,
+                        })
+                        # Update session highs on individual states too
+                        for leg in legs:
+                            s = _pos_monitor_state.setdefault(leg["ticker"], {
+                                "session_high": leg["current_price"],
+                                "alerted_breach": False,
+                                "alerted_drop": False,
+                                "last_obs": obs_temp,
+                            })
+                            if leg["current_price"] is not None and (s["session_high"] is None or leg["current_price"] > s["session_high"]):
+                                s["session_high"] = leg["current_price"]
+                            s["last_obs"] = obs_temp
+
+                        lo_str = f"{int(leg_lo['bucket_lo'])}-{int(leg_lo['bucket_hi'])}°F"
+                        hi_str = f"{int(leg_hi['bucket_lo'])}-{int(leg_hi['bucket_hi'])}°F"
+                        lo_price_str = f"{int(round(leg_lo['current_price']))}¢" if leg_lo["current_price"] is not None else "?"
+                        hi_price_str = f"{int(round(leg_hi['current_price']))}¢" if leg_hi["current_price"] is not None else "?"
+
+                        if obs_temp is not None:
+                            # Temp already past the lower bucket ceiling → exit lower leg
+                            if obs_temp > leg_lo["bucket_hi"] and not pkg_state["alerted_exit_lo"]:
+                                pkg_state["alerted_exit_lo"] = True
+                                all_alerts.append(
+                                    f"🎯 **Range Package — {city} {temp_side.upper()}**\n"
+                                    f"Obs: {obs_temp}°F — temp tracking ABOVE {lo_str}\n"
+                                    f"➡️ Exit {lo_str} now ({lo_price_str}) — it's dead\n"
+                                    f"✅ Hold {hi_str} ({hi_price_str}) — your live leg"
+                                )
+                            # Temp below the upper bucket floor → exit upper leg
+                            elif obs_temp < leg_hi["bucket_lo"] and not pkg_state["alerted_exit_hi"]:
+                                pkg_state["alerted_exit_hi"] = True
+                                all_alerts.append(
+                                    f"🎯 **Range Package — {city} {temp_side.upper()}**\n"
+                                    f"Obs: {obs_temp}°F — temp tracking BELOW {hi_str}\n"
+                                    f"➡️ Exit {hi_str} now ({hi_price_str}) — it's dead\n"
+                                    f"✅ Hold {lo_str} ({lo_price_str}) — your live leg"
+                                )
+
+                        # Price drop alert on individual legs
+                        for leg in legs:
+                            s = _pos_monitor_state[leg["ticker"]]
+                            drop_key = "alerted_drop_lo" if leg is leg_lo else "alerted_drop_hi"
+                            if (leg["current_price"] is not None and s.get("session_high") is not None
+                                    and not pkg_state[drop_key]):
+                                drop = s["session_high"] - leg["current_price"]
+                                if drop >= POSITION_MONITOR_PRICE_DROP_ALERT_CENTS:
+                                    pkg_state[drop_key] = True
+                                    bkt_str = lo_str if leg is leg_lo else hi_str
+                                    all_alerts.append(
+                                        f"⚠️ **Range Package Leg — {city} {temp_side.upper()} {bkt_str}**\n"
+                                        f"Price dropped {int(round(drop))}¢ from session high "
+                                        f"({int(round(s['session_high']))}¢ → {int(round(leg['current_price']))}¢)\n"
+                                        f"Obs: {obs_temp}°F"
+                                    )
+
+                else:
+                    # ── Single position logic ────────────────────────────────
+                    for leg in legs:
+                        ticker = leg["ticker"]
+                        bucket_lo = leg["bucket_lo"]
+                        bucket_hi = leg["bucket_hi"]
+                        bucket_str = f"{int(bucket_lo)}-{int(bucket_hi)}°F" if bucket_hi < 900 else f">{int(bucket_lo)}°F"
+                        current_price = leg["current_price"]
+
+                        with _pos_monitor_lock:
+                            state = _pos_monitor_state.setdefault(ticker, {
+                                "session_high": current_price,
+                                "alerted_breach": False,
+                                "alerted_drop": False,
+                                "last_obs": obs_temp,
+                            })
+                            if current_price is not None and (state["session_high"] is None or current_price > state["session_high"]):
+                                state["session_high"] = current_price
+
+                            if obs_temp is not None and not state["alerted_breach"]:
+                                breached = False
+                                breach_msg = ""
+                                if temp_side == "high":
+                                    if obs_temp > bucket_hi and bucket_hi < 900:
+                                        breached = True
+                                        breach_msg = f"obs {obs_temp}°F > ceiling {int(bucket_hi)}°F"
+                                    elif obs_temp < bucket_lo and now_local.hour >= 19:
+                                        breached = True
+                                        breach_msg = f"obs {obs_temp}°F < floor {int(bucket_lo)}°F (past 2 PM)"
+                                else:
+                                    if obs_temp < bucket_lo and bucket_lo > -900:
+                                        breached = True
+                                        breach_msg = f"obs {obs_temp}°F < floor {int(bucket_lo)}°F"
+                                    elif obs_temp > bucket_hi and now_local.hour >= 15:
+                                        breached = True
+                                        breach_msg = f"obs {obs_temp}°F > ceiling {int(bucket_hi)}°F (past 10 AM)"
+
+                                if breached:
+                                    state["alerted_breach"] = True
+                                    price_str = f"{int(round(current_price))}¢" if current_price is not None else "?"
+                                    all_alerts.append(
+                                        f"🚨 **Position Alert — {city} {temp_side.upper()} {bucket_str}**\n"
+                                        f"Bucket breached: {breach_msg}\n"
+                                        f"Market now: {price_str} | Consider exiting."
+                                    )
+
+                            if (current_price is not None and state["session_high"] is not None
+                                    and not state["alerted_drop"]):
+                                drop = state["session_high"] - current_price
+                                if drop >= POSITION_MONITOR_PRICE_DROP_ALERT_CENTS:
+                                    state["alerted_drop"] = True
+                                    all_alerts.append(
+                                        f"⚠️ **Position Alert — {city} {temp_side.upper()} {bucket_str}**\n"
+                                        f"Price dropped {int(round(drop))}¢ from session high "
+                                        f"({int(round(state['session_high']))}¢ → {int(round(current_price))}¢)\n"
+                                        f"Obs: {obs_temp}°F | Consider exiting."
+                                    )
+
+                            state["last_obs"] = obs_temp
+
+            for alert in all_alerts:
+                try:
+                    discord_send(alert)
+                except Exception as e:
+                    logging.warning(f"[PosMonitor] discord send failed: {e}")
+                logging.info(f"[PosMonitor] alert: {alert[:100]}")
+
+        except Exception as exc:
+            logging.warning(f"[PosMonitor] loop error: {exc}")
+
+        time.sleep(POSITION_MONITOR_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 def on_startup():
     try:
         _load_accuweather_cache_state()
     except Exception:
         pass
+    if _ws_manager is not None:
+        _ws_manager.start()
     threading.Thread(target=background_loop, daemon=True).start()
     threading.Thread(target=_salmon_poll_thread, daemon=True).start()
+    threading.Thread(target=_position_monitor_loop, daemon=True).start()
 

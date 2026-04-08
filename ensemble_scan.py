@@ -133,8 +133,38 @@ TZ_OFFSETS = {
     "America/Phoenix":     -7,  # MST (no DST, same year-round)
 }
 
+def _parse_metar_6hr_extremes(raw_msg: str):
+    """
+    Parse 6-hour min/max temperature groups from a METAR raw message.
+    Groups appear in remarks section:
+      1sTTT = 6-hour maximum (s=0 positive, s=1 negative, TTT = tenths of degC)
+      2sTTT = 6-hour minimum
+    Returns (min6_f, max6_f) in Fahrenheit, or (None, None) if not present.
+    Only present at synoptic hours: 00, 06, 12, 18 UTC.
+    """
+    import re
+    min6_f = None
+    max6_f = None
+    # Match 1sTTT and 2sTTT groups (4-digit, s=0 or 1, TTT=3 digits)
+    for m in re.finditer(r'\b([12])([01])(\d{3})\b', raw_msg):
+        group_type = m.group(1)  # 1=max, 2=min
+        sign = m.group(2)        # 0=positive, 1=negative
+        ttt = int(m.group(3))    # tenths of degC
+        temp_c = ttt / 10.0 if sign == "0" else -ttt / 10.0
+        temp_f = round(temp_c * 9/5 + 32, 1)
+        if group_type == "1":
+            max6_f = temp_f
+        else:
+            min6_f = temp_f
+    return min6_f, max6_f
+
+
 def get_obs_day_range(station, city_tz):
-    """Return (obs_low, obs_high, current_temp) recorded since local midnight, timestamps shown in ET."""
+    """
+    Return (obs_low, obs_high, current_temp) recorded since local midnight.
+    Combines individual obs temps AND 6-hour METAR min/max groups (1sTTT/2sTTT)
+    to capture true extremes that individual readings may miss.
+    """
     from datetime import datetime, timezone, timedelta
     now_utc = datetime.now(timezone.utc)
     offset_h = TZ_OFFSETS.get(city_tz, -4)
@@ -158,16 +188,28 @@ def get_obs_day_range(station, city_tz):
             ts_str = f["properties"].get("timestamp","")
             if not ts_str:
                 continue
-            # Parse timestamp
             ts_utc = datetime.fromisoformat(ts_str.replace("Z","+00:00"))
             if ts_utc < utc_midnight:
                 continue
-            temp_c = f["properties"].get("temperature", {}).get("value")
+            props = f["properties"]
+
+            # Individual instantaneous temperature
+            temp_c = props.get("temperature", {}).get("value")
             if temp_c is not None:
                 temp_f = round(temp_c * 9/5 + 32, 1)
                 temps.append(temp_f)
                 if latest is None:
                     latest = temp_f  # features are newest-first
+
+            # 6-hour min/max from METAR raw message groups (2sTTT / 1sTTT)
+            raw_msg = props.get("rawMessage", "")
+            if raw_msg:
+                min6_f, max6_f = _parse_metar_6hr_extremes(raw_msg)
+                if min6_f is not None:
+                    temps.append(min6_f)
+                if max6_f is not None:
+                    temps.append(max6_f)
+
         if temps:
             return min(temps), max(temps), latest
     except Exception:

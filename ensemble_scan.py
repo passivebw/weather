@@ -410,7 +410,7 @@ for city, (lat, lon, station, tz) in CITIES.items():
                     options.sort(key=lambda x: (x["cost"], -x["buffer"]))
                     alt_options = [o for o in options if o["bucket"] != best_opt["bucket"]][:2]
 
-                elif side == "HIGH" and obs_high is not None and blo <= round(obs_high) <= bhi and obs_current is not None and obs_current < obs_high:
+                elif side == "HIGH" and obs_high is not None and blo <= round(obs_high) <= bhi and obs_current is not None and obs_current < obs_high and mean_c <= obs_high + 5:
                     # High locked in. Find cheapest equivalent winning position:
                     # Option A: YES on current bucket (loses if temp rises above bhi)
                     # Option B: NO on any bucket whose lo > bhi (loses if temp rises into that bucket)

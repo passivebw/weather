@@ -1,0 +1,11 @@
+{
+  "_instructions": "Populate each morning with active positions. kill_signals are checked every minute against live METAR obs.",
+  "_kill_signal_types": {
+    "precip": "Present weather contains RA, SHRA, TSRA, SN etc — precipitation detected",
+    "temp_drop": "Temperature drops more than N degrees from daily peak before cutoff_hour local time",
+    "wind_shift": "Wind direction shifts to specified quadrant (e.g. 'NNE' post-frontal cold advection)",
+    "temp_above": "Temperature rises above threshold — position is out of range high side",
+    "temp_below": "Temperature falls below threshold — position is out of range low side"
+  },
+  "positions": []
+}
